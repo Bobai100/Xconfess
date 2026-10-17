@@ -14,6 +14,9 @@ import {
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditActionType } from '../audit-log/audit-log.entity';
 
+export const PERSONALIZATION_FLAG = 'personalization';
+export const RANKING_VERSION_FLAG = 'ranking.version';
+
 @Injectable()
 export class FeatureFlagsService {
   constructor(
@@ -284,6 +287,120 @@ export class FeatureFlagsService {
 
     // Random for anonymous users
     return Math.random() * 100 < flag.percentage;
+  }
+
+  /**
+   * Returns true when personalized ranking/discovery features are allowed for
+   * the given user. When the flag is missing or disabled, callers MUST fall
+   * back to non-personalized discovery (no hidden user signals).
+   */
+  async isPersonalizationEnabled(userId?: string): Promise<boolean> {
+    return this.isEnabled(PERSONALIZATION_FLAG, userId);
+  }
+
+  /**
+   * Ensures the personalization flag exists so operators can roll it out or
+   * disable it without a manual seed step. Defaults to disabled (opt-in).
+   */
+  async ensurePersonalizationFlag(actorId?: string): Promise<FeatureFlag> {
+    const existing = await this.findOne(PERSONALIZATION_FLAG);
+    if (existing) {
+      return existing;
+    }
+
+    return this.create(
+      {
+        name: PERSONALIZATION_FLAG,
+        description:
+          'Enables personalized ranking/discovery. When disabled, results are non-personalized.',
+        enabled: false,
+        percentage: 0,
+        userIds: [],
+        lastChangedBy: actorId || 'system',
+      } as CreateFeatureFlagDto,
+      actorId,
+    );
+  }
+
+  /**
+   * Returns the currently active ranking version identifier, or null when no
+   * ranking version is active (e.g. disabled by the drift review path).
+   */
+  async getActiveRankingVersion(): Promise<string | null> {
+    const flag = await this.findOne(RANKING_VERSION_FLAG);
+    if (!flag || !flag.enabled) {
+      return null;
+    }
+
+    const version = flag.description?.trim();
+    return version ? version : null;
+  }
+
+  /**
+   * Disables the active ranking version. Used by the drift review path to stop
+   * serving a ranking version whose quality has drifted.
+   */
+  async disableRankingVersion(
+    actorId?: string,
+    reason?: string,
+  ): Promise<FeatureFlag> {
+    const existing = await this.findOne(RANKING_VERSION_FLAG);
+    if (!existing) {
+      throw new NotFoundException(
+        `Feature flag ${RANKING_VERSION_FLAG} not found`,
+      );
+    }
+
+    return this.update(
+      RANKING_VERSION_FLAG,
+      {
+        enabled: false,
+        description: reason
+          ? `${existing.description ?? ''} | disabled: ${reason}`.trim()
+          : existing.description,
+        lastChangedBy: actorId || 'system',
+      } as UpdateFeatureFlagDto,
+      actorId,
+    );
+  }
+
+  /**
+   * Re-enables a previously disabled ranking version.
+   */
+  async enableRankingVersion(
+    version: string,
+    actorId?: string,
+  ): Promise<FeatureFlag> {
+    if (!version || typeof version !== 'string' || version.trim() === '') {
+      throw new BadRequestException(
+        'A non-empty ranking version identifier is required.',
+      );
+    }
+
+    const existing = await this.findOne(RANKING_VERSION_FLAG);
+    if (!existing) {
+      return this.create(
+        {
+          name: RANKING_VERSION_FLAG,
+          description: version.trim(),
+          enabled: true,
+          percentage: 100,
+          userIds: [],
+          lastChangedBy: actorId || 'system',
+        } as CreateFeatureFlagDto,
+        actorId,
+      );
+    }
+
+    return this.update(
+      RANKING_VERSION_FLAG,
+      {
+        enabled: true,
+        description: version.trim(),
+        lastChangedBy: actorId || 'system',
+      } as UpdateFeatureFlagDto,
+      actorId,
+    );
   }
 
   private hashCode(str: string): number {

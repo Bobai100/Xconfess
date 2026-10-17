@@ -1,12 +1,16 @@
 "use client";
 
 import Link from "next/link";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ErrorBoundary } from "@/app/components/common/ErrorBoundary";
 import { ConfessionFeed } from "@/app/components/confession/ConfessionFeed";
 import { useScrollRestoration } from "@/app/lib/hooks/useScrollRestoration";
 import { useAuthContext } from "../lib/providers/AuthProvider";
-import { fetchUserStats } from "@/app/api/user.api";
+import {
+  fetchUserStats,
+  fetchUserPreferences,
+  updateUserPreferences,
+} from "@/app/api/user.api";
 
 function formatDate(iso: string) {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -125,6 +129,102 @@ function UserSummarySection() {
   );
 }
 
+function PersonalizationToggle() {
+  const queryClient = useQueryClient();
+  const {
+    data: preferences,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
+    queryKey: ["userPreferences"],
+    queryFn: fetchUserPreferences,
+    retry: 1,
+  });
+
+  const { mutate, isPending, isError: isUpdateError, reset } = useMutation({
+    mutationFn: (personalized: boolean) =>
+      updateUserPreferences({ personalized }),
+    onMutate: async (personalized: boolean) => {
+      await queryClient.cancelQueries({ queryKey: ["userPreferences"] });
+      const previous = queryClient.getQueryData(["userPreferences"]);
+      queryClient.setQueryData(["userPreferences"], (old: unknown) =>
+        old && typeof old === "object"
+          ? { ...(old as object), personalized }
+          : { personalized },
+      );
+      return { previous };
+    },
+    onError: (_error, _personalized, context) => {
+      if (context?.previous !== undefined) {
+        queryClient.setQueryData(["userPreferences"], context.previous);
+      }
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["userPreferences"] });
+      void queryClient.invalidateQueries({ queryKey: ["confessions"] });
+    },
+  });
+
+  const personalized = preferences?.personalized ?? true;
+
+  return (
+    <section className="luxury-panel space-y-4 rounded-[28px] p-6">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h2 className="text-lg font-bold text-[var(--foreground)]">
+            Personalization
+          </h2>
+          <p className="mt-1 text-sm text-[var(--secondary)]">
+            When disabled, discovery ignores your activity and shows
+            non-personalized results.
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={personalized}
+          aria-label="Toggle personalized discovery"
+          disabled={isLoading || isPending || isError}
+          onClick={() => {
+            reset();
+            mutate(!personalized);
+          }}
+          className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+            personalized ? "bg-[var(--primary)]" : "bg-[var(--border)]"
+          }`}
+        >
+          <span
+            className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${
+              personalized ? "translate-x-6" : "translate-x-1"
+            }`}
+          />
+        </button>
+      </div>
+
+      {isError && (
+        <div className="rounded-2xl border border-red-500/25 bg-red-950/30 p-4 text-center">
+          <p className="mb-2 text-sm text-red-200">
+            Preferences are temporarily unavailable.
+          </p>
+          <button
+            onClick={() => void refetch()}
+            className="text-xs font-semibold text-[var(--primary-deep)] hover:text-[var(--primary)]"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
+      {isUpdateError && (
+        <p role="alert" className="text-sm text-red-300">
+          Could not update your preference. Your previous setting was restored.
+        </p>
+      )}
+    </section>
+  );
+}
+
 function RecentConfessionsSection() {
   return (
     <section className="space-y-4">
@@ -153,6 +253,7 @@ export default function DashboardPage() {
   return (
     <main className="mx-auto flex max-w-5xl flex-col gap-8 px-4 py-8 sm:px-6 md:px-8 lg:px-10">
       <UserSummarySection />
+      <PersonalizationToggle />
       <RecentConfessionsSection />
     </main>
   );

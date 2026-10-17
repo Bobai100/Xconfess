@@ -204,3 +204,117 @@ fn settlement_id_is_monotonically_increasing_across_senders() {
     assert_eq!(id3, 3);
     assert_eq!(client.get_tip_balance(&recipient), 350);
 }
+
+// ── #274 serialized sequence allocation regression tests ──────────────────────
+
+#[test]
+fn interleaved_submissions_from_same_sender_allocate_distinct_sequences() {
+    // Two workers building transactions for the same sender must not observe
+    // the same settlement sequence. Interleaving the calls (A, B, A, B) models
+    // concurrent submitters and asserts every allocation is unique and
+    // strictly increasing in submission order.
+    let (env, client, token_id) = setup();
+    let token = TestTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let recipient_a = Address::generate(&env);
+    let recipient_b = Address::generate(&env);
+
+    token.mint(&sender, &1_000);
+
+    let id1 = client.send_tip(&sender, &recipient_a, &100);
+    let id2 = client.send_tip(&sender, &recipient_b, &200);
+    let id3 = client.send_tip(&sender, &recipient_a, &300);
+    let id4 = client.send_tip(&sender, &recipient_b, &400);
+
+    assert_eq!(id1, 1);
+    assert_eq!(id2, 2);
+    assert_eq!(id3, 3);
+    assert_eq!(id4, 4);
+
+    // No sequence was reused across the interleaved submissions.
+    let mut seen = std::vec::Vec::new();
+    for id in [id1, id2, id3, id4] {
+        assert!(!seen.contains(&id), "sequence {id} was allocated twice");
+        seen.push(id);
+    }
+
+    assert_eq!(client.get_tip_balance(&recipient_a), 400);
+    assert_eq!(client.get_tip_balance(&recipient_b), 600);
+    assert_eq!(token.balance(&sender), 0);
+}
+
+#[test]
+fn rejected_submission_does_not_consume_a_sequence() {
+    // A submission that fails validation must not advance the settlement
+    // counter, otherwise concurrent workers would see gaps and retries could
+    // collide with a sequence already handed to another worker.
+    let (env, client, token_id) = setup();
+    let token = TestTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    token.mint(&sender, &500);
+
+    assert_eq!(
+        client.try_send_tip(&sender, &recipient, &0),
+        Err(Ok(Error::InvalidTipAmount))
+    );
+    assert_eq!(
+        client.try_send_tip(&sender, &recipient, &(AnonymousTipping::MAX_TIP_AMOUNT + 1)),
+        Err(Ok(Error::InvalidTipAmount))
+    );
+
+    // The first successful submission still receives sequence 1.
+    let id = client.send_tip(&sender, &recipient, &100);
+    assert_eq!(id, 1);
+    assert_eq!(client.get_tip_balance(&recipient), 100);
+}
+
+#[test]
+fn failed_transfer_does_not_consume_a_sequence() {
+    // Insufficient balance makes the token transfer fail; the settlement
+    // counter must roll back with the rest of the invocation so a retry from
+    // another worker can reuse the sequence without collision.
+    let (env, client, token_id) = setup();
+    let token = TestTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    token.mint(&sender, &50);
+
+    let failed = client.try_send_tip(&sender, &recipient, &100);
+    assert!(failed.is_err(), "transfer should fail on insufficient balance");
+    assert_eq!(client.get_tip_balance(&recipient), 0);
+
+    token.mint(&sender, &100);
+    let id = client.send_tip(&sender, &recipient, &100);
+    assert_eq!(id, 1);
+    assert_eq!(client.get_tip_balance(&recipient), 100);
+}
+
+#[test]
+fn sequences_remain_unique_across_multiple_senders_and_recipients() {
+    // Multiple workers, each owning a different sender, must still receive
+    // globally unique sequences from the shared coordinator.
+    let (env, client, token_id) = setup();
+    let token = TestTokenClient::new(&env, &token_id);
+    let sender_a = Address::generate(&env);
+    let sender_b = Address::generate(&env);
+    let sender_c = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    token.mint(&sender_a, &1_000);
+    token.mint(&sender_b, &1_000);
+    token.mint(&sender_c, &1_000);
+
+    let id1 = client.send_tip(&sender_a, &recipient, &10);
+    let id2 = client.send_tip(&sender_b, &recipient, &20);
+    let id3 = client.send_tip(&sender_c, &recipient, &30);
+    let id4 = client.send_tip(&sender_a, &recipient, &40);
+
+    assert_eq!(id1, 1);
+    assert_eq!(id2, 2);
+    assert_eq!(id3, 3);
+    assert_eq!(id4, 4);
+    assert_eq!(client.get_tip_balance(&recipient), 100);
+}

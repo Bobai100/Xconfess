@@ -255,6 +255,160 @@ export function toApiError(response: AuthErrorResponse, status = 400): ApiError 
   return new ApiError(response.error.message, status, response.error.code);
 }
 
+/**
+ * Personalization preference
+ *
+ * Users may opt out of personalized ranking. The preference is persisted on the
+ * server so it survives cache invalidation and is enforced at the ranking
+ * boundary. When disabled, discovery requests must send `personalized=false`
+ * so hidden user signals are bypassed explicitly.
+ */
+
+export const PERSONALIZATION_STORAGE_KEY = 'discovery.personalized';
+
+export interface PersonalizationPreference {
+  personalized: boolean;
+  updatedAt?: string;
+}
+
+export interface PersonalizationPreferenceResponse {
+  ok: boolean;
+  preference: PersonalizationPreference;
+  error?: { code: string; message: string };
+}
+
+export interface PersonalizationRequestOptions {
+  baseUrl?: string;
+  fetchImpl?: typeof fetch;
+}
+
+function personalizationUrl(path: string, baseUrl?: string): string {
+  if (!baseUrl) return path;
+  return `${baseUrl.replace(/\/$/, '')}${path}`;
+}
+
+/**
+ * Read the cached preference from localStorage. Defaults to personalized when
+ * no preference has been stored or storage is unavailable.
+ */
+export function getCachedPersonalizationPreference(): boolean {
+  if (typeof localStorage === 'undefined') return true;
+  try {
+    const raw = localStorage.getItem(PERSONALIZATION_STORAGE_KEY);
+    return raw === null ? true : raw === 'true';
+  } catch {
+    return true;
+  }
+}
+
+function cachePersonalizationPreference(personalized: boolean): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(PERSONALIZATION_STORAGE_KEY, String(personalized));
+  } catch {
+    // Storage may be unavailable (private mode); the server remains authoritative.
+  }
+}
+
+/**
+ * Fetch the persisted preference from the server. On success the local cache is
+ * refreshed so a cache invalidation cannot silently re-enable personalization.
+ */
+export async function fetchPersonalizationPreference(
+  options: PersonalizationRequestOptions = {},
+): Promise<PersonalizationPreferenceResponse> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  try {
+    const response = await fetchImpl(personalizationUrl('/api/preferences/personalization', options.baseUrl), {
+      method: 'GET',
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
+    });
+    const body = await response.json().catch(() => undefined);
+    if (!response.ok || !body || typeof body !== 'object') {
+      const mapped = mapServerErrorType(response.status);
+      return { ok: false, preference: { personalized: getCachedPersonalizationPreference() }, error: mapped };
+    }
+    const candidate = body as { personalized?: unknown; updatedAt?: unknown };
+    if (typeof candidate.personalized !== 'boolean') {
+      return {
+        ok: false,
+        preference: { personalized: getCachedPersonalizationPreference() },
+        error: { code: 'invalid_response', message: 'Malformed personalization preference response.' },
+      };
+    }
+    cachePersonalizationPreference(candidate.personalized);
+    return {
+      ok: true,
+      preference: {
+        personalized: candidate.personalized,
+        updatedAt: typeof candidate.updatedAt === 'string' ? candidate.updatedAt : undefined,
+      },
+    };
+  } catch {
+    return {
+      ok: false,
+      preference: { personalized: getCachedPersonalizationPreference() },
+      error: { code: 'network_error', message: 'Unable to reach the server.' },
+    };
+  }
+}
+
+/**
+ * Persist the personalization preference on the server. Requires an
+ * authenticated session; unauthenticated callers receive an explicit error and
+ * the local cache is left untouched.
+ */
+export async function updatePersonalizationPreference(
+  personalized: boolean,
+  options: PersonalizationRequestOptions = {},
+): Promise<PersonalizationPreferenceResponse> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  try {
+    const response = await fetchImpl(personalizationUrl('/api/preferences/personalization', options.baseUrl), {
+      method: 'PUT',
+      credentials: 'include',
+      headers: withCsrfHeaders('PUT', { 'Content-Type': 'application/json' }) ?? {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ personalized }),
+    });
+    const body = await response.json().catch(() => undefined);
+    if (!response.ok) {
+      const mapped = mapServerErrorType(response.status);
+      return { ok: false, preference: { personalized: getCachedPersonalizationPreference() }, error: mapped };
+    }
+    const candidate = (body && typeof body === 'object' ? body : {}) as {
+      personalized?: unknown;
+      updatedAt?: unknown;
+    };
+    const persisted = typeof candidate.personalized === 'boolean' ? candidate.personalized : personalized;
+    cachePersonalizationPreference(persisted);
+    return {
+      ok: true,
+      preference: {
+        personalized: persisted,
+        updatedAt: typeof candidate.updatedAt === 'string' ? candidate.updatedAt : undefined,
+      },
+    };
+  } catch {
+    return {
+      ok: false,
+      preference: { personalized: getCachedPersonalizationPreference() },
+      error: { code: 'network_error', message: 'Unable to reach the server.' },
+    };
+  }
+}
+
+/**
+ * Append the personalization flag to a discovery request URL so the backend
+ * can bypass personal ranking features when the user has opted out.
+ */
+export function withPersonalizationParam(url: string, personalized = getCachedPersonalizationPreference()): string {
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}personalized=${personalized ? 'true' : 'false'}`;
+}
+
 const MAX_UPLOAD_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 500;
 

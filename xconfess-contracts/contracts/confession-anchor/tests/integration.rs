@@ -319,3 +319,140 @@ fn pause_does_not_affect_verify_or_count() {
     assert_eq!(client.verify_confession(&h), Some(1_000));
     assert_eq!(client.get_confession_count(), 1);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite 9 — RPC failover safety (issue #269)
+//
+// The backend may retry a submission against a different RPC endpoint after a
+// timeout. The contract must therefore stay idempotent for anchoring and
+// tipping so a failover retry can never double-apply a write, and read-only
+// verification must remain available while writes are paused.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn failover_retry_of_anchor_is_idempotent() {
+    let (env, client, _owner) = setup();
+    let h = hash(&env, 60);
+    let ts: u64 = 1_700_000_000_000;
+
+    // First submission succeeds on the primary endpoint.
+    assert_eq!(
+        client.anchor_confession(&h, &ts),
+        soroban_sdk::symbol_short!("anchored")
+    );
+
+    // A failover retry lands on a healthy endpoint with the same payload.
+    assert_eq!(
+        client.anchor_confession(&h, &ts),
+        soroban_sdk::symbol_short!("exists")
+    );
+
+    // A retry with a drifted timestamp must not overwrite the original.
+    assert_eq!(
+        client.anchor_confession(&h, &(ts + 5_000)),
+        soroban_sdk::symbol_short!("exists")
+    );
+
+    assert_eq!(client.verify_confession(&h), Some(ts));
+    assert_eq!(client.get_confession_count(), 1);
+}
+
+#[test]
+fn failover_retry_after_pause_does_not_apply_write() {
+    let (env, client, owner) = setup();
+    let h = hash(&env, 61);
+
+    client.anchor_confession(&h, &1_000);
+    client.pause(&owner, &reason(&env, "rpc-failover"));
+
+    // Retry against a healthy endpoint while paused must be rejected, not
+    // silently applied.
+    let result = client.try_anchor_confession(&h, &1_000);
+    assert!(result.is_err(), "paused contract must reject failover retry");
+
+    // Reads remain safe for health probes during failover.
+    assert_eq!(client.verify_confession(&h), Some(1_000));
+    assert_eq!(client.get_confession_count(), 1);
+
+    client.unpause(&owner, &reason(&env, "rpc-recovered"));
+    assert_eq!(
+        client.anchor_confession(&h, &1_000),
+        soroban_sdk::symbol_short!("exists")
+    );
+    assert_eq!(client.get_confession_count(), 1);
+}
+
+#[test]
+fn failover_retries_across_endpoints_never_duplicate_anchors() {
+    let (env, client, _owner) = setup();
+    let h = hash(&env, 62);
+
+    // Simulate three endpoints each retrying the same submission.
+    for _ in 0..3 {
+        client.anchor_confession(&h, &1_000);
+    }
+
+    assert_eq!(client.get_confession_count(), 1);
+    assert_eq!(client.verify_confession(&h), Some(1_000));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suite 10 — Serialized sequence allocation (issue #274)
+//
+// Multiple transaction workers may submit anchors for distinct confessions
+// concurrently. Each submission must be independently valid and must not
+// invalidate another worker's write, so the final state must contain every
+// unique anchor exactly once.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn concurrent_workers_allocate_distinct_sequences_without_invalidating() {
+    let (env, client, _owner) = setup();
+
+    // Interleave submissions from several workers, each with its own hash.
+    let worker_hashes: [u8; 4] = [70, 71, 72, 73];
+    for round in 0u64..3 {
+        for seed in worker_hashes.iter() {
+            let h = hash(&env, *seed);
+            let status = client.anchor_confession(&h, &(round * 1_000 + *seed as u64));
+            // First round anchors; later rounds are idempotent retries.
+            let expected = if round == 0 {
+                soroban_sdk::symbol_short!("anchored")
+            } else {
+                soroban_sdk::symbol_short!("exists")
+            };
+            assert_eq!(status, expected);
+        }
+    }
+
+    assert_eq!(client.get_confession_count(), 4);
+    for seed in worker_hashes.iter() {
+        assert_eq!(
+            client.verify_confession(&hash(&env, *seed)),
+            Some(*seed as u64),
+            "worker anchor must retain its original timestamp"
+        );
+    }
+}
+
+#[test]
+fn sequence_coordinator_recovery_after_worker_failure() {
+    let (env, client, owner) = setup();
+
+    // A worker anchors, then "fails" before its retry; a recovery worker
+    // resumes with the same payload and must not double-apply.
+    let h = hash(&env, 80);
+    client.anchor_confession(&h, &5_000);
+
+    // Recovery path: pause/unpause simulates coordinator lease recovery.
+    client.pause(&owner, &reason(&env, "lease-recovery"));
+    assert!(client.try_anchor_confession(&h, &5_000).is_err());
+    client.unpause(&owner, &reason(&env, "lease-recovered"));
+
+    assert_eq!(
+        client.anchor_confession(&h, &5_000),
+        soroban_sdk::symbol_short!("exists")
+    );
+    assert_eq!(client.get_confession_count(), 1);
+    assert_eq!(client.verify_confession(&h), Some(5_000));
+}

@@ -4,12 +4,19 @@ import * as StellarSDK from '@stellar/stellar-sdk';
 import { StellarConfigService } from './stellar-config.service';
 import { ITransactionOptions } from './interfaces/stellar-config.interface';
 import { redactSecretStrings } from '../utils/redact-secrets';
+import {
+  AccountSequenceCoordinator,
+  AccountSequenceLease,
+} from './account-sequence-coordinator.service';
 
 @Injectable()
 export class TransactionBuilderService {
   private readonly logger = new Logger(TransactionBuilderService.name);
 
-  constructor(private stellarConfig: StellarConfigService) {}
+  constructor(
+    private stellarConfig: StellarConfigService,
+    private sequenceCoordinator: AccountSequenceCoordinator,
+  ) {}
 
   /**
    * Build a Stellar transaction with operations
@@ -19,6 +26,28 @@ export class TransactionBuilderService {
     sourcePublicKey: string,
     operations: any[],
     options?: ITransactionOptions,
+  ): Promise<any> {
+    // Serialize sequence allocation for this account across workers. The lease
+    // is held for the whole build (loadAccount -> build) so concurrent
+    // submitters cannot observe and reuse the same sequence number.
+    const lease = await this.sequenceCoordinator.acquire(sourcePublicKey);
+    try {
+      return await this.buildTransactionWithLease(
+        sourcePublicKey,
+        operations,
+        options,
+        lease,
+      );
+    } finally {
+      await this.sequenceCoordinator.release(lease);
+    }
+  }
+
+  private async buildTransactionWithLease(
+    sourcePublicKey: string,
+    operations: any[],
+    options: ITransactionOptions | undefined,
+    lease: AccountSequenceLease,
   ): Promise<any> {
     const maxFee = this.stellarConfig.getConfig().maxFeeBudget;
     const feeBackoffMs = this.stellarConfig.getConfig().feeBackoffMs;
@@ -46,9 +75,15 @@ export class TransactionBuilderService {
       }
 
       try {
-        // Load source account
+        // Load source account. The coordinator pins the sequence we are allowed
+        // to build against so a stale network read cannot reuse a sequence.
         const server = this.stellarConfig.getServer();
         const sourceAccount = await server.loadAccount(sourcePublicKey);
+        const pinnedSequence = this.sequenceCoordinator.nextSequence(
+          lease,
+          sourceAccount.sequenceNumber(),
+        );
+        sourceAccount.sequenceNumber = () => pinnedSequence;
 
         const txBuilder = new StellarSDK.TransactionBuilder(sourceAccount, {
           fee: options?.fee || feeEstimate.toString(),
@@ -140,6 +175,35 @@ export class TransactionBuilderService {
    * Submit transaction to network with bounded retries for transient failures
    */
   async submitTransaction(transaction: any): Promise<any> {
+    // Hold the account sequence lease across submission so a retry or a
+    // concurrent worker cannot interleave a competing sequence.
+    const sourceAccountId = this.getSourceAccountId(transaction);
+    const lease = sourceAccountId
+      ? await this.sequenceCoordinator.acquire(sourceAccountId)
+      : undefined;
+
+    try {
+      return await this.submitTransactionWithLease(transaction);
+    } finally {
+      if (lease) {
+        await this.sequenceCoordinator.release(lease);
+      }
+    }
+  }
+
+  private getSourceAccountId(transaction: any): string | undefined {
+    try {
+      const source = transaction?.source;
+      if (!source) {
+        return undefined;
+      }
+      return typeof source === 'string' ? source : source.accountId?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async submitTransactionWithLease(transaction: any): Promise<any> {
     const maxRetries = this.stellarConfig.getConfig().rpcMaxRetries;
     const baseDelay = this.stellarConfig.getConfig().rpcRetryBaseDelayMs;
     const maxDelay = this.stellarConfig.getConfig().rpcRetryMaxDelayMs;
@@ -170,6 +234,14 @@ export class TransactionBuilderService {
             txCode === 'tx_malformed' ||
             txCode === 'tx_not_supported'
           ) {
+            if (txCode === 'tx_bad_seq') {
+              // Sequence was consumed or invalidated elsewhere; drop the cached
+              // sequence so the next build re-reads from the network.
+              const accountId = this.getSourceAccountId(transaction);
+              if (accountId) {
+                this.sequenceCoordinator.invalidate(accountId);
+              }
+            }
             throw new Error(`Transaction failed (non-retryable): ${JSON.stringify(resultCodes)}`);
           }
         }

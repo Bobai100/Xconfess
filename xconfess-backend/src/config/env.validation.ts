@@ -114,6 +114,38 @@ export const envValidationSchema = Joi.object({
   STELLAR_SOROBAN_RPC_URL: Joi.string()
     .uri()
     .default('https://soroban-rpc-testnet.stellar.org'),
+  // Comma-separated ordered list of Soroban RPC endpoints used for failover.
+  // The first entry is preferred; STELLAR_SOROBAN_RPC_URL is used when unset.
+  STELLAR_SOROBAN_RPC_URLS: Joi.string()
+    .allow('')
+    .pattern(/^https?:\/\/[^\s,]+(,https?:\/\/[^\s,]+)*$/)
+    .optional()
+    .messages({
+      'string.pattern.base':
+        'STELLAR_SOROBAN_RPC_URLS must be a comma-separated list of http(s) URLs.',
+    }),
+  // How long an endpoint stays in cooldown after a failure before it is probed again.
+  STELLAR_RPC_COOLDOWN_MS: Joi.number().min(100).default(30000),
+  // Per-request timeout applied to each RPC call before the endpoint is marked unhealthy.
+  STELLAR_RPC_REQUEST_TIMEOUT_MS: Joi.number().min(100).default(10000),
+  // Consecutive failures required before an endpoint is taken out of rotation.
+  STELLAR_RPC_FAILURE_THRESHOLD: Joi.number().min(1).default(3),
+  // Consecutive successes required before a recovering endpoint is trusted again.
+  STELLAR_RPC_RECOVERY_SUCCESS_THRESHOLD: Joi.number().min(1).default(2),
+  // Interval for background health probes of cooling-down endpoints.
+  STELLAR_RPC_HEALTH_PROBE_INTERVAL_MS: Joi.number().min(100).default(15000),
+  // Maximum number of failover attempts per RPC operation (bounded recovery).
+  STELLAR_RPC_MAX_FAILOVER_ATTEMPTS: Joi.number().min(1).max(10).default(3),
+  // Backoff between failover attempts.
+  STELLAR_RPC_RETRY_BACKOFF_MS: Joi.number().min(0).default(250),
+  // Whether submit operations may fail over to another endpoint (read-only ops always may).
+  STELLAR_RPC_SUBMIT_FAILOVER_ENABLED: Joi.string()
+    .valid('true', 'false')
+    .default('true'),
+  // Lease TTL for the account-scoped sequence coordinator.
+  STELLAR_SEQUENCE_LEASE_TTL_MS: Joi.number().min(1000).default(30000),
+  // Max time to wait for a sequence lease before failing the submission.
+  STELLAR_SEQUENCE_LEASE_WAIT_MS: Joi.number().min(0).default(15000),
   DEPLOYMENT_METADATA_PATH: Joi.string().optional(),
   CONFESSION_ANCHOR_CONTRACT_ID: Joi.string().when(
     'STELLAR_FEATURES_ENABLED',

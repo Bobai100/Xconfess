@@ -78,6 +78,38 @@ interface ProcessedTransactionData {
   receiptMetadata: SettlementReceiptMetadata;
 }
 
+/**
+ * Minimal structural contract for the account-scoped sequence coordinator
+ * (issue #274). The coordinator serialises sequence allocation per source
+ * account across concurrent transaction workers, hands out leases with an
+ * expiry, and recovers leases abandoned by a crashed process.
+ *
+ * It is declared structurally here so the tipping service can depend on it
+ * without a hard import cycle, and so tests can inject a fake.
+ */
+export interface AccountSequenceCoordinator {
+  /**
+   * Run `work` while holding an exclusive lease on `account`'s sequence.
+   * Concurrent callers for the same account are serialised; callers for
+   * different accounts proceed in parallel.
+   */
+  withSequenceLease<T>(
+    account: string,
+    work: (lease: AccountSequenceLease) => Promise<T>,
+    options?: { ownerId?: string; leaseTtlMs?: number },
+  ): Promise<T>;
+}
+
+export interface AccountSequenceLease {
+  account: string;
+  /** Monotonic sequence number reserved for this lease. */
+  sequence: string;
+  /** Unique lease identifier, useful for auditing and recovery. */
+  leaseId: string;
+  /** Extend the lease if the work is still in flight. */
+  renew(ttlMs?: number): Promise<void>;
+}
+
 // PostgreSQL unique-violation error code
 const PG_UNIQUE_VIOLATION = '23505';
 
@@ -91,6 +123,7 @@ const PG_UNIQUE_VIOLATION = '23505';
 export class TippingService {
   private static readonly MAX_RECEIPT_PROOF_METADATA_LEN = 128;
   private static readonly LOCK_TIMEOUT_MS = 30_000; // 30 seconds
+  private static readonly DEFAULT_SEQUENCE_LEASE_TTL_MS = 15_000;
   private readonly logger = new Logger(TippingService.name);
 
   constructor(
@@ -105,6 +138,8 @@ export class TippingService {
     private readonly configService?: ConfigService,
     @Optional()
     private readonly analyticsEventService?: AnalyticsEventService,
+    @Optional()
+    private readonly sequenceCoordinator?: AccountSequenceCoordinator,
   ) {}
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -173,7 +208,14 @@ export class TippingService {
    *    totals in the audit trail are always accurate regardless of how many
    *    concurrent verify calls arrive for the same transaction.
    *
-   * Issues: #1480, #170, #784, #777
+   * 5. **Account sequence coordination (issue #274)** — when a sequence
+   *    coordinator is configured, the on-chain settlement work runs while
+   *    holding an account-scoped sequence lease. Concurrent tipping workers
+   *    for the same source account are serialised so they cannot build
+   *    transactions from the same sequence and invalidate each other. Leases
+   *    carry a TTL and are recovered after process failure by the coordinator.
+   *
+   * Issues: #1480, #170, #784, #777, #274
    */
   async verifyAndRecordTip(
     confessionId: string,
@@ -303,237 +345,15 @@ export class TippingService {
       });
     }
 
-    // ── 5. On-chain verification ──────────────────────────────────────────
+    // ── 5. On-chain verification (sequence-coordinated) ───────────────────
     try {
-      let isValid = false;
-      try {
-        isValid = await this.stellarService.verifyTransaction(
-          dto.txId,
-          requestId,
-        );
-      } catch (verifyError: any) {
-        this.logger.warn({
-          message: 'Network error verifying transaction, marking for retry',
-          requestId,
-          confessionId,
-          txHash: dto.txId,
-          error: verifyError.message,
-        });
-        await this.updateRetryMetadata(sentinelTip.id, 'network_error', {
-          error: verifyError.message,
-          attemptedAt: new Date().toISOString(),
-        });
-        await this.releaseProcessingLock(sentinelTip.id);
-        throw new ConflictException({
-          message: `Transaction ${dto.txId} verification temporarily failed due to network error. Will be retried.`,
-          state: 'failed' as TipResponseState,
-          conflictReason: 'NETWORK_ERROR',
-          canRetry: true,
-        });
-      }
-
-      if (!isValid) {
-        this.logger.warn({
-          message: 'Transaction not found or invalid on Stellar network',
-          requestId,
-          confessionId,
-          txHash: dto.txId,
-        });
-        await this.updateRetryMetadata(sentinelTip.id, 'not_found', {
-          error: 'Transaction not found on chain',
-          attemptedAt: new Date().toISOString(),
-        });
-        await this.releaseProcessingLock(sentinelTip.id);
-        throw new BadRequestException(
-          'Transaction not found or invalid on Stellar network',
-        );
-      }
-
-      // ── 6. Fetch Horizon data ─────────────────────────────────────────
-      let txData: any;
-      try {
-        txData = await this.fetchTransactionData(dto.txId);
-      } catch (fetchError: any) {
-        const isRetryable =
-          fetchError instanceof GatewayTimeoutException ||
-          fetchError instanceof NotFoundException;
-        if (isRetryable) {
-          await this.updateRetryMetadata(sentinelTip.id, 'fetch_retryable', {
-            error: fetchError.message,
-            attemptedAt: new Date().toISOString(),
-          });
-          await this.releaseProcessingLock(sentinelTip.id);
-          throw new ConflictException({
-            message: `Transaction ${dto.txId} data fetch failed temporarily. Will be retried.`,
-            state: 'failed' as TipResponseState,
-            conflictReason: 'NETWORK_ERROR',
-            canRetry: true,
-          });
-        }
-        throw fetchError;
-      }
-
-      const processedData = await this.processTransactionData(txData, dto.txId);
-
-      // ── 7. Amount bounds validation ─────────────────────────────────────
-      if (processedData.amount < MIN_TIP_AMOUNT) {
-        await this.updateRetryMetadata(sentinelTip.id, 'invalid_amount', {
-          amount: processedData.amount,
-          minRequired: MIN_TIP_AMOUNT,
-          maxAllowed: MAX_TIP_AMOUNT,
-          reason: 'below_minimum',
-        });
-        await this.releaseProcessingLock(sentinelTip.id);
-        throw new BadRequestException(
-          `Tip amount ${processedData.amount} XLM is below minimum of ${MIN_TIP_AMOUNT} XLM`,
-        );
-      }
-
-      if (processedData.amount > MAX_TIP_AMOUNT) {
-        await this.updateRetryMetadata(sentinelTip.id, 'invalid_amount', {
-          amount: processedData.amount,
-          minRequired: MIN_TIP_AMOUNT,
-          maxAllowed: MAX_TIP_AMOUNT,
-          reason: 'above_maximum',
-        });
-        await this.releaseProcessingLock(sentinelTip.id);
-        throw new BadRequestException(
-          `Tip amount ${processedData.amount} XLM exceeds maximum of ${MAX_TIP_AMOUNT} XLM`,
-        );
-      }
-
-      // Validate precision: no more than TIP_PRECISION decimal places
-      const amountStr = processedData.amount.toString();
-      const decimalPart = amountStr.includes('.') ? amountStr.split('.')[1] : '';
-      if (decimalPart.length > TIP_PRECISION) {
-        await this.updateRetryMetadata(sentinelTip.id, 'invalid_amount', {
-          amount: processedData.amount,
-          decimalPlaces: decimalPart.length,
-          maxPrecision: TIP_PRECISION,
-          reason: 'excess_precision',
-        });
-        await this.releaseProcessingLock(sentinelTip.id);
-        throw new BadRequestException(
-          `Tip amount has ${decimalPart.length} decimal places, maximum allowed is ${TIP_PRECISION}`,
-        );
-      }
-
-      // ── 8. Finalise the sentinel row as VERIFIED (single write) ────────
-      const reconciliationMetadata = {
-        verifiedBy: 'user_request',
-        processedData: {
-          amount: processedData.amount,
-          senderAddress: processedData.senderAddress,
-        },
-        receiptMetadata: processedData.receiptMetadata,
+      return await this.runSequenceCoordinatedSettlement(
+        confessionId,
+        dto,
+        requestId,
         idempotencyKey,
-        requestId: requestId ?? null,
-      };
-
-      sentinelTip.amount = processedData.amount;
-      sentinelTip.senderAddress = processedData.senderAddress;
-      sentinelTip.verificationStatus = TipVerificationStatus.VERIFIED;
-      sentinelTip.verifiedAt = new Date();
-      sentinelTip.lastChainStatus = 'verified';
-      sentinelTip.lastCheckedAt = new Date();
-      sentinelTip.reconciliationMetadata = reconciliationMetadata;
-      sentinelTip.processingLock = null;
-      sentinelTip.lockedAt = null;
-      sentinelTip.lockedBy = null;
-
-      const savedTip = await this.tipRepository.save(sentinelTip);
-      const amountAtomic = Math.round(
-        processedData.amount * 10_000_000,
-      ).toString();
-      const network = this.getAnalyticsNetwork();
-
-      this.analyticsEventService
-        ?.record({
-          eventName: 'tip_completed',
-          txHash: dto.txId,
-          assetCode: 'XLM',
-          amountAtomic,
-          network,
-          idempotencyKey: `tip_completed:${dto.txId}`,
-          metadata: {
-            source: 'tipping_service',
-            tipId: savedTip.id,
-            confessionId,
-            requestId: requestId ?? null,
-          },
-        })
-        .catch((err) =>
-          this.logger.warn({
-            message: 'Failed to record tip analytics',
-            requestId,
-            confessionId,
-            txHash: dto.txId,
-            error: err instanceof Error ? err.message : String(err),
-          }),
-        );
-      this.analyticsEventService
-        ?.record({
-          eventName: 'stellar_tx_confirmed',
-          txHash: dto.txId,
-          assetCode: 'XLM',
-          amountAtomic,
-          network,
-          idempotencyKey: `stellar_tx_confirmed:${dto.txId}`,
-          metadata: { source: 'tipping_service', requestId: requestId ?? null },
-        })
-        .catch((err) =>
-          this.logger.warn({
-            message: 'Failed to record Stellar confirmation analytics',
-            requestId,
-            txHash: dto.txId,
-            error: err instanceof Error ? err.message : String(err),
-          }),
-        );
-
-      // ── 9. Post-success side-effects (emitted exactly once) ───────────
-
-      // Domain event for downstream listeners
-      this.eventEmitter.emit('tip.verified', {
-        tipId: savedTip.id,
-        confessionId,
-        txId: dto.txId,
-        amount: processedData.amount,
-        requestId,
-      });
-
-      // Audit log — one settlement event per unique (confession, tx) pair.
-      // Because only the first-writer reaches this code path, concurrent
-      // duplicates never emit a second event.
-      await this.auditLogService.log({
-        actionType: AuditActionType.TIP_SETTLEMENT_VERIFIED,
-        metadata: {
-          entityType: 'tip',
-          entityId: savedTip.id,
-          tipId: savedTip.id,
-          confessionId,
-          txId: dto.txId,
-          amount: processedData.amount,
-          idempotencyKey,
-          requestId: requestId ?? null,
-          settledAt: savedTip.verifiedAt?.toISOString(),
-        },
-        context: {
-          actor: { type: 'system', id: 'tipping-service' },
-          requestId,
-        },
-      });
-
-      this.logger.log({
-        message: 'Tip verify succeeded',
-        requestId,
-        confessionId,
-        txHash: dto.txId,
-        tipId: savedTip.id,
-        amount: processedData.amount,
-        isNew: true,
-      });
-
-      return { tip: savedTip, isNew: true, isIdempotent: false, state: 'verified' };
+        sentinelTip,
+      );
     } catch (error) {
       // Best-effort: release the processing lock so the reconciler can retry.
       // If the sentinel row itself is the problem (e.g. amount/fetch error),
@@ -568,6 +388,373 @@ export class TippingService {
 
       throw error;
     }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Sequence-coordinated settlement (issue #274)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Run the on-chain settlement for a first-writer sentinel while holding an
+   * account-scoped sequence lease. When no coordinator is configured we fall
+   * back to running the settlement directly (single-worker deployments).
+   */
+  private async runSequenceCoordinatedSettlement(
+    confessionId: string,
+    dto: VerifyTipDto,
+    requestId: string | undefined,
+    idempotencyKey: string,
+    sentinelTip: Tip,
+  ): Promise<TipVerificationResult> {
+    const settlement = () =>
+      this.settleSentinelTip(
+        confessionId,
+        dto,
+        requestId,
+        idempotencyKey,
+        sentinelTip,
+      );
+
+    if (!this.sequenceCoordinator) {
+      return settlement();
+    }
+
+    const account = this.resolveSequenceAccount();
+    const leaseTtlMs = this.resolveSequenceLeaseTtlMs();
+
+    this.logger.debug({
+      message: 'Acquiring account sequence lease',
+      requestId,
+      confessionId,
+      txHash: dto.txId,
+      account,
+      leaseTtlMs,
+    });
+
+    return this.sequenceCoordinator.withSequenceLease(
+      account,
+      async (lease) => {
+        this.logger.debug({
+          message: 'Account sequence lease acquired',
+          requestId,
+          confessionId,
+          txHash: dto.txId,
+          account: lease.account,
+          sequence: lease.sequence,
+          leaseId: lease.leaseId,
+        });
+
+        // Persist the reserved sequence so reconciliation can correlate the
+        // settlement with the sequence slot it consumed.
+        await this.recordSequenceLease(sentinelTip.id, lease);
+
+        return settlement();
+      },
+      {
+        ownerId: `tipping:${requestId ?? sentinelTip.id}`,
+        leaseTtlMs,
+      },
+    );
+  }
+
+  /**
+   * Resolve the source account whose sequence must be serialised. Tipping
+   * settlements are submitted from the configured hot wallet; fall back to a
+   * stable sentinel so single-account deployments still serialise correctly.
+   */
+  private resolveSequenceAccount(): string {
+    const configured =
+      this.configService?.get<string>('STELLAR_TIPPING_SOURCE_ACCOUNT') ??
+      this.configService?.get<string>('STELLAR_HOT_WALLET_PUBLIC_KEY');
+    return configured && configured.length > 0 ? configured : 'default-tipping-account';
+  }
+
+  private resolveSequenceLeaseTtlMs(): number {
+    const raw = this.configService?.get<string>(
+      'TIPPING_SEQUENCE_LEASE_TTL_MS',
+    );
+    const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+    return Number.isFinite(parsed) && parsed > 0
+      ? parsed
+      : TippingService.DEFAULT_SEQUENCE_LEASE_TTL_MS;
+  }
+
+  /**
+   * Best-effort persistence of the reserved sequence onto the sentinel row so
+   * operators can correlate a settlement with the sequence slot it consumed.
+   * Failures here must never abort settlement.
+   */
+  private async recordSequenceLease(
+    tipId: string,
+    lease: AccountSequenceLease,
+  ): Promise<void> {
+    try {
+      await this.tipRepository
+        .createQueryBuilder()
+        .update(Tip)
+        .set({
+          reconciliationMetadata: () =>
+            `COALESCE(reconciliation_metadata, '{}'::jsonb) || :leaseMetadata::jsonb`,
+        })
+        .setParameters({
+          leaseMetadata: JSON.stringify({
+            sequenceLease: {
+              account: lease.account,
+              sequence: lease.sequence,
+              leaseId: lease.leaseId,
+              acquiredAt: new Date().toISOString(),
+            },
+          }),
+        })
+        .where('id = :tipId', { tipId })
+        .execute();
+    } catch (err) {
+      this.logger.warn({
+        message: 'Failed to persist sequence lease metadata',
+        tipId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Perform the actual on-chain verification and finalisation of a sentinel
+   * tip row. Extracted from `verifyAndRecordTip` so it can be wrapped in an
+   * account sequence lease without duplicating logic.
+   */
+  private async settleSentinelTip(
+    confessionId: string,
+    dto: VerifyTipDto,
+    requestId: string | undefined,
+    idempotencyKey: string,
+    sentinelTip: Tip,
+  ): Promise<TipVerificationResult> {
+    let isValid = false;
+    try {
+      isValid = await this.stellarService.verifyTransaction(dto.txId, requestId);
+    } catch (verifyError: any) {
+      this.logger.warn({
+        message: 'Network error verifying transaction, marking for retry',
+        requestId,
+        confessionId,
+        txHash: dto.txId,
+        error: verifyError.message,
+      });
+      await this.updateRetryMetadata(sentinelTip.id, 'network_error', {
+        error: verifyError.message,
+        attemptedAt: new Date().toISOString(),
+      });
+      await this.releaseProcessingLock(sentinelTip.id);
+      throw new ConflictException({
+        message: `Transaction ${dto.txId} verification temporarily failed due to network error. Will be retried.`,
+        state: 'failed' as TipResponseState,
+        conflictReason: 'NETWORK_ERROR',
+        canRetry: true,
+      });
+    }
+
+    if (!isValid) {
+      this.logger.warn({
+        message: 'Transaction not found or invalid on Stellar network',
+        requestId,
+        confessionId,
+        txHash: dto.txId,
+      });
+      await this.updateRetryMetadata(sentinelTip.id, 'not_found', {
+        error: 'Transaction not found on chain',
+        attemptedAt: new Date().toISOString(),
+      });
+      await this.releaseProcessingLock(sentinelTip.id);
+      throw new BadRequestException(
+        'Transaction not found or invalid on Stellar network',
+      );
+    }
+
+    // ── Fetch Horizon data ─────────────────────────────────────────────
+    let txData: any;
+    try {
+      txData = await this.fetchTransactionData(dto.txId);
+    } catch (fetchError: any) {
+      const isRetryable =
+        fetchError instanceof GatewayTimeoutException ||
+        fetchError instanceof NotFoundException;
+      if (isRetryable) {
+        await this.updateRetryMetadata(sentinelTip.id, 'fetch_retryable', {
+          error: fetchError.message,
+          attemptedAt: new Date().toISOString(),
+        });
+        await this.releaseProcessingLock(sentinelTip.id);
+        throw new ConflictException({
+          message: `Transaction ${dto.txId} data fetch failed temporarily. Will be retried.`,
+          state: 'failed' as TipResponseState,
+          conflictReason: 'NETWORK_ERROR',
+          canRetry: true,
+        });
+      }
+      throw fetchError;
+    }
+
+    const processedData = await this.processTransactionData(txData, dto.txId);
+
+    // ── Amount bounds validation ────────────────────────────────────────
+    if (processedData.amount < MIN_TIP_AMOUNT) {
+      await this.updateRetryMetadata(sentinelTip.id, 'invalid_amount', {
+        amount: processedData.amount,
+        minRequired: MIN_TIP_AMOUNT,
+        maxAllowed: MAX_TIP_AMOUNT,
+        reason: 'below_minimum',
+      });
+      await this.releaseProcessingLock(sentinelTip.id);
+      throw new BadRequestException(
+        `Tip amount ${processedData.amount} XLM is below minimum of ${MIN_TIP_AMOUNT} XLM`,
+      );
+    }
+
+    if (processedData.amount > MAX_TIP_AMOUNT) {
+      await this.updateRetryMetadata(sentinelTip.id, 'invalid_amount', {
+        amount: processedData.amount,
+        minRequired: MIN_TIP_AMOUNT,
+        maxAllowed: MAX_TIP_AMOUNT,
+        reason: 'above_maximum',
+      });
+      await this.releaseProcessingLock(sentinelTip.id);
+      throw new BadRequestException(
+        `Tip amount ${processedData.amount} XLM exceeds maximum of ${MAX_TIP_AMOUNT} XLM`,
+      );
+    }
+
+    // Validate precision: no more than TIP_PRECISION decimal places
+    const amountStr = processedData.amount.toString();
+    const decimalPart = amountStr.includes('.') ? amountStr.split('.')[1] : '';
+    if (decimalPart.length > TIP_PRECISION) {
+      await this.updateRetryMetadata(sentinelTip.id, 'invalid_amount', {
+        amount: processedData.amount,
+        decimalPlaces: decimalPart.length,
+        maxPrecision: TIP_PRECISION,
+        reason: 'excess_precision',
+      });
+      await this.releaseProcessingLock(sentinelTip.id);
+      throw new BadRequestException(
+        `Tip amount has ${decimalPart.length} decimal places, maximum allowed is ${TIP_PRECISION}`,
+      );
+    }
+
+    // ── Finalise the sentinel row as VERIFIED (single write) ────────────
+    const reconciliationMetadata = {
+      verifiedBy: 'user_request',
+      processedData: {
+        amount: processedData.amount,
+        senderAddress: processedData.senderAddress,
+      },
+      receiptMetadata: processedData.receiptMetadata,
+      idempotencyKey,
+      requestId: requestId ?? null,
+    };
+
+    sentinelTip.amount = processedData.amount;
+    sentinelTip.senderAddress = processedData.senderAddress;
+    sentinelTip.verificationStatus = TipVerificationStatus.VERIFIED;
+    sentinelTip.verifiedAt = new Date();
+    sentinelTip.lastChainStatus = 'verified';
+    sentinelTip.lastCheckedAt = new Date();
+    sentinelTip.reconciliationMetadata = reconciliationMetadata;
+    sentinelTip.processingLock = null;
+    sentinelTip.lockedAt = null;
+    sentinelTip.lockedBy = null;
+
+    const savedTip = await this.tipRepository.save(sentinelTip);
+    const amountAtomic = Math.round(
+      processedData.amount * 10_000_000,
+    ).toString();
+    const network = this.getAnalyticsNetwork();
+
+    this.analyticsEventService
+      ?.record({
+        eventName: 'tip_completed',
+        txHash: dto.txId,
+        assetCode: 'XLM',
+        amountAtomic,
+        network,
+        idempotencyKey: `tip_completed:${dto.txId}`,
+        metadata: {
+          source: 'tipping_service',
+          tipId: savedTip.id,
+          confessionId,
+          requestId: requestId ?? null,
+        },
+      })
+      .catch((err) =>
+        this.logger.warn({
+          message: 'Failed to record tip analytics',
+          requestId,
+          confessionId,
+          txHash: dto.txId,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    this.analyticsEventService
+      ?.record({
+        eventName: 'stellar_tx_confirmed',
+        txHash: dto.txId,
+        assetCode: 'XLM',
+        amountAtomic,
+        network,
+        idempotencyKey: `stellar_tx_confirmed:${dto.txId}`,
+        metadata: { source: 'tipping_service', requestId: requestId ?? null },
+      })
+      .catch((err) =>
+        this.logger.warn({
+          message: 'Failed to record Stellar confirmation analytics',
+          requestId,
+          txHash: dto.txId,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+
+    // ── Post-success side-effects (emitted exactly once) ───────────────
+
+    // Domain event for downstream listeners
+    this.eventEmitter.emit('tip.verified', {
+      tipId: savedTip.id,
+      confessionId,
+      txId: dto.txId,
+      amount: processedData.amount,
+      requestId,
+    });
+
+    // Audit log — one settlement event per unique (confession, tx) pair.
+    // Because only the first-writer reaches this code path, concurrent
+    // duplicates never emit a second event.
+    await this.auditLogService.log({
+      actionType: AuditActionType.TIP_SETTLEMENT_VERIFIED,
+      metadata: {
+        entityType: 'tip',
+        entityId: savedTip.id,
+        tipId: savedTip.id,
+        confessionId,
+        txId: dto.txId,
+        amount: processedData.amount,
+        idempotencyKey,
+        requestId: requestId ?? null,
+        settledAt: savedTip.verifiedAt?.toISOString(),
+      },
+      context: {
+        actor: { type: 'system', id: 'tipping-service' },
+        requestId,
+      },
+    });
+
+    this.logger.log({
+      message: 'Tip verify succeeded',
+      requestId,
+      confessionId,
+      txHash: dto.txId,
+      tipId: savedTip.id,
+      amount: processedData.amount,
+      isNew: true,
+    });
+
+    return { tip: savedTip, isNew: true, isIdempotent: false, state: 'verified' };
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -796,127 +983,3 @@ export class TippingService {
         `Failed to process tip transaction: ${error instanceof Error ? error.message : 'Unknown error'}`,
       );
     }
-  }
-
-  private extractSettlementReceiptMetadata(
-    txData: any,
-  ): SettlementReceiptMetadata {
-    const empty: SettlementReceiptMetadata = {
-      settlementId: null,
-      proofMetadata: null,
-      anonymousSender: false,
-    };
-
-    const memoType = txData?.memo_type;
-    const memoValue = txData?.memo;
-    if (
-      memoType !== 'text' ||
-      typeof memoValue !== 'string' ||
-      memoValue.length === 0
-    ) {
-      return empty;
-    }
-
-    try {
-      const payload = JSON.parse(memoValue);
-      const settlementId =
-        typeof payload?.settlement_id === 'string' &&
-        payload.settlement_id.length > 0
-          ? payload.settlement_id
-          : null;
-      const proofMetadata =
-        typeof payload?.proof_metadata === 'string' &&
-        payload.proof_metadata.length > 0
-          ? payload.proof_metadata
-          : null;
-
-      if (
-        proofMetadata &&
-        proofMetadata.length > TippingService.MAX_RECEIPT_PROOF_METADATA_LEN
-      ) {
-        throw new BadRequestException(
-          'Settlement receipt proof metadata exceeds allowed bounds',
-        );
-      }
-
-      return {
-        settlementId,
-        proofMetadata,
-        anonymousSender: payload?.anonymous_sender === true,
-      };
-    } catch (error) {
-      if (error instanceof BadRequestException) throw error;
-      return empty;
-    }
-  }
-
-  /**
-   * Acquire a processing lock for a tip to prevent concurrent verify/reconciliation races
-   * Issue #784: Preserve single-credit semantics
-   */
-  private async acquireProcessingLock(
-    txId: string,
-    processType: 'verify' | 'reconciliation',
-  ): Promise<{ success: boolean; existingTip?: Tip }> {
-    const lockId = crypto.randomBytes(16).toString('hex');
-    const now = new Date();
-
-    return await this.tipRepository.manager.transaction(async (manager) => {
-      const tipRepo = manager.getRepository(Tip);
-
-      // Check if tip already exists
-      const existingTip = await tipRepo.findOne({
-        where: { txId },
-      });
-
-      if (existingTip) {
-        // Tip already processed - return it for idempotent response
-        if (existingTip.verificationStatus === TipVerificationStatus.VERIFIED) {
-          return { success: false, existingTip };
-        }
-
-        // Check if there's an active lock
-        if (existingTip.processingLock) {
-          const lockAge = now.getTime() - (existingTip.lockedAt?.getTime() || 0);
-          
-          // If lock is stale (older than timeout), we can steal it
-          if (lockAge < TippingService.LOCK_TIMEOUT_MS) {
-            this.logger.warn(
-              `Tip ${txId} is already being processed by ${existingTip.lockedBy}`,
-            );
-            return { success: false, existingTip };
-          }
-
-          this.logger.warn(
-            `Stealing stale lock on tip ${txId} from ${existingTip.lockedBy}`,
-          );
-        }
-
-        // Acquire or update lock
-        await tipRepo.update(existingTip.id, {
-          processingLock: lockId,
-          lockedAt: now,
-          lockedBy: processType,
-          retryCount: existingTip.retryCount + 1,
-          lastCheckedAt: now,
-        });
-
-        return { success: true };
-      }
-
-      // Create new pending tip with lock
-      const newTip = tipRepo.create({
-        txId,
-        verificationStatus: TipVerificationStatus.PENDING,
-        processingLock: lockId,
-        lockedAt: now,
-        lockedBy: processType,
-        retryCount: 0,
-        lastCheckedAt: now,
-      });
-
-      await tipRepo.save(newTip);
-      return { success: true };
-    });
-  }
-}

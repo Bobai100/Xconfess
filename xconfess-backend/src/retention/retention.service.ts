@@ -14,6 +14,9 @@ import {
   RetentionPolicy,
   DOMAIN_RETENTION_POLICIES,
   PurgeExecutionReport,
+  RANKING_QUALITY_RETENTION_LIMITS,
+  RankingQualityAggregate,
+  RankingQualityRetentionViolation,
 } from './retention-policy.types';
 
 @Injectable()
@@ -233,5 +236,91 @@ export class RetentionService {
       order: { createdAt: 'DESC' },
       take: limit,
     });
+  }
+
+  /**
+   * Validate a batch of ranking-quality aggregates against the retention limits.
+   *
+   * Ranking quality drift detection must operate on aggregate-only indicators
+   * (minimum-cohort buckets). User-level histories are never retained for this
+   * purpose, so any aggregate that carries user-identifying fields or falls
+   * outside the configured retention window is rejected.
+   */
+  validateRankingQualityAggregates(
+    aggregates: RankingQualityAggregate[],
+    now: Date = new Date(),
+  ): RankingQualityRetentionViolation[] {
+    const limits = RANKING_QUALITY_RETENTION_LIMITS;
+    const violations: RankingQualityRetentionViolation[] = [];
+    const oldestAllowed = new Date(
+      now.getTime() - limits.maxRetentionDays * 24 * 60 * 60 * 1000,
+    );
+
+    for (const aggregate of aggregates) {
+      const bucketStart = new Date(aggregate.bucketStart);
+      if (Number.isNaN(bucketStart.getTime())) {
+        violations.push({
+          bucketStart: aggregate.bucketStart,
+          reason: 'invalid_bucket_start',
+        });
+        continue;
+      }
+
+      if (bucketStart < oldestAllowed) {
+        violations.push({
+          bucketStart: aggregate.bucketStart,
+          reason: 'exceeds_max_retention',
+        });
+      }
+
+      if (aggregate.cohortSize < limits.minCohortSize) {
+        violations.push({
+          bucketStart: aggregate.bucketStart,
+          reason: 'below_min_cohort_size',
+        });
+      }
+
+      if (this.containsUserLevelFields(aggregate)) {
+        violations.push({
+          bucketStart: aggregate.bucketStart,
+          reason: 'contains_user_level_data',
+        });
+      }
+    }
+
+    return violations;
+  }
+
+  /**
+   * Enforce retention limits by dropping aggregates that violate the policy.
+   * Returns the retained aggregates plus the violations that were removed.
+   */
+  enforceRankingQualityRetention(
+    aggregates: RankingQualityAggregate[],
+    now: Date = new Date(),
+  ): {
+    retained: RankingQualityAggregate[];
+    dropped: RankingQualityRetentionViolation[];
+  } {
+    const violations = this.validateRankingQualityAggregates(aggregates, now);
+    const droppedBuckets = new Set(violations.map((v) => v.bucketStart));
+
+    const retained = aggregates.filter(
+      (a) => !droppedBuckets.has(a.bucketStart),
+    );
+
+    if (violations.length > 0) {
+      this.logger.warn(
+        `Ranking quality retention dropped ${violations.length} aggregate violation(s)`,
+      );
+    }
+
+    return { retained, dropped: violations };
+  }
+
+  private containsUserLevelFields(aggregate: RankingQualityAggregate): boolean {
+    const forbidden = RANKING_QUALITY_RETENTION_LIMITS.forbiddenFields;
+    const record = aggregate as unknown as Record<string, unknown>;
+    return forbidden.some((field) => record[field] !== undefined && record[field] !== null);
   }
 }
