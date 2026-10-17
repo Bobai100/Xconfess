@@ -21,10 +21,62 @@ interface ReconciliationConfig {
   backoffBaseMinutes: number;
 }
 
+/**
+ * Configuration for the periodic indexed-event-range verification job.
+ *
+ * The verifier is read-only: it compares the locally indexed Soroban event
+ * ranges against ledger data and reports gaps. When gaps are found it may
+ * trigger a *bounded* reprocessing window, capped by `maxReprocessRanges`.
+ */
+interface EventRangeVerificationConfig {
+  enabled: boolean;
+  interval: string;
+  /** Number of most recent checkpoints to verify per run. */
+  checkpointWindow: number;
+  /** Maximum number of gap ranges to reprocess per run. */
+  maxReprocessRanges: number;
+  /** Maximum number of ledgers a single reprocess range may span. */
+  maxLedgersPerRange: number;
+  /** When false, gaps are only reported and never reprocessed. */
+  reprocessEnabled: boolean;
+}
+
+/**
+ * Minimal read-only contract the verifier depends on. Implementations live in
+ * the ingestion boundary; this worker only orchestrates scheduling/reporting.
+ */
+export interface EventRangeVerifier {
+  /** Returns the checkpoint ids to verify, newest first. */
+  listCheckpoints(limit: number): Promise<string[]>;
+  /** Compares a checkpoint's indexed range against ledger data. */
+  verifyCheckpoint(checkpointId: string): Promise<EventRangeVerificationResult>;
+  /** Safely reprocesses a bounded ledger range. Must be idempotent. */
+  reprocessRange(
+    checkpointId: string,
+    fromLedger: number,
+    toLedger: number,
+  ): Promise<void>;
+}
+
+export interface EventRangeGap {
+  checkpointId: string;
+  fromLedger: number;
+  toLedger: number;
+  reason: 'missing' | 'misclassified' | 'out_of_order';
+}
+
+export interface EventRangeVerificationResult {
+  checkpointId: string;
+  verified: boolean;
+  gaps: EventRangeGap[];
+}
+
 @Injectable()
 export class StellarReconciliationWorker {
   private readonly logger = new Logger(StellarReconciliationWorker.name);
   private readonly config: ReconciliationConfig;
+  private readonly eventRangeConfig: EventRangeVerificationConfig;
+  private eventRangeVerificationRunning = false;
 
   constructor(
     @InjectRepository(StellarAnchor)
@@ -36,6 +88,7 @@ export class StellarReconciliationWorker {
     private readonly auditService: AuditLogService,
     private readonly configService: ConfigService,
     private readonly eventEmitter: EventEmitter2,
+    private readonly eventRangeVerifier?: EventRangeVerifier,
   ) {
     const envInterval = process.env.STELLAR_RECONCILIATION_INTERVAL;
     this.config = {
@@ -44,6 +97,27 @@ export class StellarReconciliationWorker {
       batchSize: parseInt(process.env.STELLAR_RECONCILIATION_BATCH_SIZE || '50', 10),
       maxRetries: parseInt(process.env.STELLAR_RECONCILIATION_MAX_RETRIES || '5', 10),
       backoffBaseMinutes: parseInt(process.env.STELLAR_RECONCILIATION_BACKOFF_BASE || '2', 10),
+    };
+
+    this.eventRangeConfig = {
+      enabled:
+        (process.env.STELLAR_EVENT_RANGE_VERIFY_ENABLED || 'true') === 'true',
+      interval:
+        process.env.STELLAR_EVENT_RANGE_VERIFY_INTERVAL || '*/30 * * * *',
+      checkpointWindow: parseInt(
+        process.env.STELLAR_EVENT_RANGE_VERIFY_WINDOW || '10',
+        10,
+      ),
+      maxReprocessRanges: parseInt(
+        process.env.STELLAR_EVENT_RANGE_MAX_REPROCESS_RANGES || '5',
+        10,
+      ),
+      maxLedgersPerRange: parseInt(
+        process.env.STELLAR_EVENT_RANGE_MAX_LEDGERS_PER_RANGE || '1000',
+        10,
+      ),
+      reprocessEnabled:
+        (process.env.STELLAR_EVENT_RANGE_REPROCESS_ENABLED || 'true') === 'true',
     };
   }
 
@@ -101,6 +175,194 @@ export class StellarReconciliationWorker {
         timestamp: new Date(),
       });
     }
+  }
+
+  /**
+   * Periodic read-only verification of indexed Soroban event ranges.
+   *
+   * Compares indexed checkpoints against ledger data, reports gaps by
+   * checkpoint, and (when enabled) triggers bounded, idempotent reprocessing
+   * of the reported gap ranges. Never mutates anchor state directly.
+   */
+  @Cron(process.env.STELLAR_EVENT_RANGE_VERIFY_INTERVAL || '*/30 * * * *')
+  async verifyIndexedEventRanges(): Promise<void> {
+    if (!this.eventRangeConfig.enabled) {
+      return;
+    }
+    if (!this.eventRangeVerifier) {
+      this.logger.debug(
+        'Event range verifier not configured; skipping indexed range verification',
+      );
+      return;
+    }
+    // Prevent overlapping runs: a slow verification must not stack up.
+    if (this.eventRangeVerificationRunning) {
+      this.logger.warn(
+        'Event range verification already in progress; skipping this run',
+      );
+      return;
+    }
+
+    this.eventRangeVerificationRunning = true;
+    const requestId = randomUUID();
+
+    try {
+      const checkpointIds = await this.eventRangeVerifier.listCheckpoints(
+        this.eventRangeConfig.checkpointWindow,
+      );
+
+      if (checkpointIds.length === 0) {
+        this.logger.debug({
+          event: 'stellar_event_range_verify_no_checkpoints',
+          requestId,
+        });
+        return;
+      }
+
+      const gapsByCheckpoint: Record<string, EventRangeGap[]> = {};
+      let totalGaps = 0;
+
+      for (const checkpointId of checkpointIds) {
+        let result: EventRangeVerificationResult;
+        try {
+          result = await this.eventRangeVerifier.verifyCheckpoint(checkpointId);
+        } catch (error: any) {
+          // A verification failure for one checkpoint must not abort the run.
+          this.logger.warn({
+            event: 'stellar_event_range_verify_error',
+            requestId,
+            checkpointId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          continue;
+        }
+
+        if (!result.verified && result.gaps.length > 0) {
+          gapsByCheckpoint[checkpointId] = result.gaps;
+          totalGaps += result.gaps.length;
+        }
+      }
+
+      if (totalGaps === 0) {
+        this.logger.log({
+          event: 'stellar_event_range_verify_ok',
+          requestId,
+          checkpointsVerified: checkpointIds.length,
+        });
+        return;
+      }
+
+      this.logger.warn({
+        event: 'stellar_event_range_gaps_detected',
+        requestId,
+        checkpointsVerified: checkpointIds.length,
+        checkpointsWithGaps: Object.keys(gapsByCheckpoint).length,
+        totalGaps,
+        gapsByCheckpoint,
+      });
+
+      await this.auditService.log({
+        actionType: AuditActionType.STELLAR_ANCHOR_RETRY,
+        metadata: {
+          requestId,
+          operation: 'event_range_verification',
+          checkpointsVerified: checkpointIds.length,
+          totalGaps,
+          gapsByCheckpoint,
+        },
+      });
+
+      this.eventEmitter.emit('stellar.event_range.gaps', {
+        requestId,
+        gapsByCheckpoint,
+        totalGaps,
+        timestamp: new Date(),
+      });
+
+      if (this.eventRangeConfig.reprocessEnabled) {
+        await this.reprocessGapRanges(requestId, gapsByCheckpoint);
+      }
+    } catch (error: any) {
+      this.logger.error({
+        event: 'stellar_event_range_verify_failed',
+        requestId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      this.eventRangeVerificationRunning = false;
+    }
+  }
+
+  /**
+   * Reprocesses gap ranges within configured bounds. Each range is clamped to
+   * `maxLedgersPerRange` and the total number of ranges is capped by
+   * `maxReprocessRanges`. Reprocessing is idempotent and failures are isolated
+   * per range so one bad range cannot block the rest.
+   */
+  private async reprocessGapRanges(
+    requestId: string,
+    gapsByCheckpoint: Record<string, EventRangeGap[]>,
+  ): Promise<void> {
+    if (!this.eventRangeVerifier) return;
+
+    let processed = 0;
+    let skipped = 0;
+
+    for (const [checkpointId, gaps] of Object.entries(gapsByCheckpoint)) {
+      for (const gap of gaps) {
+        if (processed >= this.eventRangeConfig.maxReprocessRanges) {
+          skipped++;
+          continue;
+        }
+
+        const fromLedger = Math.min(gap.fromLedger, gap.toLedger);
+        const toLedger = Math.min(
+          Math.max(gap.fromLedger, gap.toLedger),
+          fromLedger + this.eventRangeConfig.maxLedgersPerRange - 1,
+        );
+
+        if (toLedger < fromLedger) {
+          skipped++;
+          continue;
+        }
+
+        try {
+          await this.eventRangeVerifier.reprocessRange(
+            checkpointId,
+            fromLedger,
+            toLedger,
+          );
+          processed++;
+
+          this.logger.log({
+            event: 'stellar_event_range_reprocessed',
+            requestId,
+            checkpointId,
+            fromLedger,
+            toLedger,
+            reason: gap.reason,
+          });
+        } catch (error: any) {
+          skipped++;
+          this.logger.warn({
+            event: 'stellar_event_range_reprocess_error',
+            requestId,
+            checkpointId,
+            fromLedger,
+            toLedger,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+
+    this.logger.log({
+      event: 'stellar_event_range_reprocess_complete',
+      requestId,
+      processed,
+      skipped,
+      maxReprocessRanges: this.eventRangeConfig.maxReprocessRanges,
+    });
   }
 
   private async retryAnchor(

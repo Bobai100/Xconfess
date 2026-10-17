@@ -22,6 +22,18 @@ CONTRACT_CRATES=(
   "reputation-badges"
 )
 
+# Migration rehearsal fixtures represent the last released on-chain storage
+# layout. They must be refreshed whenever a storage schema change ships.
+MIGRATION_FIXTURES_DIR="${XCONFESS_MIGRATION_FIXTURES_DIR:-$CONTRACTS_DIR/tests/fixtures/storage-migrations}"
+MIGRATION_TEST_TARGET="${XCONFESS_MIGRATION_TEST_TARGET:-storage_migration_rehearsal}"
+ROLLBACK_TEST_TARGET="${XCONFESS_ROLLBACK_TEST_TARGET:-storage_rollback_constraints}"
+COMPAT_REPORT_FILE="${XCONFESS_COMPAT_REPORT_FILE:-$REPO_ROOT/deployments/contract-compatibility-report.json}"
+# Explicit operator authorization is required to rehearse or release against a
+# storage layout that has not been signed off by the migration owner.
+RELEASE_AUTHORIZATION_ENV="${XCONFESS_RELEASE_AUTHORIZATION:-}"
+REQUIRED_AUTHORIZATION_TOKEN="${XCONFESS_REQUIRED_AUTHORIZATION_TOKEN:-storage-migration-approved}"
+=======
+
 timestamp_utc() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
@@ -61,6 +73,127 @@ stellar_arg_path() {
 crate_to_wasm_name() {
   local crate="$1"
   echo "${crate//-/_}.wasm"
+}
+
+require_release_authorization() {
+  local action="$1"
+  if [[ -z "$RELEASE_AUTHORIZATION_ENV" ]]; then
+    echo "Authorization required for '$action': set XCONFESS_RELEASE_AUTHORIZATION to the migration sign-off token." >&2
+    echo "Expected token: $REQUIRED_AUTHORIZATION_TOKEN" >&2
+    exit 1
+  fi
+  if [[ "$RELEASE_AUTHORIZATION_ENV" != "$REQUIRED_AUTHORIZATION_TOKEN" ]]; then
+    echo "Authorization rejected for '$action': XCONFESS_RELEASE_AUTHORIZATION does not match the required sign-off token." >&2
+    exit 1
+  fi
+}
+
+require_migration_fixtures() {
+  if [[ ! -d "$MIGRATION_FIXTURES_DIR" ]]; then
+    echo "Missing migration fixtures directory: $MIGRATION_FIXTURES_DIR" >&2
+    echo "Prior-version storage fixtures are required to rehearse upgrades." >&2
+    exit 1
+  fi
+  local fixture_count
+  fixture_count="$(find "$MIGRATION_FIXTURES_DIR" -type f -name '*.json' | wc -l | tr -d '[:space:]')"
+  if [[ "$fixture_count" -eq 0 ]]; then
+    echo "No prior-version storage fixtures (*.json) found in $MIGRATION_FIXTURES_DIR" >&2
+    exit 1
+  fi
+}
+
+rehearse_migration() {
+  local cargo_bin
+  cargo_bin="$(resolve_cmd cargo)" || {
+    echo "Missing required command: cargo" >&2
+    exit 1
+  }
+  require_release_authorization "migration rehearsal"
+  require_migration_fixtures
+
+  echo "Rehearsing storage migration against prior-version fixtures in $MIGRATION_FIXTURES_DIR..."
+  pushd "$CONTRACTS_DIR" >/dev/null
+  if ! "$cargo_bin" test --locked --workspace --test "$MIGRATION_TEST_TARGET" -- --nocapture; then
+    popd >/dev/null
+    echo "Migration rehearsal failed: prior-version storage could not be transformed safely." >&2
+    exit 1
+  fi
+  echo "Rehearsing rollback constraints..."
+  if ! "$cargo_bin" test --locked --workspace --test "$ROLLBACK_TEST_TARGET" -- --nocapture; then
+    popd >/dev/null
+    echo "Rollback constraint check failed: migration is not reversible under the documented constraints." >&2
+    exit 1
+  fi
+  popd >/dev/null
+  echo "Migration rehearsal and rollback constraints passed."
+}
+
+generate_compatibility_report() {
+  local report_script="$REPO_ROOT/scripts/contract-storage-compat-report.mjs"
+  if [[ ! -f "$report_script" ]]; then
+    echo "Missing compatibility report generator: $report_script" >&2
+    exit 1
+  fi
+  local node_bin
+  node_bin="$(resolve_cmd node)" || {
+    echo "Missing required command: node" >&2
+    exit 1
+  }
+  [[ -d "$REPO_ROOT/deployments" ]] || mkdir -p "$REPO_ROOT/deployments"
+  echo "Generating pre-release storage compatibility report..."
+  if ! "$node_bin" "$report_script" --output "$COMPAT_REPORT_FILE"; then
+    echo "Compatibility report generation failed." >&2
+    exit 1
+  fi
+  echo "Compatibility report written to: $COMPAT_REPORT_FILE"
+}
+
+check_compatibility_report() {
+  if [[ ! -f "$COMPAT_REPORT_FILE" ]]; then
+    echo "Missing compatibility report: $COMPAT_REPORT_FILE" >&2
+    echo "Run the compatibility report step before releasing." >&2
+    exit 1
+  fi
+  local blocking
+  blocking="$("$PYTHON_BIN" - "$COMPAT_REPORT_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        report = json.load(handle)
+except (OSError, ValueError) as exc:
+    print(f"unreadable:{exc}")
+    sys.exit(0)
+
+blocking = report.get("blocking_conditions") or []
+if not isinstance(blocking, list):
+    print("malformed:blocking_conditions")
+    sys.exit(0)
+if blocking:
+    for item in blocking:
+        code = item.get("code", "unknown") if isinstance(item, dict) else str(item)
+        message = item.get("message", "") if isinstance(item, dict) else ""
+        print(f"{code}: {message}".strip())
+PY
+)"
+  if [[ -n "$blocking" ]]; then
+    echo "Release blocked by storage compatibility report conditions:" >&2
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && echo "  - $line" >&2
+    done <<< "$blocking"
+    exit 1
+  fi
+  echo "Compatibility report contains no blocking conditions."
+}
+
+preflight_release() {
+  local action="$1"
+  require_release_authorization "$action"
+  rehearse_migration
+  generate_compatibility_report
+  check_compatibility_report
 }
 
 verify_wasm_outputs() {
@@ -132,6 +265,7 @@ write_manifest() {
 }
 
 build_all() {
+  preflight_release "release build"
   local cargo_bin
   local rustup_bin
   cargo_bin="$(resolve_cmd cargo)" || {
@@ -155,6 +289,7 @@ build_all() {
 }
 
 verify_only() {
+  preflight_release "release verification"
   verify_wasm_outputs
   [[ -d "$REPO_ROOT/deployments" ]] || mkdir -p "$REPO_ROOT/deployments"
   local manifest_file="$REPO_ROOT/deployments/contract-wasm-manifest.json"
@@ -173,6 +308,7 @@ deploy_all() {
     echo "Missing required command: stellar" >&2
     exit 1
   }
+  preflight_release "deployment to $network"
   verify_only
 
   local output_file="$REPO_ROOT/deployments/${network}.json"
@@ -270,14 +406,20 @@ PY
 print_help() {
   cat <<'EOF'
 Usage:
+  ./scripts/contracts-release.sh rehearse
   ./scripts/contracts-release.sh build
   ./scripts/contracts-release.sh verify
   ./scripts/contracts-release.sh deploy --network <network> --source <stellar-key-name> [--dry-run] [--force]
 
 Commands:
-  build    Build all contract crates reproducibly and generate a manifest
-  verify   Verify all expected artifacts exist and regenerate the manifest
-  deploy   Deploy all artifacts and write per-network deployment metadata
+  rehearse  Run the storage migration rehearsal and rollback-constraint checks only
+  build     Rehearse migration, generate the compatibility report, then build and manifest
+  verify    Rehearse migration, generate the compatibility report, then verify artifacts
+  deploy    Rehearse migration, generate the compatibility report, then deploy
+
+Every command requires explicit authorization via XCONFESS_RELEASE_AUTHORIZATION
+(must equal XCONFESS_REQUIRED_AUTHORIZATION_TOKEN, default "storage-migration-approved").
+Release is blocked when the compatibility report lists blocking conditions.
 
 Options:
   --dry-run  Verify build artifacts and deployment readiness without deploying contracts
@@ -293,6 +435,9 @@ main() {
 
   local cmd="${1:-}"
   case "$cmd" in
+    rehearse)
+      rehearse_migration
+      ;;
     build)
       build_all
       ;;

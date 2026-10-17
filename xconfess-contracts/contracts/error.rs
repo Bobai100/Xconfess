@@ -7,7 +7,7 @@ use soroban_sdk::contracttype;
 /// consume codes, or existing codes are reassigned). Consumers MUST check
 /// this version before relying on error code semantics.
 #[allow(dead_code)]
-pub const ERROR_REGISTRY_VERSION: u32 = 1;
+pub const ERROR_REGISTRY_VERSION: u32 = 2;
 
 /// ============================================================================
 /// ERROR CLASSIFICATION
@@ -88,6 +88,17 @@ pub mod codes {
     pub const TIPPING_RATE_LIMITED: u32 = 6007;
     pub const TIPPING_INVALID_RATE_LIMIT_CONFIG: u32 = 6008;
     pub const TIPPING_TOKEN_NOT_CONFIGURED: u32 = 6009;
+
+    /// ====== Storage / Upgrade Compatibility Errors (7000-7099) ======
+    /// Reserved for storage-layout migration rehearsal and pre-release
+    /// compatibility reporting. These codes are stable and must not be
+    /// reassigned; new compatibility failures take the next free code.
+    pub const STORAGE_VERSION_MISMATCH: u32 = 7000;
+    pub const INCOMPATIBLE_DOWNGRADE: u32 = 7001;
+    pub const STORAGE_MIGRATION_REQUIRED: u32 = 7002;
+    pub const STORAGE_LAYOUT_INCOMPATIBLE: u32 = 7003;
+    pub const STORAGE_MIGRATION_UNAUTHORIZED: u32 = 7004;
+    pub const STORAGE_ROLLBACK_UNSAFE: u32 = 7005;
 }
 
 /// ============================================================================
@@ -136,6 +147,16 @@ pub enum ContractError {
     AlreadyApproved,      // caller already approved this proposal (5003)
     AlreadyExecuted,      // proposal already executed (5004)
     InvalidAction,        // invalid governance action (5005)
+
+    /// ===========================================
+    /// Storage / upgrade compatibility errors
+    /// ===========================================
+    StorageVersionMismatch,      // on-chain storage version != expected (7000)
+    IncompatibleDowngrade,       // target version older than on-chain storage (7001)
+    StorageMigrationRequired,    // migration must run before this entrypoint (7002)
+    StorageLayoutIncompatible,   // persisted layout cannot be reinterpreted (7003)
+    StorageMigrationUnauthorized, // caller not authorized to migrate storage (7004)
+    StorageRollbackUnsafe,       // rollback would lose or corrupt persisted state (7005)
 }
 
 impl ContractError {
@@ -166,6 +187,13 @@ impl ContractError {
             ContractError::AlreadyApproved => codes::ALREADY_APPROVED,
             ContractError::AlreadyExecuted => codes::ALREADY_EXECUTED,
             ContractError::InvalidAction => codes::INVALID_ACTION,
+
+            ContractError::StorageVersionMismatch => codes::STORAGE_VERSION_MISMATCH,
+            ContractError::IncompatibleDowngrade => codes::INCOMPATIBLE_DOWNGRADE,
+            ContractError::StorageMigrationRequired => codes::STORAGE_MIGRATION_REQUIRED,
+            ContractError::StorageLayoutIncompatible => codes::STORAGE_LAYOUT_INCOMPATIBLE,
+            ContractError::StorageMigrationUnauthorized => codes::STORAGE_MIGRATION_UNAUTHORIZED,
+            ContractError::StorageRollbackUnsafe => codes::STORAGE_ROLLBACK_UNSAFE,
         }
     }
 
@@ -196,6 +224,13 @@ impl ContractError {
             ContractError::AlreadyApproved => "caller already approved this proposal",
             ContractError::AlreadyExecuted => "proposal already executed",
             ContractError::InvalidAction => "invalid governance action",
+
+            ContractError::StorageVersionMismatch => "storage version mismatch",
+            ContractError::IncompatibleDowngrade => "incompatible storage downgrade",
+            ContractError::StorageMigrationRequired => "storage migration required",
+            ContractError::StorageLayoutIncompatible => "storage layout incompatible",
+            ContractError::StorageMigrationUnauthorized => "caller not authorized to migrate storage",
+            ContractError::StorageRollbackUnsafe => "storage rollback unsafe",
         }
     }
 
@@ -216,10 +251,18 @@ impl ContractError {
             ContractError::ConfessionTooLong => ErrorClassification::Terminal,
             ContractError::UnauthorizedApproval => ErrorClassification::Terminal,
             ContractError::InvalidAction => ErrorClassification::Terminal,
+            ContractError::IncompatibleDowngrade => ErrorClassification::Terminal,
+            ContractError::StorageLayoutIncompatible => ErrorClassification::Terminal,
+            ContractError::StorageMigrationUnauthorized => ErrorClassification::Terminal,
+            ContractError::StorageRollbackUnsafe => ErrorClassification::Terminal,
 
             // Retryable: transient state or resource contention
             ContractError::CooldownActive => ErrorClassification::Retryable,
             ContractError::Overflow => ErrorClassification::Retryable,
+            // Migration may be pending; retry after the operator runs the
+            // upgrade sequence documented in the migration rehearsal runbook.
+            ContractError::StorageVersionMismatch => ErrorClassification::Retryable,
+            ContractError::StorageMigrationRequired => ErrorClassification::Retryable,
 
             // Terminal: business logic violations
             ContractError::NotFound => ErrorClassification::Terminal,

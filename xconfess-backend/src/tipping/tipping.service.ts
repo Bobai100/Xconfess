@@ -82,6 +82,45 @@ interface ProcessedTransactionData {
 const PG_UNIQUE_VIOLATION = '23505';
 
 /**
+ * Durable state of a tip *submission* (issue #279).
+ *
+ * A submission is the caller-initiated act of sending a tip to the chain and
+ * asking us to record it.  Network timeouts after submission leave the caller
+ * unsure whether a retry will duplicate the operation, so we persist the
+ * intent *before* touching the chain and reconcile ambiguous outcomes on
+ * retry.
+ *
+ * - `pending`    — intent recorded, outcome not yet known (in flight or the
+ *                  caller lost the response).  Retries must NOT resubmit;
+ *                  they reconcile against the chain instead.
+ * - `submitted`  — the transaction was accepted by the chain and recorded.
+ * - `failed`     — the submission terminally failed; a retry is safe.
+ * - `conflict`   — the intent is bound to a different payload; never retry.
+ */
+export type TipSubmissionState =
+  | 'pending'
+  | 'submitted'
+  | 'failed'
+  | 'conflict';
+
+export interface TipSubmissionIntent {
+  /** Deterministic key derived from the operation intent (confession + tx). */
+  intentKey: string;
+  confessionId: string;
+  txId: string;
+  state: TipSubmissionState;
+  attempts: number;
+  lastError?: string | null;
+  updatedAt: Date;
+}
+
+export interface TipSubmissionResult extends TipVerificationResult {
+  /** True when this call reconciled a previously ambiguous submission. */
+  reconciled: boolean;
+  submissionState: TipSubmissionState;
+}
+
+/**
  * Tip amount bounds — must be consistent with contract and frontend.
  * - MIN_TIP_AMOUNT: 0.1 XLM (minimum viable tip)
  * - MAX_TIP_AMOUNT: 10,000 XLM (upper bound to prevent overflow and abuse)
@@ -91,6 +130,11 @@ const PG_UNIQUE_VIOLATION = '23505';
 export class TippingService {
   private static readonly MAX_RECEIPT_PROOF_METADATA_LEN = 128;
   private static readonly LOCK_TIMEOUT_MS = 30_000; // 30 seconds
+  /**
+   * How long a submission may stay `pending` before a retry treats it as an
+   * ambiguous outcome and reconciles it against the chain (issue #279).
+   */
+  private static readonly SUBMISSION_RECONCILE_AFTER_MS = 15_000;
   private readonly logger = new Logger(TippingService.name);
 
   constructor(
@@ -179,7 +223,7 @@ export class TippingService {
     confessionId: string,
     dto: VerifyTipDto,
     requestId?: string,
-  ): Promise<TipVerificationResult> {
+  ): Promise<TipSubmissionResult> {
     this.logger.log({
       message: 'Tip verify started',
       requestId,
@@ -221,7 +265,14 @@ export class TippingService {
           tipId: existingByIdempotencyKey.id,
           status: existingByIdempotencyKey.verificationStatus,
         });
-        return this.resolveIdempotentOutcome(existingByIdempotencyKey);
+        return this.withSubmissionState(
+          await this.resolveIdempotentOutcome(existingByIdempotencyKey),
+          existingByIdempotencyKey.verificationStatus ===
+            TipVerificationStatus.VERIFIED
+            ? 'submitted'
+            : 'pending',
+          false,
+        );
       }
 
       this.logger.warn({
@@ -242,6 +293,10 @@ export class TippingService {
     //  • INSERT succeeds   → this caller owns the work; proceed to chain verify.
     //  • INSERT fails 23505 → another caller (or a prior completed request)
     //                         already holds this key; return canonical replay.
+    //
+    // Issue #279: the sentinel row *is* the durable pending-submission record.
+    // It is written before any chain interaction, so a caller that times out
+    // and retries will find it and reconcile instead of resubmitting.
     const { isFirstWriter, sentinelTip } =
       await this.tryInsertSentinelTip(confessionId, dto.txId, idempotencyKey);
 
@@ -270,7 +325,25 @@ export class TippingService {
         status: canonical.verificationStatus,
       });
 
-      return this.resolveIdempotentOutcome(canonical);
+      // Issue #279: a retry that lands on a still-pending sentinel is an
+      // ambiguous submission outcome.  Reconcile it against the chain rather
+      // than blindly reporting "pending" forever — this is what makes retries
+      // converge without a duplicate tip.
+      const reconciled = await this.reconcilePendingSubmission(
+        canonical,
+        requestId,
+      );
+      if (reconciled) {
+        return this.withSubmissionState(reconciled, 'submitted', true);
+      }
+
+      return this.withSubmissionState(
+        await this.resolveIdempotentOutcome(canonical),
+        canonical.verificationStatus === TipVerificationStatus.VERIFIED
+          ? 'submitted'
+          : 'pending',
+        false,
+      );
     }
 
     // ── 4. Guard: txId must not be bound to a different confession ────────
@@ -533,7 +606,14 @@ export class TippingService {
         isNew: true,
       });
 
-      return { tip: savedTip, isNew: true, isIdempotent: false, state: 'verified' };
+      return {
+        tip: savedTip,
+        isNew: true,
+        isIdempotent: false,
+        state: 'verified',
+        reconciled: false,
+        submissionState: 'submitted',
+      };
     } catch (error) {
       // Best-effort: release the processing lock so the reconciler can retry.
       // If the sentinel row itself is the problem (e.g. amount/fetch error),
@@ -583,6 +663,149 @@ export class TippingService {
       .createHash('sha256')
       .update(`${confessionId}:${txHash}`)
       .digest('hex');
+  }
+
+  /**
+   * Attach the durable submission state to a verification result so callers
+   * can distinguish "already settled" from "still ambiguous" (issue #279).
+   */
+  private withSubmissionState(
+    result: TipVerificationResult,
+    submissionState: TipSubmissionState,
+    reconciled: boolean,
+  ): TipSubmissionResult {
+    return { ...result, reconciled, submissionState };
+  }
+
+  /**
+   * Reconcile an ambiguous (pending) submission against the chain.
+   *
+   * Called when a retry finds a sentinel row that is still PENDING.  We only
+   * attempt reconciliation once the row has been pending longer than
+   * `SUBMISSION_RECONCILE_AFTER_MS`, so an in-flight first attempt is not
+   * raced.  Returns a settled result when the chain confirms the transaction,
+   * or `null` when the outcome is still ambiguous (caller should retry).
+   *
+   * Issue #279.
+   */
+  private async reconcilePendingSubmission(
+    tip: Tip,
+    requestId?: string,
+  ): Promise<TipVerificationResult | null> {
+    const pendingSince = tip.lastCheckedAt ?? tip.createdAt;
+    const pendingForMs = pendingSince
+      ? Date.now() - new Date(pendingSince).getTime()
+      : Number.POSITIVE_INFINITY;
+
+    if (pendingForMs < TippingService.SUBMISSION_RECONCILE_AFTER_MS) {
+      return null;
+    }
+
+    let isValid = false;
+    try {
+      isValid = await this.stellarService.verifyTransaction(tip.txId, requestId);
+    } catch (error: any) {
+      this.logger.warn({
+        message: 'Reconciliation lookup failed; submission remains pending',
+        requestId,
+        txHash: tip.txId,
+        tipId: tip.id,
+        error: error?.message,
+      });
+      return null;
+    }
+
+    if (!isValid) {
+      // The chain has no record of it.  Keep the row pending so a later retry
+      // can still reconcile; do not mark it failed (the tx may still land).
+      await this.updateRetryMetadata(tip.id, 'reconcile_not_found', {
+        reconciledAt: new Date().toISOString(),
+        requestId: requestId ?? null,
+      });
+      return null;
+    }
+
+    let txData: any;
+    try {
+      txData = await this.fetchTransactionData(tip.txId);
+    } catch (error: any) {
+      this.logger.warn({
+        message: 'Reconciliation data fetch failed; submission remains pending',
+        requestId,
+        txHash: tip.txId,
+        tipId: tip.id,
+        error: error?.message,
+      });
+      return null;
+    }
+
+    const processedData = await this.processTransactionData(txData, tip.txId);
+
+    tip.amount = processedData.amount;
+    tip.senderAddress = processedData.senderAddress;
+    tip.verificationStatus = TipVerificationStatus.VERIFIED;
+    tip.verifiedAt = new Date();
+    tip.lastChainStatus = 'reconciled';
+    tip.lastCheckedAt = new Date();
+    tip.reconciliationMetadata = {
+      verifiedBy: 'reconciliation',
+      processedData: {
+        amount: processedData.amount,
+        senderAddress: processedData.senderAddress,
+      },
+      receiptMetadata: processedData.receiptMetadata,
+      idempotencyKey: tip.idempotencyKey,
+      requestId: requestId ?? null,
+    };
+    tip.processingLock = null;
+    tip.lockedAt = null;
+    tip.lockedBy = null;
+
+    const savedTip = await this.tipRepository.save(tip);
+
+    this.eventEmitter.emit('tip.verified', {
+      tipId: savedTip.id,
+      confessionId: savedTip.confessionId,
+      txId: savedTip.txId,
+      amount: processedData.amount,
+      requestId,
+      reconciled: true,
+    });
+
+    await this.auditLogService.log({
+      actionType: AuditActionType.TIP_SETTLEMENT_VERIFIED,
+      metadata: {
+        entityType: 'tip',
+        entityId: savedTip.id,
+        tipId: savedTip.id,
+        confessionId: savedTip.confessionId,
+        txId: savedTip.txId,
+        amount: processedData.amount,
+        idempotencyKey: savedTip.idempotencyKey,
+        requestId: requestId ?? null,
+        reconciled: true,
+        settledAt: savedTip.verifiedAt?.toISOString(),
+      },
+      context: {
+        actor: { type: 'system', id: 'tipping-service' },
+        requestId,
+      },
+    });
+
+    this.logger.log({
+      message: 'Ambiguous tip submission reconciled',
+      requestId,
+      confessionId: savedTip.confessionId,
+      txHash: savedTip.txId,
+      tipId: savedTip.id,
+    });
+
+    return {
+      tip: savedTip,
+      isNew: false,
+      isIdempotent: true,
+      state: 'verified',
+    };
   }
 
   private getAnalyticsNetwork(): AnalyticsNetwork {

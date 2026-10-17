@@ -206,3 +206,60 @@ npm run ci
 The full gate includes frontend type-checking, frontend tests, backend tests, and Rust contract tests. Contract tests need enough free disk space for the MSVC linker on Windows.
 
 `npm run deploy:preflight` checks Render config drift, migration timestamp duplicates, and required production env vars. It now also runs automatically as a required GitHub Actions check (`Deploy Preflight`) on every pull request against `main`, using dummy production-shaped env values — no live secrets are needed for the check to run.
+
+## Contract Release Compatibility Report
+
+Before promoting any contract release, generate the pre-release compatibility report:
+
+```powershell
+npm run check:abi-drift
+npm run contract:test
+```
+
+The report combines ABI diffs, the on-chain storage version, migration requirements, and deployment manifest differences. Interpret it as follows:
+
+- **Blocking conditions** (any of these stops the release): ABI drift without a matching version bump, a storage version change with no registered migration, a manifest diff for a contract ID that is not part of the release, or a failed migration rehearsal.
+- **Non-blocking warnings**: additive ABI entries, documentation-only manifest changes, and storage version bumps that ship with a rehearsal fixture.
+- Attach the generated report to the release PR. A release without an attached report is not approved.
+
+## Contract Storage Migration Rehearsal
+
+Upgrades must be rehearsed against representative prior-version state fixtures before release:
+
+```powershell
+npm run contract:test
+npm run contract:build:release
+```
+
+Operator sequence:
+
+1. Run the rehearsal suite against the prior-version fixtures. It applies the migration to a snapshot of deployed state and asserts the post-migration layout.
+2. Confirm the rollback constraints documented by the rehearsal (which fields are forward-only and cannot be reverted).
+3. Only after a green rehearsal, build the release artifact and proceed with deployment.
+4. If a rehearsal fails, do not deploy. Fix the migration or add a fixture that reproduces the failure.
+
+## Indexed Event Range Verification
+
+The event verifier is read-only and compares indexed ranges against ledger data:
+
+```powershell
+npm run contract:test:integration
+```
+
+- It reports gaps grouped by checkpoint so operators can see exactly which ranges were missed or misclassified.
+- Bounded reprocessing is opt-in and requires an explicit range. Never reprocess unbounded ranges in production.
+- Reprocessing is idempotent: re-indexing an already-indexed range must not duplicate events. If it does, stop and escalate before continuing.
+
+## Ambiguous Transaction Submission Recovery
+
+When a submission times out, the caller must not blindly retry. The backend records a durable pending state keyed by operation intent:
+
+1. On timeout, look up the pending record by operation intent before retrying.
+2. If the record shows the operation landed, treat the submission as successful and do not resubmit.
+3. If the record is still pending, retry with the same operation intent so the reconciliation lookup converges instead of duplicating tipping or anchoring.
+4. If reconciliation cannot resolve the intent, escalate; do not issue a fresh intent.
+
+```powershell
+npm run backend:test
+npm run contract:test:integration
+```

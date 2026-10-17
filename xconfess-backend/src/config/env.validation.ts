@@ -237,4 +237,31 @@ export const envValidationSchema = Joi.object({
 
   // â”€â”€ Redis queue health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   REDIS_QUEUE_LATENCY_THRESHOLD_MS: Joi.number().default(250),
+
+  // â”€â”€ Soroban event range verifier (read-only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  SOROBAN_EVENT_VERIFIER_ENABLED: Joi.string()
+    .valid('true', 'false')
+    .default('false'),
+  SOROBAN_EVENT_VERIFIER_MAX_RANGE: Joi.number()
+    .integer()
+    .min(1)
+    .max(10000)
+    .default(1000)
+    .messages({
+      'number.min':
+        'SOROBAN_EVENT_VERIFIER_MAX_RANGE must be at least 1 ledger.',
+      'number.max':
+        'SOROBAN_EVENT_VERIFIER_MAX_RANGE must not exceed 10000 ledgers per verification pass.',
+    }),
+  SOROBAN_EVENT_REPROCESS_BATCH_SIZE: Joi.number()
+    .integer()
+    .min(1)
+    .max(1000)
+    .default(100)
+    .messages({
+      'number.min':
+        'SOROBAN_EVENT_REPROCESS_BATCH_SIZE must be at least 1.',
+      'number.max':
+        'SOROBAN_EVENT_REPROCESS_BATCH_SIZE must not exceed 1000 events per batch.',
+    }),
 }).options({ allowUnknown: true, abortEarly: false });

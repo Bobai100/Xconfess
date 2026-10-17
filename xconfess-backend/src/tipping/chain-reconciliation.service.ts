@@ -4,6 +4,10 @@ import { Repository, In } from 'typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
 import { Tip, TipVerificationStatus } from './entities/tip.entity';
+import {
+  PendingSubmission,
+  PendingSubmissionStatus,
+} from './entities/pending-submission.entity';
 import { StellarService } from '../stellar/stellar.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditActionType } from '../audit-log/audit-log.entity';
@@ -24,6 +28,36 @@ interface ReconciliationMetrics {
   lastRun: Date;
   duration: number;
   errors: string[];
+  pendingSubmissions?: PendingSubmissionReconciliationMetrics;
+}
+
+interface PendingSubmissionReconciliationMetrics {
+  total: number;
+  confirmed: number;
+  failed: number;
+  expired: number;
+  stillPending: number;
+  errors: string[];
+}
+
+/**
+ * Authorization context for reconciliation actions.
+ * Issue #279: Reconciliation actions must be explicitly authorized.
+ */
+export interface ReconciliationActor {
+  type: 'system' | 'operator';
+  id: string;
+}
+
+/**
+ * Result of reconciling a single pending submission by operation intent.
+ * Issue #279: Durable pending state + reconciliation lookup keyed by intent.
+ */
+export interface PendingSubmissionReconciliationResult {
+  operationIntent: string;
+  status: PendingSubmissionStatus;
+  txId?: string;
+  error?: string;
 }
 
 interface DeadLetterRecord {
@@ -54,6 +88,7 @@ export class ChainReconciliationService {
   private readonly INITIAL_BACKOFF_MS = 5000; // 5 seconds
   private readonly MAX_BACKOFF_MS = 3600000; // 1 hour
   private readonly STALE_THRESHOLD_MS = 86400000; // 24 hours
+  private readonly DEFAULT_PENDING_SUBMISSION_TTL_MS = 3600000; // 1 hour
   private lastMetrics: ReconciliationMetrics | null = null;
 
   constructor(
@@ -64,6 +99,9 @@ export class ChainReconciliationService {
     private readonly configService: ConfigService,
     @Optional()
     private readonly analyticsEventService?: AnalyticsEventService,
+    @Optional()
+    @InjectRepository(PendingSubmission)
+    private readonly pendingSubmissionRepository?: Repository<PendingSubmission>,
   ) {}
 
   /**
@@ -159,6 +197,230 @@ export class ChainReconciliationService {
     return this.configService.get<string>('STELLAR_NETWORK') === 'mainnet'
       ? 'mainnet'
       : 'testnet';
+  }
+
+  /**
+   * Issue #279: Resolve the TTL after which an unresolved pending submission
+   * is considered expired (ambiguous outcome that never resolved on-chain).
+   */
+  private getPendingSubmissionTtlMs(): number {
+    const configured = Number(
+      this.configService.get<string>('PENDING_SUBMISSION_TTL_MS'),
+    );
+    return Number.isFinite(configured) && configured > 0
+      ? configured
+      : this.DEFAULT_PENDING_SUBMISSION_TTL_MS;
+  }
+
+  /**
+   * Issue #279: Enforce explicit authorization for reconciliation actions.
+   * Only the system scheduler or an authenticated operator may reconcile.
+   */
+  private assertReconciliationAuthorized(actor?: ReconciliationActor): void {
+    if (!actor) {
+      throw new Error('Reconciliation requires an explicit actor context');
+    }
+    if (actor.type !== 'system' && actor.type !== 'operator') {
+      throw new Error(
+        `Reconciliation actor type '${actor.type}' is not authorized`,
+      );
+    }
+    if (!actor.id || actor.id.trim().length === 0) {
+      throw new Error('Reconciliation actor id must be provided');
+    }
+  }
+
+  /**
+   * Issue #279: Look up a durable pending submission by operation intent.
+   * Returns null when no submission was ever recorded for the intent.
+   */
+  async findByOperationIntent(
+    operationIntent: string,
+  ): Promise<PendingSubmission | null> {
+    if (!this.pendingSubmissionRepository) {
+      return null;
+    }
+    if (!operationIntent || operationIntent.trim().length === 0) {
+      throw new Error('operationIntent is required for reconciliation lookup');
+    }
+    return this.pendingSubmissionRepository.findOne({
+      where: { operationIntent },
+    });
+  }
+
+  /**
+   * Issue #279: Reconcile a single pending submission against chain state.
+   * Transitions the durable record to CONFIRMED, FAILED or EXPIRED exactly once,
+   * so retries converge without duplicating the underlying operation.
+   */
+  async reconcilePendingSubmission(
+    operationIntent: string,
+    actor: ReconciliationActor = { type: 'system', id: 'chain-reconciliation' },
+  ): Promise<PendingSubmissionReconciliationResult> {
+    this.assertReconciliationAuthorized(actor);
+
+    if (!this.pendingSubmissionRepository) {
+      throw new Error(
+        'Pending submission repository is not configured for reconciliation',
+      );
+    }
+
+    const submission = await this.findByOperationIntent(operationIntent);
+    if (!submission) {
+      throw new Error(
+        `No pending submission found for operation intent '${operationIntent}'`,
+      );
+    }
+
+    // Terminal states are idempotent: retries converge on the same outcome.
+    if (submission.status !== PendingSubmissionStatus.PENDING) {
+      return {
+        operationIntent,
+        status: submission.status,
+        txId: submission.txId,
+      };
+    }
+
+    const now = new Date();
+    const ttlMs = this.getPendingSubmissionTtlMs();
+    const isExpired =
+      now.getTime() - new Date(submission.createdAt).getTime() > ttlMs;
+
+    let nextStatus: PendingSubmissionStatus = PendingSubmissionStatus.PENDING;
+    let error: string | undefined;
+
+    if (submission.txId) {
+      try {
+        const txData = await this.stellarService.verifyTransactionFull(
+          submission.txId,
+        );
+        if (txData && txData.success) {
+          nextStatus = PendingSubmissionStatus.CONFIRMED;
+        } else if (txData && txData.success === false) {
+          nextStatus = PendingSubmissionStatus.FAILED;
+          error = 'Transaction failed on-chain';
+        }
+      } catch (err) {
+        error = err instanceof Error ? err.message : String(err);
+        this.logger.warn(
+          `Pending submission ${operationIntent} lookup failed: ${error}`,
+        );
+      }
+    }
+
+    // If the chain outcome is still ambiguous and the record is past its TTL,
+    // mark it expired so callers stop retrying and can surface a clear outcome.
+    if (nextStatus === PendingSubmissionStatus.PENDING && isExpired) {
+      nextStatus = PendingSubmissionStatus.EXPIRED;
+      error = error ?? 'Pending submission expired without chain confirmation';
+    }
+
+    if (nextStatus === PendingSubmissionStatus.PENDING) {
+      await this.pendingSubmissionRepository.update(submission.id, {
+        lastCheckedAt: now,
+        attemptCount: submission.attemptCount + 1,
+        lastError: error ?? null,
+      });
+      return { operationIntent, status: nextStatus, txId: submission.txId };
+    }
+
+    await this.pendingSubmissionRepository.update(submission.id, {
+      status: nextStatus,
+      lastCheckedAt: now,
+      resolvedAt: now,
+      attemptCount: submission.attemptCount + 1,
+      lastError: error ?? null,
+    });
+
+    await this.auditLogService
+      .log({
+        actionType: AuditActionType.TIP_RECONCILIATION_DEAD_LETTER,
+        context: {
+          userId: null,
+          actor: { type: actor.type, id: actor.id },
+        },
+        metadata: {
+          entityType: 'PENDING_SUBMISSION',
+          entityId: submission.id,
+          operationIntent,
+          txId: submission.txId,
+          finalStatus: nextStatus,
+          error: error ?? null,
+          description: `Pending submission ${operationIntent} resolved to ${nextStatus}`,
+        },
+      })
+      .catch((err) =>
+        this.logger.warn(
+          `Failed to audit pending submission ${operationIntent}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        ),
+      );
+
+    return { operationIntent, status: nextStatus, txId: submission.txId };
+  }
+
+  /**
+   * Issue #279: Reconcile all durable pending submissions.
+   * Used by the scheduled loop and by operators via manual trigger.
+   */
+  async reconcilePendingSubmissions(
+    actor: ReconciliationActor = { type: 'system', id: 'chain-reconciliation' },
+  ): Promise<PendingSubmissionReconciliationMetrics> {
+    this.assertReconciliationAuthorized(actor);
+
+    const metrics: PendingSubmissionReconciliationMetrics = {
+      total: 0,
+      confirmed: 0,
+      failed: 0,
+      expired: 0,
+      stillPending: 0,
+      errors: [],
+    };
+
+    if (!this.pendingSubmissionRepository) {
+      return metrics;
+    }
+
+    const pending = await this.pendingSubmissionRepository.find({
+      where: { status: PendingSubmissionStatus.PENDING },
+      order: { createdAt: 'ASC' },
+    });
+
+    metrics.total = pending.length;
+
+    for (const submission of pending) {
+      try {
+        const result = await this.reconcilePendingSubmission(
+          submission.operationIntent,
+          actor,
+        );
+        switch (result.status) {
+          case PendingSubmissionStatus.CONFIRMED:
+            metrics.confirmed++;
+            break;
+          case PendingSubmissionStatus.FAILED:
+            metrics.failed++;
+            break;
+          case PendingSubmissionStatus.EXPIRED:
+            metrics.expired++;
+            break;
+          default:
+            metrics.stillPending++;
+            break;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        metrics.errors.push(
+          `Error reconciling pending submission ${submission.operationIntent}: ${message}`,
+        );
+        this.logger.error(
+          `Failed to reconcile pending submission ${submission.operationIntent}: ${message}`,
+        );
+      }
+    }
+
+    return metrics;
   }
 
   private async recordReconciliationAnalytics(
@@ -473,6 +735,20 @@ export class ChainReconciliationService {
         }
       }
 
+      // Issue #279: Reconcile durable pending submissions keyed by intent.
+      try {
+        metrics.pendingSubmissions = await this.reconcilePendingSubmissions({
+          type: 'system',
+          id: 'chain-reconciliation',
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        metrics.errors.push(`Pending submission reconciliation error: ${message}`);
+        this.logger.error(
+          `Pending submission reconciliation failed: ${message}`,
+        );
+      }
+
       metrics.duration = Math.max(1, Date.now() - startTime);
 
       // Log reconciliation summary
@@ -502,7 +778,9 @@ export class ChainReconciliationService {
    */
   async manualReconciliation(
     tipIds?: string[],
+    actor: ReconciliationActor = { type: 'operator', id: 'manual' },
   ): Promise<ReconciliationMetrics> {
+    this.assertReconciliationAuthorized(actor);
     const startTime = Date.now();
 
     try {
@@ -587,6 +865,16 @@ export class ChainReconciliationService {
         } else if (!reconcileResult.success) {
           metrics.failed++;
         }
+      }
+
+      // Issue #279: Also reconcile durable pending submissions by intent.
+      try {
+        metrics.pendingSubmissions = await this.reconcilePendingSubmissions(
+          actor,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        metrics.errors.push(`Pending submission reconciliation error: ${message}`);
       }
 
       metrics.duration = Date.now() - startTime;

@@ -17,6 +17,7 @@ import { SorobanEventCheckpoint } from './entities/soroban-event-checkpoint.enti
 import { AnonymousConfession } from '../confession/entities/confession.entity';
 import { Tip } from '../tipping/entities/tip.entity';
 import { SorobanEventCheckpointService } from './soroban-event-checkpoint.service';
+import { SorobanEventRangeVerifierService } from './soroban-event-range-verifier.service';
 
 @Module({
   imports: [
@@ -40,6 +41,7 @@ import { SorobanEventCheckpointService } from './soroban-event-checkpoint.servic
     StellarReconciliationWorker,
     ReputationReconciliationWorker,
     SorobanEventCheckpointService,
+    SorobanEventRangeVerifierService,
   ],
   controllers: [StellarController],
   exports: [
@@ -49,6 +51,7 @@ import { SorobanEventCheckpointService } from './soroban-event-checkpoint.servic
     ContractService,
     DeploymentMetadataService,
     SorobanEventCheckpointService,
+    SorobanEventRangeVerifierService,
   ],
 })
 export class StellarModule {}

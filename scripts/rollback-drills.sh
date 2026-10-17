@@ -15,6 +15,7 @@
 #   app         Backend application rollback drill
 #   schema      Database schema migration rollback drill
 #   contract    Soroban contract rollback drill
+#   storage     Contract storage migration rehearsal drill (issue #275)
 #   frontend    Frontend deployment rollback drill
 #
 # Options:
@@ -37,6 +38,11 @@
 #   - Drills meet RTO targets
 #   - Data compatibility is verified (forward/backward column checks)
 #   - Unresolved gaps become tracked remediation issues
+#
+# Acceptance criteria (issue #275):
+#   - Prior-version contract storage fixtures are applied to a rehearsal env
+#   - Migration is rehearsed and rollback constraints are verified
+#   - The exact operator sequence is documented before release
 #
 # NOTE: This script exercises STAGING boundaries only.  The irreversible
 #       boundary is any live database or contract deployment.  Each drill
@@ -375,9 +381,85 @@ drill_contract() {
   rto_check "Contract rollback drill" "${start}" && drill_pass "Contract rollback" || true
 }
 
-# ── Drill 4: Frontend deployment rollback ────────────────────────────────────
+# ── Drill 4: Contract storage migration rehearsal ────────────────────────────
+drill_storage() {
+  log_section "Drill 4: Contract Storage Migration Rehearsal"
+  # IRREVERSIBLE BOUNDARY: This drill runs ONLY against a rehearsal/testnet
+  # contract instance.  Applying a storage migration to a live mainnet contract
+  # is irreversible once the new schema is committed.  The drill proves that
+  # prior-version on-chain state can be transformed safely and that the
+  # rollback constraints hold before any real deployment.
+
+  local start
+  start=$(rto_start)
+
+  local fixtures_dir="${REPO_ROOT}/xconfess-contracts/fixtures/storage-migrations"
+  local rehearsal_script="${REPO_ROOT}/xconfess-contracts/scripts/storage-migration-rehearsal.sh"
+
+  # 4a. Verify prior-version fixtures exist
+  log_info "Checking prior-version storage fixtures..."
+  if [[ -d "${fixtures_dir}" ]]; then
+    local fixture_count
+    fixture_count=$(find "${fixtures_dir}" -name "*.json" | wc -l | tr -d ' ')
+    if [[ "${fixture_count}" -gt 0 ]]; then
+      log_pass "Found ${fixture_count} prior-version storage fixture(s) in ${fixtures_dir}"
+    else
+      drill_fail "Storage migration rehearsal" "No fixture JSON files found in ${fixtures_dir}"
+    fi
+  else
+    drill_fail "Storage migration rehearsal" "Fixtures directory not found: ${fixtures_dir}"
+  fi
+
+  # 4b. Verify rehearsal harness is present
+  log_info "Checking storage migration rehearsal harness..."
+  if [[ -x "${rehearsal_script}" ]]; then
+    log_pass "Rehearsal harness present and executable: ${rehearsal_script}"
+  elif [[ -f "${rehearsal_script}" ]]; then
+    log_warn "Rehearsal harness present but not executable — run: chmod +x ${rehearsal_script}"
+    GAPS+=("Storage: Rehearsal harness not executable — chmod +x ${rehearsal_script}")
+  else
+    drill_fail "Storage migration rehearsal" "Rehearsal harness not found: ${rehearsal_script}"
+  fi
+
+  # 4c. Run the rehearsal (apply fixtures → migrate → verify rollback constraints)
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log_dry "Would run: ${rehearsal_script} --fixtures ${fixtures_dir} --verify-rollback"
+  elif [[ -x "${rehearsal_script}" ]]; then
+    log_info "Running storage migration rehearsal..."
+    if "${rehearsal_script}" --fixtures "${fixtures_dir}" --verify-rollback; then
+      log_pass "Storage migration rehearsal completed and rollback constraints verified"
+    else
+      drill_fail "Storage migration rehearsal" "Rehearsal harness reported failure — see output above"
+    fi
+  else
+    log_warn "Skipping rehearsal execution — harness not executable"
+  fi
+
+  # 4d. Document the exact operator sequence before release
+  log_info "Contract storage migration operator sequence (pre-release):"
+  log_info "  1. Snapshot current on-chain storage: ./scripts/export-contract-storage.sh --network testnet"
+  log_info "  2. Apply prior-version fixtures to rehearsal instance:"
+  log_info "       ${rehearsal_script} --fixtures ${fixtures_dir} --apply"
+  log_info "  3. Run the migration against the rehearsal instance and capture the new schema hash"
+  log_info "  4. Verify rollback constraints: ${rehearsal_script} --verify-rollback"
+  log_info "  5. Confirm the migration is idempotent (re-run step 3, expect no diff)"
+  log_info "  6. Record the rehearsal evidence in ${REPORT_DIR}"
+  log_info "  7. Only after all checks pass, schedule the live upgrade via upgrade_authority"
+  log_info "  See: docs/contract-release-and-upgrade-runbook.md (Storage Migration section)"
+
+  # 4e. Rollback constraints for storage migrations
+  log_info "Storage migration rollback constraints:"
+  log_info "  - A committed storage schema change cannot be reverted on-chain"
+  log_info "  - Rollback = forward-fix migration that maps new schema back to a compatible shape"
+  log_info "  - Every migration MUST be idempotent and tolerate partially-migrated state"
+  log_info "  - Prior-version readers must tolerate unknown keys (forward compatibility)"
+
+  rto_check "Storage migration rehearsal drill" "${start}" && drill_pass "Storage migration rehearsal" || true
+}
+
+# ── Drill 5: Frontend deployment rollback ────────────────────────────────────
 drill_frontend() {
-  log_section "Drill 4: Frontend Deployment Rollback"
+  log_section "Drill 5: Frontend Deployment Rollback"
   # IRREVERSIBLE BOUNDARY: none for Vercel/preview — deployments are immutable
   # and each commit creates a distinct deployment URL.  Rollback is a repoint
   # of the production alias to a previous deployment.
@@ -454,15 +536,17 @@ case "${DRILL_NAME}" in
     drill_app
     drill_schema
     drill_contract
+    drill_storage
     drill_frontend
     ;;
   app)      drill_app ;;
   schema)   drill_schema ;;
   contract) drill_contract ;;
+  storage)  drill_storage ;;
   frontend) drill_frontend ;;
   *)
     echo -e "${RED}Unknown drill name: ${DRILL_NAME}${NC}" >&2
-    echo "Valid names: all, app, schema, contract, frontend" >&2
+    echo "Valid names: all, app, schema, contract, storage, frontend" >&2
     exit 2
     ;;
 esac

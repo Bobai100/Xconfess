@@ -24,4 +24,29 @@ export default registerAs('stellar', () => ({
   rpcMaxRetries: Number(process.env.STELLAR_RPC_MAX_RETRIES) || 3,
   rpcRetryBaseDelayMs: Number(process.env.STELLAR_RPC_RETRY_BASE_DELAY_MS) || 1000,
   rpcRetryMaxDelayMs: Number(process.env.STELLAR_RPC_RETRY_MAX_DELAY_MS) || 10000,
+
+  // Event range verifier settings
+  eventVerifier: {
+    enabled: parseBoolean(process.env.STELLAR_EVENT_VERIFIER_ENABLED, false),
+    maxLedgerRange:
+      Number(process.env.STELLAR_EVENT_VERIFIER_MAX_LEDGER_RANGE) || 1000,
+    reprocessingBatchSize:
+      Number(process.env.STELLAR_EVENT_VERIFIER_REPROCESSING_BATCH_SIZE) || 100,
+    scheduleCron:
+      process.env.STELLAR_EVENT_VERIFIER_SCHEDULE_CRON || '*/15 * * * *',
+  },
 }));
+
+function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined || value === null || value === '') {
+    return defaultValue;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['false', '0', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+  return defaultValue;
+}
