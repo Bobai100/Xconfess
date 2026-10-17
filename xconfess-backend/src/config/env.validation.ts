@@ -157,6 +157,59 @@ export const envValidationSchema = Joi.object({
   // â”€â”€ Tipping SLA â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   TIP_VERIFICATION_STALE_THRESHOLD_MINUTES: Joi.number().min(1).default(30),
 
+  // â”€â”€ Stellar finality / confirmation tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Number of ledgers a transaction must be buried under before it is
+  // considered final. Stellar closes a ledger roughly every 5 seconds.
+  STELLAR_CONFIRMATION_DEPTH: Joi.number().integer().min(1).max(100).default(1),
+  // How often the finality tracker polls the RPC/Horizon for new ledgers.
+  STELLAR_FINALITY_POLL_INTERVAL_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .max(600000)
+    .default(5000),
+  // Observations older than this are treated as stale and never promoted to
+  // a verified final state.
+  STELLAR_FINALITY_MAX_AGE_MS: Joi.number()
+    .integer()
+    .min(60000)
+    .max(86400000)
+    .default(3600000),
+
+  // â”€â”€ Stellar multi-contract reconciliation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  STELLAR_RECONCILIATION_ENABLED: Joi.string()
+    .valid('true', 'false')
+    .default('true'),
+  // Interval between reconciliation sweeps for partially completed flows.
+  STELLAR_RECONCILIATION_INTERVAL_MS: Joi.number()
+    .integer()
+    .min(10000)
+    .max(3600000)
+    .default(60000),
+  // Maximum number of partial operations reconciled per sweep.
+  STELLAR_RECONCILIATION_BATCH_SIZE: Joi.number()
+    .integer()
+    .min(1)
+    .max(1000)
+    .default(50),
+  // A partial operation older than this is escalated instead of retried.
+  STELLAR_RECONCILIATION_MAX_AGE_MS: Joi.number()
+    .integer()
+    .min(60000)
+    .max(604800000)
+    .default(86400000),
+  // Bounded retry budget for compensating calls.
+  STELLAR_RECONCILIATION_MAX_ATTEMPTS: Joi.number()
+    .integer()
+    .min(1)
+    .max(20)
+    .default(5),
+  // Base backoff between compensation attempts (exponential).
+  STELLAR_RECONCILIATION_RETRY_BACKOFF_MS: Joi.number()
+    .integer()
+    .min(100)
+    .max(300000)
+    .default(2000),
+
   // â”€â”€ Email (primary) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   MAIL_HOST: Joi.string().default('smtp.ethereal.email'),
   MAIL_PORT: Joi.number().port().default(587),

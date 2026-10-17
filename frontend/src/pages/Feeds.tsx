@@ -2,29 +2,17 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { Feed, FeedSort } from '../lib/api';
+import {
+  DEFAULT_SORT,
+  DEFAULT_TAGS,
+  SORT_OPTIONS,
+  parseSort,
+  parseTags,
+  serializeTags,
+} from '../lib/feedFilters';
 
-const SORT_OPTIONS: FeedSort[] = ['recent', 'popular', 'trending'];
-const DEFAULT_SORT: FeedSort = 'recent';
-const DEFAULT_TAGS: string[] = [];
-
-function parseSort(value: string | null): FeedSort {
-  if (value && (SORT_OPTIONS as string[]).includes(value)) {
-    return value as FeedSort;
-  }
-  return DEFAULT_SORT;
-}
-
-function parseTags(value: string | null): string[] {
-  if (!value) return DEFAULT_TAGS;
-  const tags = value
-    .split(',')
-    .map((tag) => tag.trim().toLowerCase())
-    .filter((tag) => tag.length > 0 && tag.length <= 50 && /^[a-z0-9-_]+$/.test(tag));
-  return Array.from(new Set(tags));
-}
-
-function serializeTags(tags: string[]): string | null {
-  return tags.length > 0 ? tags.join(',') : null;
+function pluralizeFeeds(count: number): string {
+  return count === 1 ? '1 feed' : `${count} feeds`;
 }
 
 export default function Feeds() {
@@ -32,6 +20,7 @@ export default function Feeds() {
   const [feeds, setFeeds] = useState<Feed[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [announcement, setAnnouncement] = useState('');
 
   const sort = useMemo(() => parseSort(searchParams.get('sort')), [searchParams]);
   const tags = useMemo(() => parseTags(searchParams.get('tags')), [searchParams]);
@@ -80,7 +69,10 @@ export default function Feeds() {
 
   const handleClearFilters = useCallback(() => {
     updateParams({ sort: DEFAULT_SORT, tags: DEFAULT_TAGS });
+    setAnnouncement('Filters cleared. Showing all feeds.');
   }, [updateParams]);
+
+  const hasActiveFilters = sort !== DEFAULT_SORT || tags.length > 0;
 
   useEffect(() => {
     let cancelled = false;
@@ -90,10 +82,20 @@ export default function Feeds() {
     api
       .getFeeds({ sort, tags })
       .then((data) => {
-        if (!cancelled) setFeeds(data);
+        if (!cancelled) {
+          setFeeds(data);
+          setAnnouncement(
+            data.length === 0
+              ? 'No feeds match these filters.'
+              : `Showing ${pluralizeFeeds(data.length)}.`,
+          );
+        }
       })
       .catch(() => {
-        if (!cancelled) setError('Unable to load feeds. Please try again.');
+        if (!cancelled) {
+          setError('Unable to load feeds. Please try again.');
+          setAnnouncement('Unable to load feeds. Please try again.');
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -109,15 +111,23 @@ export default function Feeds() {
       <header className="feeds-header">
         <h1>Feeds</h1>
         <div className="feeds-controls">
-          <label htmlFor="feed-sort">Sort</label>
-          <select id="feed-sort" value={sort} onChange={handleSortChange}>
+          <label htmlFor="feed-sort">Sort feeds by</label>
+          <select
+            id="feed-sort"
+            value={sort}
+            onChange={handleSortChange}
+            aria-describedby="feed-sort-hint"
+          >
             {SORT_OPTIONS.map((option) => (
               <option key={option} value={option}>
                 {option}
               </option>
             ))}
           </select>
-          {tags.length > 0 && (
+          <span id="feed-sort-hint" className="visually-hidden">
+            Changes the order of the feed list.
+          </span>
+          {hasActiveFilters && (
             <button type="button" onClick={handleClearFilters}>
               Clear filters
             </button>
@@ -125,11 +135,19 @@ export default function Feeds() {
         </div>
       </header>
 
+      <p className="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+        {announcement}
+      </p>
+
       {tags.length > 0 && (
-        <ul className="feeds-active-tags">
+        <ul className="feeds-active-tags" aria-label="Active tag filters">
           {tags.map((tag) => (
             <li key={tag}>
-              <button type="button" onClick={() => handleTagToggle(tag)}>
+              <button
+                type="button"
+                onClick={() => handleTagToggle(tag)}
+                aria-label={`Remove tag filter ${tag}`}
+              >
                 {tag} ×
               </button>
             </li>
@@ -140,16 +158,25 @@ export default function Feeds() {
       {loading && <p>Loading feeds…</p>}
       {error && <p role="alert">{error}</p>}
 
-      {!loading && !error && (
+      {!loading && !error && feeds.length === 0 && (
+        <p className="feeds-empty">No feeds match these filters.</p>
+      )}
+
+      {!loading && !error && feeds.length > 0 && (
         <ul className="feeds-list">
           {feeds.map((feed) => (
             <li key={feed.id}>
               <h2>{feed.title}</h2>
               {feed.tags?.length > 0 && (
-                <ul className="feed-tags">
+                <ul className="feed-tags" aria-label={`Tags for ${feed.title}`}>
                   {feed.tags.map((tag) => (
                     <li key={tag}>
-                      <button type="button" onClick={() => handleTagToggle(tag)}>
+                      <button
+                        type="button"
+                        onClick={() => handleTagToggle(tag)}
+                        aria-pressed={tags.includes(tag.trim().toLowerCase())}
+                        aria-label={`Filter by tag ${tag}`}
+                      >
                         {tag}
                       </button>
                     </li>

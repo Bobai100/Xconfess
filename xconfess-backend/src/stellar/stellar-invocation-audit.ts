@@ -4,7 +4,18 @@ import {
 } from '../audit-log/audit-log.service';
 import { RequestUser } from '../auth/interfaces/jwt-payload.interface';
 
-export type StellarInvocationOutcome = 'success' | 'failed' | 'denied';
+export type StellarInvocationOutcome =
+  | 'success'
+  | 'failed'
+  | 'denied'
+  | 'partial';
+
+export type StellarCompensatingAction =
+  | 'none'
+  | 'compensated'
+  | 'compensation_failed'
+  | 'reconciliation_required'
+  | 'skipped';
 
 interface StellarAuditRequest {
   headers: Record<string, string | string[] | undefined>;
@@ -27,6 +38,11 @@ interface BuildStellarInvocationAuditMetadataOptions {
   expectedSourceAccount?: string | null;
   authorizedScope?: string | null;
   requiredScopes?: readonly string[] | null;
+  sagaId?: string | null;
+  stepIndex?: number | null;
+  totalSteps?: number | null;
+  compensatingAction?: StellarCompensatingAction | null;
+  partialState?: Record<string, unknown> | null;
 }
 
 function createAdminActor(user?: RequestUser): AuditActor | undefined {
@@ -110,6 +126,31 @@ export function buildStellarInvocationAuditMetadata(
 
   if (options.requiredScopes && options.requiredScopes.length > 0) {
     metadata.requiredScopes = [...options.requiredScopes];
+  }
+
+  if (options.sagaId) {
+    metadata.sagaId = options.sagaId;
+  }
+
+  if (typeof options.stepIndex === 'number') {
+    metadata.stepIndex = options.stepIndex;
+  }
+
+  if (typeof options.totalSteps === 'number') {
+    metadata.totalSteps = options.totalSteps;
+  }
+
+  if (options.compensatingAction) {
+    metadata.compensatingAction = options.compensatingAction;
+  }
+
+  if (options.partialState) {
+    metadata.partialState = options.partialState;
+  }
+
+  if (options.outcome === 'partial') {
+    metadata.partialStateOutcome = true;
+    metadata.reconcilable = true;
   }
 
   return metadata;

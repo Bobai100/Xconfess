@@ -21,12 +21,106 @@ export interface AnchorData {
   anchoredAt: Date;
 }
 
+/**
+ * User-visible lifecycle of a submitted transaction.
+ *
+ * - ACCEPTED:  the transaction was submitted to the network (hash known) but
+ *              no verified ledger evidence has been observed yet.
+ * - INCLUDED:  the transaction is present in a closed ledger but has not yet
+ *              reached the configured confirmation depth.
+ * - FINALIZED: the transaction is included at a ledger whose depth meets the
+ *              confirmation threshold, so it is considered irreversible.
+ * - FAILED:    the transaction was included in a ledger but its result code
+ *              indicates failure (e.g. tx_failed / tx_bad_seq).
+ * - UNKNOWN:   no trustworthy evidence is available (missing, ambiguous or
+ *              conflicting RPC observations). Never promoted without evidence.
+ */
+export enum TransactionFinalityState {
+  ACCEPTED = 'ACCEPTED',
+  INCLUDED = 'INCLUDED',
+  FINALIZED = 'FINALIZED',
+  FAILED = 'FAILED',
+  UNKNOWN = 'UNKNOWN',
+}
+
+/**
+ * Verified evidence gathered from a single RPC/Horizon observation.
+ */
+export interface TransactionObservation {
+  txHash: string;
+  /** Ledger sequence the transaction was included in, if any. */
+  ledger: number | null;
+  /** Whether the transaction succeeded, if the network reported it. */
+  successful: boolean | null;
+  /** Raw result code reported by the network, if any. */
+  resultCode: string | null;
+  /** Whether the observation contained enough evidence to be trusted. */
+  verified: boolean;
+  /** Reason the observation could not be verified, when applicable. */
+  reason?: string;
+  observedAt: Date;
+}
+
+/**
+ * Persisted finality record for a logical transaction.
+ */
+export interface TransactionFinalityRecord {
+  txHash: string;
+  state: TransactionFinalityState;
+  ledger: number | null;
+  resultCode: string | null;
+  /** Replacement hashes linked to this logical transaction (fee bumps). */
+  replacementHashes: string[];
+  /** Hash of the transaction this one replaced, if any. */
+  replacesHash: string | null;
+  lastObservedAt: Date | null;
+  updatedAt: Date;
+}
+
+/**
+ * Minimal persistence boundary for finality records. Implementations may back
+ * this with a database table; the service only depends on this contract so
+ * that observations can be recorded and read back deterministically.
+ */
+export interface TransactionFinalityRepository {
+  find(txHash: string): Promise<TransactionFinalityRecord | null>;
+  save(record: TransactionFinalityRecord): Promise<TransactionFinalityRecord>;
+}
+
+/**
+ * In-memory fallback used when no persistent repository is wired in. Kept
+ * intentionally simple; production deployments should provide a durable
+ * implementation via the DI token below.
+ */
+export class InMemoryTransactionFinalityRepository
+  implements TransactionFinalityRepository
+{
+  private readonly records = new Map<string, TransactionFinalityRecord>();
+
+  async find(txHash: string): Promise<TransactionFinalityRecord | null> {
+    const record = this.records.get(txHash);
+    return record ? { ...record, replacementHashes: [...record.replacementHashes] } : null;
+  }
+
+  async save(record: TransactionFinalityRecord): Promise<TransactionFinalityRecord> {
+    const stored = { ...record, replacementHashes: [...record.replacementHashes] };
+    this.records.set(record.txHash, stored);
+    return { ...stored, replacementHashes: [...stored.replacementHashes] };
+  }
+}
+
+export const TRANSACTION_FINALITY_REPOSITORY = Symbol(
+  'TRANSACTION_FINALITY_REPOSITORY',
+);
+
 @Injectable()
 export class StellarService {
   private readonly logger = new Logger(StellarService.name);
   private readonly contractId: string;
   private readonly network: string;
   private readonly horizonUrl: string;
+  private readonly confirmationDepth: number;
+  private readonly finalityRepository: TransactionFinalityRepository;
 
   constructor(
     private readonly configService: ConfigService,
@@ -35,6 +129,7 @@ export class StellarService {
     private deploymentMetadataService: DeploymentMetadataService,
     @InjectRepository(AnonymousConfession)
     private readonly confessionRepo: Repository<AnonymousConfession>,
+    finalityRepository?: TransactionFinalityRepository,
   ) {
     this.contractId = this.configService.get<string>(
       'CONFESSION_ANCHOR_CONTRACT',
@@ -45,6 +140,15 @@ export class StellarService {
       'STELLAR_HORIZON_URL',
       'https://horizon-testnet.stellar.org',
     );
+    const configuredDepth = Number(
+      this.configService.get<string | number>('STELLAR_CONFIRMATION_DEPTH', 1),
+    );
+    this.confirmationDepth =
+      Number.isFinite(configuredDepth) && configuredDepth >= 1
+        ? Math.floor(configuredDepth)
+        : 1;
+    this.finalityRepository =
+      finalityRepository ?? new InMemoryTransactionFinalityRepository();
   }
 
   /**
@@ -339,6 +443,355 @@ export class StellarService {
     }
 
     return false;
+  }
+
+  /**
+   * Record that a transaction has been accepted (submitted) by the network.
+   *
+   * This only establishes the ACCEPTED baseline; it never promotes a
+   * transaction to INCLUDED/FINALIZED without verified ledger evidence.
+   */
+  async recordAccepted(txHash: string): Promise<TransactionFinalityRecord> {
+    if (!this.isValidTxHash(txHash)) {
+      throw new AppException(
+        'Invalid transaction hash',
+        ErrorCode.STELLAR_ERROR,
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const existing = await this.finalityRepository.find(txHash);
+    if (existing && existing.state !== TransactionFinalityState.UNKNOWN) {
+      // Never downgrade a verified state back to ACCEPTED.
+      return existing;
+    }
+
+    const now = new Date();
+    const record: TransactionFinalityRecord = {
+      txHash,
+      state: TransactionFinalityState.ACCEPTED,
+      ledger: existing?.ledger ?? null,
+      resultCode: existing?.resultCode ?? null,
+      replacementHashes: existing?.replacementHashes ?? [],
+      replacesHash: existing?.replacesHash ?? null,
+      lastObservedAt: existing?.lastObservedAt ?? null,
+      updatedAt: now,
+    };
+    return this.finalityRepository.save(record);
+  }
+
+  /**
+   * Observe a transaction on the network and persist verified evidence.
+   *
+   * Only verified observations promote state:
+   *  - included at ledger depth >= confirmationDepth -> FINALIZED
+   *  - included but below confirmation depth          -> INCLUDED
+   *  - included with a failing result code            -> FAILED
+   *  - missing / ambiguous / conflicting evidence     -> UNKNOWN (no promotion)
+   */
+  async observeTransaction(txHash: string): Promise<TransactionFinalityRecord> {
+    if (!this.isValidTxHash(txHash)) {
+      throw new AppException(
+        'Invalid transaction hash',
+        ErrorCode.STELLAR_ERROR,
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const existing = await this.finalityRepository.find(txHash);
+    const observation = await this.fetchObservation(txHash);
+    const now = new Date();
+
+    const base: TransactionFinalityRecord = existing ?? {
+      txHash,
+      state: TransactionFinalityState.UNKNOWN,
+      ledger: null,
+      resultCode: null,
+      replacementHashes: [],
+      replacesHash: null,
+      lastObservedAt: null,
+      updatedAt: now,
+    };
+
+    if (!observation.verified) {
+      // Ambiguous or missing evidence: keep any previously verified state,
+      // otherwise remain UNKNOWN. Never promote on unverified data.
+      const next: TransactionFinalityRecord = {
+        ...base,
+        state:
+          base.state === TransactionFinalityState.ACCEPTED
+            ? TransactionFinalityState.ACCEPTED
+            : base.state,
+        lastObservedAt: now,
+        updatedAt: now,
+      };
+      return this.finalityRepository.save(next);
+    }
+
+    // Conflicting observation: a previously finalized/included record that now
+    // reports a different ledger is treated as untrusted and left untouched.
+    if (
+      base.ledger !== null &&
+      observation.ledger !== null &&
+      base.ledger !== observation.ledger &&
+      (base.state === TransactionFinalityState.FINALIZED ||
+        base.state === TransactionFinalityState.INCLUDED)
+    ) {
+      this.logger.warn(
+        `Conflicting ledger observation for ${txHash}: recorded ${base.ledger}, observed ${observation.ledger}`,
+      );
+      const next: TransactionFinalityRecord = {
+        ...base,
+        lastObservedAt: now,
+        updatedAt: now,
+      };
+      return this.finalityRepository.save(next);
+    }
+
+    const nextState = this.resolveState(observation);
+    const next: TransactionFinalityRecord = {
+      ...base,
+      state: nextState,
+      ledger: observation.ledger ?? base.ledger,
+      resultCode: observation.resultCode ?? base.resultCode,
+      lastObservedAt: now,
+      updatedAt: now,
+    };
+    return this.finalityRepository.save(next);
+  }
+
+  /**
+   * Read the current verified finality state for a transaction.
+   */
+  async getFinality(txHash: string): Promise<TransactionFinalityRecord> {
+    if (!this.isValidTxHash(txHash)) {
+      throw new AppException(
+        'Invalid transaction hash',
+        ErrorCode.STELLAR_ERROR,
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const record = await this.finalityRepository.find(txHash);
+    if (record) {
+      return record;
+    }
+
+    return {
+      txHash,
+      state: TransactionFinalityState.UNKNOWN,
+      ledger: null,
+      resultCode: null,
+      replacementHashes: [],
+      replacesHash: null,
+      lastObservedAt: null,
+      updatedAt: new Date(),
+    };
+  }
+
+  /**
+   * Link a fee-bump replacement hash to the logical transaction it replaces so
+   * that the user-facing ledger records a single logical operation.
+   */
+  async recordReplacement(
+    originalHash: string,
+    replacementHash: string,
+  ): Promise<TransactionFinalityRecord> {
+    if (!this.isValidTxHash(originalHash) || !this.isValidTxHash(replacementHash)) {
+      throw new AppException(
+        'Invalid transaction hash',
+        ErrorCode.STELLAR_ERROR,
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const original =
+      (await this.finalityRepository.find(originalHash)) ??
+      (await this.recordAccepted(originalHash));
+
+    const replacementHashes = original.replacementHashes.includes(replacementHash)
+      ? original.replacementHashes
+      : [...original.replacementHashes, replacementHash];
+
+    const updated = await this.finalityRepository.save({
+      ...original,
+      replacementHashes,
+      updatedAt: new Date(),
+    });
+
+    // Ensure the replacement hash resolves to the same logical record.
+    const replacementRecord = await this.finalityRepository.find(replacementHash);
+    await this.finalityRepository.save({
+      txHash: replacementHash,
+      state: replacementRecord?.state ?? TransactionFinalityState.ACCEPTED,
+      ledger: replacementRecord?.ledger ?? null,
+      resultCode: replacementRecord?.resultCode ?? null,
+      replacementHashes: updated.replacementHashes,
+      replacesHash: originalHash,
+      lastObservedAt: replacementRecord?.lastObservedAt ?? null,
+      updatedAt: new Date(),
+    });
+
+    return updated;
+  }
+
+  /**
+   * Fetch a single observation from Horizon and classify its trustworthiness.
+   */
+  private async fetchObservation(txHash: string): Promise<TransactionObservation> {
+    const observedAt = new Date();
+    const rpcConfig = this.stellarConfig.getConfig();
+    const maxRetries = rpcConfig.rpcMaxRetries;
+    const baseDelay = rpcConfig.rpcRetryBaseDelayMs;
+    const maxDelay = rpcConfig.rpcRetryMaxDelayMs;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(
+          () => controller.abort(),
+          rpcConfig.rpcTimeoutMs,
+        );
+
+        let response: Response;
+        try {
+          response = await fetch(this.getHorizonTxUrl(txHash), {
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timeoutId);
+        }
+
+        if (response.status === 404) {
+          // Not yet visible: a delayed observation, not a failure.
+          return {
+            txHash,
+            ledger: null,
+            successful: null,
+            resultCode: null,
+            verified: false,
+            reason: 'not_found',
+            observedAt,
+          };
+        }
+
+        if (!response.ok) {
+          return {
+            txHash,
+            ledger: null,
+            successful: null,
+            resultCode: null,
+            verified: false,
+            reason: `http_${response.status}`,
+            observedAt,
+          };
+        }
+
+        const data: any = await response.json();
+        const ledger =
+          typeof data.ledger === 'number' && data.ledger > 0 ? data.ledger : null;
+        const successful =
+          typeof data.successful === 'boolean' ? data.successful : null;
+        const resultCode =
+          typeof data.result_code === 'string' ? data.result_code : null;
+
+        // Evidence is only trusted when a ledger inclusion is reported.
+        if (ledger === null || successful === null) {
+          return {
+            txHash,
+            ledger,
+            successful,
+            resultCode,
+            verified: false,
+            reason: 'incomplete_evidence',
+            observedAt,
+          };
+        }
+
+        return {
+          txHash,
+          ledger,
+          successful,
+          resultCode,
+          verified: true,
+          observedAt,
+        };
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        const isAbort =
+          error instanceof DOMException && error.name === 'AbortError';
+        const isRetryable =
+          isAbort ||
+          message.toLowerCase().includes('econnrefused') ||
+          message.toLowerCase().includes('econnreset') ||
+          message.toLowerCase().includes('network');
+
+        if (!isRetryable || attempt >= maxRetries) {
+          this.logger.error(
+            `Finality observation failed for ${txHash}: ${message}`,
+          );
+          return {
+            txHash,
+            ledger: null,
+            successful: null,
+            resultCode: null,
+            verified: false,
+            reason: 'rpc_error',
+            observedAt,
+          };
+        }
+
+        const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
+        await new Promise((res) => setTimeout(res, delay));
+      }
+    }
+
+    return {
+      txHash,
+      ledger: null,
+      successful: null,
+      resultCode: null,
+      verified: false,
+      reason: 'exhausted_retries',
+      observedAt,
+    };
+  }
+
+  /**
+   * Map a verified observation to a finality state.
+   */
+  private resolveState(
+    observation: TransactionObservation,
+  ): TransactionFinalityState {
+    if (!observation.verified || observation.ledger === null) {
+      return TransactionFinalityState.UNKNOWN;
+    }
+
+    if (observation.successful === false) {
+      return TransactionFinalityState.FAILED;
+    }
+
+    const currentLedger = this.getLatestKnownLedger(observation.ledger);
+    const depth = currentLedger - observation.ledger + 1;
+    if (depth >= this.confirmationDepth) {
+      return TransactionFinalityState.FINALIZED;
+    }
+    return TransactionFinalityState.INCLUDED;
+  }
+
+  /**
+   * Determine the latest ledger used to compute confirmation depth. The
+   * observation's own ledger is the conservative lower bound; callers may
+   * override via configuration for deterministic testing.
+   */
+  private getLatestKnownLedger(observedLedger: number): number {
+    const configured = Number(
+      this.configService.get<string | number>('STELLAR_LATEST_LEDGER', 0),
+    );
+    if (Number.isFinite(configured) && configured >= observedLedger) {
+      return Math.floor(configured);
+    }
+    return observedLedger;
   }
 
   /**
