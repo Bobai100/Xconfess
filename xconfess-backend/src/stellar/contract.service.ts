@@ -11,6 +11,9 @@ import { encodeContractArgs, ContractArg } from './utils/parameter.encoder';
 import { redactSecretStrings } from '../utils/redact-secrets';
 import { InvokeContractDto } from './dto/invoke-contract.dto';
 import { getStellarInvocationPolicy } from './stellar-invocation-policy';
+import { AppException } from '../common/exceptions/app.exception';
+import { ErrorCode } from '../common/enums/error-code.enum';
+import { StaleSimulationError } from './errors/stale-simulation.error';
 
 @Injectable()
 export class ContractService {
@@ -74,6 +77,11 @@ export class ContractService {
         invocation.sourceAccount,
         [operation],
       );
+
+      // Simulate first and bind the result to the network and operation inputs.
+      // Submission re-validates freshness and rejects if ledger state has aged
+      // or changed since simulation (see TransactionBuilderService).
+      const simulation = await this.txBuilder.simulateTransaction(tx);
       const signedTx = this.txBuilder.signTransaction(tx, signerSecret);
       const timeoutMs = this.stellarConfig.getConfig().rpcTimeoutMs;
       let timeoutId: NodeJS.Timeout | undefined;
@@ -86,7 +94,7 @@ export class ContractService {
       let result: ITransactionResult;
       try {
         result = await Promise.race([
-          this.txBuilder.submitTransaction(signedTx),
+          this.txBuilder.submitTransaction(signedTx, simulation),
           timeout,
         ]);
       } finally {
@@ -100,6 +108,16 @@ export class ContractService {
         result: decodedResult,
       };
     } catch (error: unknown) {
+      if (error instanceof StaleSimulationError) {
+        // Fail safely: never submit a transaction whose simulation state has
+        // aged or changed. The message is already redacted at its source.
+        const message = redactSecretStrings(error.message);
+        this.logger.warn('Rejected stale contract submission: ' + String(message));
+        throw new AppException(
+          ErrorCode.STALE_SIMULATION,
+          'Simulation state is stale; please retry the operation',
+        );
+      }
       // Redacted defensively: this can be the signing path's error, which is
       // derived from the server secret key and must never log it verbatim.
       const message = redactSecretStrings(

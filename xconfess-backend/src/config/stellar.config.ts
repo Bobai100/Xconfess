@@ -24,4 +24,14 @@ export default registerAs('stellar', () => ({
   rpcMaxRetries: Number(process.env.STELLAR_RPC_MAX_RETRIES) || 3,
   rpcRetryBaseDelayMs: Number(process.env.STELLAR_RPC_RETRY_BASE_DELAY_MS) || 1000,
   rpcRetryMaxDelayMs: Number(process.env.STELLAR_RPC_RETRY_MAX_DELAY_MS) || 10000,
+
+  // Simulation freshness bounds
+  // Maximum age (ms) of a simulation result before it is considered stale
+  // and the transaction submission is rejected.
+  simulationFreshnessMs:
+    Number(process.env.STELLAR_SIMULATION_FRESHNESS_MS) || 30000, // 30s default
+  // Maximum allowed ledger drift (in ledgers) between the ledger the
+  // simulation was performed against and the current ledger at submission.
+  simulationMaxLedgerDrift:
+    Number(process.env.STELLAR_SIMULATION_MAX_LEDGER_DRIFT) || 5,
 }));

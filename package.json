@@ -85,8 +85,11 @@
     "release:notes:checklist": "node scripts/generate-release-notes.js --format checklist",
     "release:check-unreleased": "node scripts/generate-release-notes.js --check-unreleased",
     "post-deploy:verify": "node scripts/post-deploy-verify.js",
-    "post-deploy:verify:staging": "node scripts/post-deploy-verify.js --env staging",
-    "post-deploy:verify:production": "node scripts/post-deploy-verify.js --env production",
+    "post-deploy:verify:staging": "node scripts/post-deploy-verify.js --env staging --journey",
+    "post-deploy:verify:production": "node scripts/post-deploy-verify.js --env production --journey",
+    "post-deploy:verify:journey": "node scripts/post-deploy-verify.js --journey",
+    "post-deploy:verify:journey:test": "node --test scripts/__tests__/post-deploy-journey.test.js",
+=======
     "provenance:generate": "node scripts/generate-provenance.js",
     "provenance:verify": "node scripts/verify-provenance.js",
     "sbom:generate": "node scripts/generate-sbom.js",

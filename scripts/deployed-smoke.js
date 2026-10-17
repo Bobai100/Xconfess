@@ -8,6 +8,15 @@ const runMutation = process.env.SMOKE_RUN_MUTATION === 'true';
 const timeoutMs = Number(process.env.SMOKE_TIMEOUT_MS || 45000);
 const maxAttempts = Math.max(1, Number(process.env.SMOKE_MAX_ATTEMPTS || process.env.SMOKE_RETRIES || 5));
 const retryDelayMs = Math.max(0, Number(process.env.SMOKE_RETRY_DELAY_MS || 5000));
+const smokeUsername = process.env.SMOKE_USERNAME || '';
+const smokePassword = process.env.SMOKE_PASSWORD || '';
+const runJourney = process.env.SMOKE_RUN_JOURNEY !== 'false';
+const sessionCookieName = process.env.SMOKE_SESSION_COOKIE_NAME || 'xconfess_session';
+const journeyPath = process.env.SMOKE_JOURNEY_PATH || '/api/auth/me';
+const signInPath = process.env.SMOKE_SIGN_IN_PATH || '/api/auth/login';
+const signOutPath = process.env.SMOKE_SIGN_OUT_PATH || '/api/auth/logout';
+const expectedOrigin = process.env.SMOKE_EXPECTED_ORIGIN || frontendUrl;
+=======
 
 function joinUrl(base, path) {
   return `${base.replace(/\/+$/, '')}${path}`;
@@ -89,7 +98,59 @@ function assertObject(name, value) {
   }
 }
 
+function parseSetCookieHeaders(response) {
+  const raw = typeof response.headers.getSetCookie === 'function' ? response.headers.getSetCookie() : [];
+  if (raw.length > 0) return raw;
+  const combined = response.headers.get('set-cookie');
+  return combined ? [combined] : [];
+}
+
+function findSessionCookie(response) {
+  const cookies = parseSetCookieHeaders(response);
+  for (const cookie of cookies) {
+    const [pair] = cookie.split(';');
+    const eqIndex = pair.indexOf('=');
+    if (eqIndex === -1) continue;
+    const name = pair.slice(0, eqIndex).trim();
+    const value = pair.slice(eqIndex + 1).trim();
+    if (name === sessionCookieName && value) {
+      return { name, value, raw: cookie };
+    }
+  }
+  return null;
+}
+
+function assertSessionCookieAttributes(name, cookie) {
+  const lower = cookie.toLowerCase();
+  if (!/httponly/.test(lower)) {
+    throw new Error(`${name} session cookie is missing HttpOnly`);
+  }
+  if (!/samesite=(lax|strict|none)/.test(lower)) {
+    throw new Error(`${name} session cookie is missing SameSite`);
+  }
+  if (frontendUrl.startsWith('https://') && !/;\s*secure/.test(lower)) {
+    throw new Error(`${name} session cookie is missing Secure on an https deployment`);
+  }
+}
+
+function assertCorsHeaders(name, response) {
+  const allowOrigin = response.headers.get('access-control-allow-origin');
+  if (!allowOrigin) {
+    throw new Error(`${name} response is missing Access-Control-Allow-Origin`);
+  }
+  if (allowOrigin !== '*' && allowOrigin !== expectedOrigin) {
+    throw new Error(`${name} Access-Control-Allow-Origin ${allowOrigin} does not match expected origin ${expectedOrigin}`);
+  }
+  if (allowOrigin !== '*') {
+    const allowCredentials = response.headers.get('access-control-allow-credentials');
+    if (allowCredentials !== 'true') {
+      throw new Error(`${name} response is missing Access-Control-Allow-Credentials for a credentialed origin`);
+    }
+  }
+}
+
 function assertNoSensitiveKeys(name, value, path = '') {
+=======
   if (!value || typeof value !== 'object') return;
 
   const sensitiveKeys = new Set([
@@ -127,6 +188,82 @@ function assertNoSensitiveKeys(name, value, path = '') {
   }
 }
 
+async function verifyUserJourney() {
+  if (!smokeUsername || !smokePassword) {
+    throw new Error('SMOKE_USERNAME and SMOKE_PASSWORD are required to verify the deployed user journey');
+  }
+
+  const originHeaders = { origin: expectedOrigin };
+
+  const preflight = await request(
+    'journey CORS preflight',
+    joinUrl(backendUrl, signInPath),
+    { method: 'OPTIONS', headers: { ...originHeaders, 'access-control-request-method': 'POST' } },
+    [200, 204],
+  );
+  assertCorsHeaders('journey CORS preflight', preflight);
+
+  const anonymousJourney = await request(
+    'journey anonymous authenticated request',
+    joinUrl(backendUrl, journeyPath),
+    { headers: originHeaders },
+    [401, 403],
+  );
+  assertCorsHeaders('journey anonymous authenticated request', anonymousJourney);
+
+  const signInResponse = await request(
+    'journey sign-in',
+    joinUrl(backendUrl, signInPath),
+    {
+      method: 'POST',
+      headers: originHeaders,
+      body: JSON.stringify({ username: smokeUsername, password: smokePassword }),
+    },
+    [200, 201],
+  );
+  assertCorsHeaders('journey sign-in', signInResponse);
+  const sessionCookie = findSessionCookie(signInResponse);
+  if (!sessionCookie) {
+    throw new Error(`journey sign-in did not set the ${sessionCookieName} session cookie`);
+  }
+  assertSessionCookieAttributes('journey sign-in', sessionCookie.raw);
+
+  const authenticated = await request(
+    'journey authenticated request',
+    joinUrl(backendUrl, journeyPath),
+    { headers: { ...originHeaders, cookie: `${sessionCookie.name}=${sessionCookie.value}` } },
+    [200],
+  );
+  assertCorsHeaders('journey authenticated request', authenticated);
+  const authenticatedBody = await authenticated.json().catch(() => null);
+  assertObject('journey authenticated request', authenticatedBody);
+  assertNoSensitiveKeys('journey authenticated request', authenticatedBody);
+
+  const signOutResponse = await request(
+    'journey sign-out',
+    joinUrl(backendUrl, signOutPath),
+    {
+      method: 'POST',
+      headers: { ...originHeaders, cookie: `${sessionCookie.name}=${sessionCookie.value}` },
+    },
+    [200, 204],
+  );
+  assertCorsHeaders('journey sign-out', signOutResponse);
+  const clearedCookie = findSessionCookie(signOutResponse);
+  if (clearedCookie && clearedCookie.value) {
+    throw new Error('journey sign-out did not clear the session cookie');
+  }
+
+  await request(
+    'journey post-sign-out authenticated request',
+    joinUrl(backendUrl, journeyPath),
+    { headers: { ...originHeaders, cookie: `${sessionCookie.name}=${sessionCookie.value}` } },
+    [401, 403],
+  );
+
+  console.log('user journey verified: sign-in, authenticated request, sign-out');
+}
+
 async function main() {
   await requestJson('backend liveness', joinUrl(backendUrl, '/api/health/live'));
   await requestJson('backend readiness', joinUrl(backendUrl, '/api/health/ready'));
@@ -150,6 +287,12 @@ async function main() {
   await request('frontend traction page', joinUrl(frontendUrl, '/traction'), {}, [200]);
   await request('frontend session anonymous', joinUrl(frontendUrl, '/api/auth/session'), {}, [401]);
   await request('frontend register method guard', joinUrl(frontendUrl, '/api/users/register'), {}, [405]);
+
+  if (runJourney) {
+    await verifyUserJourney();
+  } else {
+    console.log('user journey skipped; set SMOKE_RUN_JOURNEY=false only when credentials are unavailable');
+  }
 
   if (runMutation) {
     const suffix = crypto.randomBytes(4).toString('hex');
