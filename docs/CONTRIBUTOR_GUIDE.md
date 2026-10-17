@@ -236,79 +236,54 @@ extend to groups.
 - Invites are scoped to a single conversation and a single invitee, expire, and
   are single-use.
 
-## Conversation-Level Blocking And Report Handoff
+## Multilingual Search Normalization
 
-Blocking, reporting, and conversation access interact, so the backend defines
-precedence and preserves only the safety evidence it needs. All of this is
-enforced at the owning boundary; clients must not infer block or report state
-locally.
+Search queries and indexed text are normalized and tokenized by the backend at
+the search boundary so that equivalent input matches regardless of Unicode form,
+diacritics, or language-specific token boundaries. Clients must send raw query
+text and must not pre-normalize it.
 
-### Atomic State Transitions
+### Normalization Rules
 
-- A block is a single atomic transition: the block record, the conversation
-  access change, and the delivery-suppression flag are written together or not
-  at all. A partial block is never observable.
-- A report is likewise atomic: the report record and its handoff marker are
-  written in one transaction. If the handoff write fails, the report is not
-  reported as filed and the caller receives an error to retry.
-- Both transitions are idempotent: repeating a block or report for the same
-  target returns the existing state rather than creating duplicates.
+- Text is normalized to Unicode NFKC before tokenization, so composed and
+  decomposed forms (e.g. `é` vs `e` + combining accent) match.
+- Diacritics are folded for Latin-script languages so `café` matches `cafe`.
+- Case is folded using locale-aware lowercasing for the detected language.
+- The same normalization is applied to both the query and the indexed text; a
+  mismatch between the two is a bug.
 
-### Precedence When States Conflict
+### Tokenization Per Language
 
-- A block takes precedence over conversation access: once a block is in place,
-  the blocked party can no longer read, send to, or be fanned out the
-  conversation, even if they were previously a member.
-- A report does not by itself change conversation access. Reporting and
-  blocking are independent; a reporter may block separately, and a block does
-  not implicitly file a report.
-- If a block and a report target the same conversation, the block's delivery
-  suppression applies immediately while the report is handed off for review.
+- Supported languages (`en`, `fr`, `es`, `de`, `pt`, `ar`, `zh`, `ja`) each
+  define their own token boundaries. CJK languages tokenize per character or
+  bigram rather than on whitespace; Arabic and Latin languages split on
+  whitespace and punctuation.
+- The language is taken from an explicit request hint when present, otherwise
+  detected from the query, otherwise falls back to the default language.
 
-### Reporter Privacy
+### Fallback For Unknown Languages
 
-- The blocked party is never told who reported them, and report metadata is
-  never included in conversation reads, previews, or fanout to the blocked
-  party.
-- Only the minimum safety evidence is retained: the report id, conversation
-  id, reporter id (visible only to authorized reviewers), target id, reason
-  code, and timestamp. Message bodies are not copied into the report record.
-
-### Delivery Suppression And Queued Messages
-
-- After a block, new messages to the blocked party are suppressed at the
-  boundary and the sender receives a generic failure that does not reveal the
-  block reason.
-- Messages already queued for delivery when the block lands are dropped before
-  fanout; they are not delivered late. The sender is not retroactively
-  notified of the drop.
-- Suppression is checked at send time and again at fanout time so a race
-  between queueing and blocking cannot leak a message.
-
-### Appeal Implications
-
-- A block may be appealed through the moderation flow; filing an appeal does
-  not lift the block. The block stays in effect until a reviewer resolves the
-  appeal.
-- Resolving an appeal in the blocked party's favor removes the block
-  atomically and restores access per the conversation's membership rules.
+- Unknown or unsupported languages use a safe fallback: NFKC normalization,
+  case folding, and whitespace/punctuation tokenization without diacritic
+  folding that could corrupt non-Latin scripts.
+- Malformed input (invalid UTF-8, lone surrogates, control characters) is
+  sanitized before normalization; it never throws and never reaches the index
+  unnormalized.
 
 ### Authorization And Failure Semantics
 
-- Only a participant may block or report within a conversation; unauthorized
-  requests are rejected with `403` at the owning boundary.
-- Blocking or reporting a non-participant is rejected with `404` so the caller
-  cannot probe membership.
-- Failed transitions surface an error and are safe to retry; the caller never
-  sees a success for a transition that did not commit.
+- Search requires an authenticated session; unauthorized requests are rejected
+  with `403` at the search boundary.
+- Normalization failures fall back to the safe fallback path rather than
+  returning an error, and are logged without query content.
 
 ### Testing Expectations
 
-Backend tests for this area must cover the expected path plus rejection cases
-(unauthorized block/report, non-participant target), the atomicity of partial
-failures, delivery suppression of already-queued messages, and the regression
-risk of reporter identity leaking to the blocked party. Run them with:
+Backend tests for this area must cover the expected path plus mixed-script
+input, malformed input, and the fallback for unknown languages, and the
+rejection case for unauthorized search. Fixtures live alongside the search
+tests. Run them with:
 
 ```bash
-npm run backend:test && npm run frontend:test
+npm run backend:test
 ```
