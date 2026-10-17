@@ -127,6 +127,34 @@ export const ALERT_OWNERSHIP_MAP: Record<string, OwnershipEntry> = {
       runbookUrl: 'https://github.com/yazeed11011/Xconfess/blob/main/docs/production-critical-path.md',
     },
   },
+  'transaction-latency': {
+    owner: {
+      handle: '@xconfess/backend',
+      channel: '#stellar-incidents',
+      runbookUrl: 'https://github.com/yazeed11011/Xconfess/blob/main/docs/transaction-latency-budgets.md',
+    },
+    escalation: [
+      {
+        handle: '@xconfess/backend-oncall',
+        channel: '#incidents-escalation',
+        runbookUrl: 'https://github.com/yazeed11011/Xconfess/blob/main/docs/transaction-latency-budgets.md',
+      },
+    ],
+  },
+  'transaction-failure': {
+    owner: {
+      handle: '@xconfess/backend',
+      channel: '#stellar-incidents',
+      runbookUrl: 'https://github.com/yazeed11011/Xconfess/blob/main/docs/transaction-latency-budgets.md',
+    },
+    escalation: [
+      {
+        handle: '@xconfess/backend-oncall',
+        channel: '#incidents-escalation',
+        runbookUrl: 'https://github.com/yazeed11011/Xconfess/blob/main/docs/transaction-latency-budgets.md',
+      },
+    ],
+  },
 } as const;
 
 /** Fallback owner when a service area is not registered. */
@@ -167,6 +195,61 @@ const DEFAULT_DEDUP_WINDOWS_MS: Record<AlertSeverity, number> = {
   warning:  15 * 60_000, // 15 minutes
   info:     60 * 60_000, // 1 hour
 };
+
+/**
+ * Transaction workflow stages measured by the latency/failure budgets.
+ * Kept as a closed union so alert labels stay bounded (no unbounded cardinality).
+ */
+export type TransactionStage = 'submission' | 'inclusion' | 'confirmation';
+
+/** Operation classes used to segment transaction budgets. */
+export type TransactionOperationClass = 'tip' | 'anchor' | 'transfer' | 'other';
+
+/** Network identifiers used to segment transaction budgets. */
+export type TransactionNetwork = 'mainnet' | 'testnet' | 'futurenet';
+
+/** Which budget was breached. */
+export type TransactionBudgetKind = 'latency' | 'failure';
+
+export interface TransactionBudgetBreach {
+  kind: TransactionBudgetKind;
+  network: TransactionNetwork;
+  operationClass: TransactionOperationClass;
+  stage: TransactionStage;
+  /** Observed value: latency in ms, or failure ratio in [0, 1]. */
+  observed: number;
+  /** Configured budget threshold that was exceeded. */
+  threshold: number;
+}
+
+/**
+ * Map a budget breach to an AlertDefinition with bounded labels.
+ *
+ * Labels are restricted to the closed unions above so the identity key (and
+ * therefore the dedup window) cannot explode in cardinality.
+ */
+export function buildTransactionBudgetAlert(
+  breach: TransactionBudgetBreach,
+): AlertDefinition {
+  const service =
+    breach.kind === 'latency' ? 'transaction-latency' : 'transaction-failure';
+  const unit = breach.kind === 'latency' ? 'ms' : 'ratio';
+  return {
+    alertName: `transaction.${breach.kind}.budget_exceeded`,
+    severity: 'critical',
+    service,
+    message:
+      `Transaction ${breach.kind} budget exceeded for ${breach.operationClass} ` +
+      `on ${breach.network} at stage ${breach.stage}: ` +
+      `observed ${breach.observed}${unit} > threshold ${breach.threshold}${unit}`,
+    labels: {
+      network: breach.network,
+      operation_class: breach.operationClass,
+      stage: breach.stage,
+      kind: breach.kind,
+    },
+  };
+}
 
 /**
  * In-process alert deduplication and ownership router.
@@ -271,6 +354,17 @@ export class AlertManager {
   /** Returns true when any critical alert is currently firing. */
   hasCritical(): boolean {
     return this.getActive().some((a) => a.severity === 'critical');
+  }
+
+  /**
+   * Fire a transaction latency/failure budget breach alert.
+   *
+   * Routes ownership via the `transaction-latency` / `transaction-failure`
+   * service entries and deduplicates using the bounded label set, so a
+   * sustained breach pages once per dedup window rather than per sample.
+   */
+  fireTransactionBudgetBreach(breach: TransactionBudgetBreach): FiredAlert {
+    return this.fire(buildTransactionBudgetAlert(breach));
   }
 
   setMaintenanceMode(enabled: boolean): void {

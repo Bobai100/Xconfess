@@ -62,7 +62,21 @@ export function handleStellarError(error: any): StellarError {
     actionable = "Check your internet connection and ensure your wallet is on the correct network (Testnet/Mainnet).";
   }
 
-  // 4. Contract / Transaction errors (Duplicate, Balance, Timeout)
+  // 4. Authorization scope mismatches (signed invocation != displayed intent)
+  else if (
+    errorString.includes("scope mismatch") ||
+    errorString.includes("authorization scope") ||
+    errorString.includes("unexpected authorization") ||
+    errorString.includes("unexpected auth") ||
+    errorString.includes("unauthorized operation") ||
+    errorString.includes("intent mismatch")
+  ) {
+    userMessage = "Authorization scope mismatch.";
+    type = 'contract';
+    actionable = "The operation requested by your wallet does not match the intent shown. Review the operation details and only approve if they match.";
+  }
+
+  // 5. Contract / Transaction errors (Duplicate, Balance, Timeout)
   else if (errorString.includes("duplicate")) {
     userMessage = "Already anchored.";
     type = 'contract';
