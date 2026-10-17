@@ -372,3 +372,6 @@ When adding a new API endpoint, follow the [API endpoint contributor checklist](
 
 <!-- handsoff-issue-24 -->
 - #24: [Advanced] Add device and session management UI
+
+<!-- handsoff-issue-250 -->
+- #250: [Advanced] Add per-device notification controls for private conversations
