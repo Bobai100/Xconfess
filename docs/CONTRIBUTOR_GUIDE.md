@@ -113,6 +113,49 @@ If a full check cannot run locally because a dependency, Docker service, or
 platform tool is unavailable, document the failed command and the exact blocker
 in the pull request body.
 
+## Conversation Ordering And Unread Reconciliation
+
+Conversation previews and unread counts are owned by the backend. Clients must
+treat the server as the single source of truth and never derive ordering or
+unread totals from local timestamps.
+
+### Deterministic Ordering
+
+- Conversation previews are ordered by a stable, server-assigned monotonic
+  sequence (not client `createdAt`/`updatedAt`). Ties are broken by the
+  conversation id so the order is total and reproducible.
+- Each message and preview carries an event cursor. Clients apply events in
+  cursor order and ignore any event whose cursor is not greater than the last
+  applied cursor for that conversation.
+
+### Reconnect Replay
+
+- On reconnect, clients resume from their last applied cursor. Replay is
+  idempotent: duplicate events are dropped and out-of-order events are buffered
+  or discarded rather than reordering previews.
+- Delayed delivery must not move a conversation ahead of a newer one; the
+  server sequence, not arrival time, decides position.
+
+### Unread Reconciliation
+
+- Unread counts are reconciled from authoritative server state (the unread
+  endpoint), not incremented optimistically from client events alone.
+- Reconciliation requires an authenticated session; unauthenticated or
+  unauthorized requests are rejected at the owning boundary and the client
+  keeps its last known counts rather than guessing.
+- On failure, clients surface the error and retry reconciliation; they must not
+  silently reset counts to zero.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path plus delayed,
+duplicate, and out-of-order delivery, and the rejection/failure cases for
+unauthorized reconciliation. Run them with:
+
+```bash
+npm run backend:test
+```
+
 ## Accessibility Contributor Test Harness
 
 The accessibility harness gives every contributor a consistent, low-friction
@@ -276,5 +319,5 @@ If your PR includes logs or screenshots, follow the redaction rules:
 
 - [Attaching logs to issues and PRs](LOG_ATTACHING_GUIDE.md)
 
-Never include production secrets, private keys, real user data, or KYC/payment
-information in repository artifacts.
+Never include production secrets, private keys, or credentials in any artifact
+attached to an issue or pull request.
