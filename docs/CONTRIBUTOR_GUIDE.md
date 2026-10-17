@@ -113,6 +113,58 @@ If a full check cannot run locally because a dependency, Docker service, or
 platform tool is unavailable, document the failed command and the exact blocker
 in the pull request body.
 
+## Message Retention And Expiry
+
+Private messages have an explicit, enforceable lifecycle. Retention is chosen
+per conversation and enforced by the backend at the ownership boundary; clients
+must not assume messages live forever or that local copies outlive the server.
+
+### Supported Retention Choices And Defaults
+
+- `7d`, `30d`, `90d`, `1y`, and `forever` are the supported retention choices.
+- The default is `30d` when a conversation does not specify one.
+- Retention is set by an authorized participant (owner or moderator) and is
+  validated against the supported set; unknown values are rejected with `422`.
+- Changing retention applies to messages going forward and re-evaluates
+  existing messages against the new window.
+
+### Expiry Enforcement
+
+- Expiry is enforced in primary storage: expired messages are excluded from
+  reads and purged by the retention job.
+- Secondary indexes (search, previews, unread) are updated in the same
+  operation so expired content is never surfaced.
+- Notifications and device sync fanout skip expired messages; clients receive
+  an expiry event and drop the local copy.
+- Reads of an expired message return `410 Gone` rather than `404`, so clients
+  can distinguish expiry from a missing message.
+
+### Deletion Completion Records
+
+- When a message is purged, the backend records a deletion completion marker
+  (message id, conversation id, timestamp, reason) **without** the message body.
+- These markers support audit and idempotent retries and must never contain
+  message content.
+
+### Authorization And Failure Semantics
+
+- Only authorized participants may read, change retention for, or delete
+  messages; unauthorized requests are rejected with `403` at the owning
+  boundary.
+- Purge failures are retried and surfaced; a message is never reported as
+  deleted until the deletion completion marker is written.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path plus rejection cases
+(unauthorized retention change, unsupported retention value, expired read) and
+the regression risk of expired content leaking through indexes, notifications,
+or device sync. Run them with:
+
+```bash
+npm run backend:test && npm run frontend:test
+```
+
 ## Conversation Ordering And Unread Reconciliation
 
 Conversation previews and unread counts are owned by the backend. Clients must
@@ -233,97 +285,3 @@ commands, so a clean checkout can run it without extra setup:
 npm run frontend:lint        # static a11y lint rules
 npm run frontend:test        # component-level a11y assertions
 npm run frontend:test:e2e    # browser-level a11y checks
-```
-
-### Fixtures
-
-Shared fixtures live under `xconfess-frontend/tests/a11y/fixtures/`. They cover
-the routes and states the harness exercises (for example the confession feed,
-comment thread, and profile pages). Add a fixture when you introduce a new route
-or a new interactive state that needs coverage; keep fixtures minimal and free
-of real user data.
-
-### Browser Setup
-
-End-to-end accessibility checks run in a real browser via Playwright. Install
-the browser binaries once per machine:
-
-```bash
-npx playwright install --with-deps chromium
-```
-
-Then run the harness through the standard command:
-
-```bash
-npm run frontend:test:e2e
-```
-
-If the browser cannot be installed in your environment, run the lint and unit
-layers (`npm run frontend:lint && npm run frontend:test`) and note the blocker in
-your pull request.
-
-### Reading Harness Output
-
-Every failure names the route under test and the specific rule that was
-violated, for example:
-
-```
-/a11y/feed  color-contrast  expected 4.5:1, got 3.1:1
-/a11y/profile  label  form control has no accessible name
-```
-
-Use the route to reproduce the page and the rule to look up the requirement
-before changing markup.
-
-### Known Limitations
-
-- Automated checks cover a subset of WCAG rules and cannot judge meaning,
-  reading order, or content quality.
-- Dynamic states (modals, toasts, async loading) are only covered where a
-  fixture exists.
-- Screen reader behavior and keyboard-only flows are not fully simulated.
-
-### When Manual Testing Is Required
-
-Run manual testing in addition to the harness when a change affects:
-
-- Keyboard navigation, focus order, or focus trapping.
-- Screen reader announcements, live regions, or dynamic content updates.
-- Color, contrast, or motion where the automated rule set is incomplete.
-- Any new interactive component without an existing fixture.
-
-### Failure Triage
-
-1. Reproduce the failing route locally with `npm run dev:frontend`.
-2. Confirm the rule in the harness output against the WCAG requirement.
-3. Fix the markup or styles at the source rather than suppressing the rule.
-4. If a rule is a false positive, document why in the pull request and add a
-   scoped, commented exception instead of disabling the check globally.
-
-## Database Migrations
-
-xConfess uses TypeORM migrations to manage the Postgres schema. There are two
-migration directories:
-
-- `xconfess-backend/migrations/` — historical and feature migrations.
-- `xconfess-backend/src/migrations/` — newer in-source migrations.
-
-Both directories are loaded by the TypeORM CLI and the app at startup.
-
-### Show pending migrations
-
-```bash
-npm run backend:migration:show
-```
-
-This prints the list of all migrations and which ones have already run in the
-connected database. Check that it completes without TypeORM class-name errors
-before opening a migration-related PR.
-
-### Run pending migrations (clean database)
-
-For a fresh Postgres database — for example, a new Docker container — run all
-pending migrations in order:
-
-```bash
-npm run
