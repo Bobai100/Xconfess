@@ -11,6 +11,10 @@ import { encodeContractArgs, ContractArg } from './utils/parameter.encoder';
 import { redactSecretStrings } from '../utils/redact-secrets';
 import { InvokeContractDto } from './dto/invoke-contract.dto';
 import { getStellarInvocationPolicy } from './stellar-invocation-policy';
+import {
+  TransactionLatencyBudgetService,
+  TransactionPhase,
+} from './transaction-latency-budget.service';
 
 /**
  * A single step in a multi-contract workflow.
@@ -109,6 +113,7 @@ export class ContractService {
   constructor(
     private stellarConfig: StellarConfigService,
     private txBuilder: TransactionBuilderService,
+    private latencyBudget: TransactionLatencyBudgetService,
   ) {}
 
   /**
@@ -152,6 +157,12 @@ export class ContractService {
     invocation: IContractInvocation,
     signerSecret: string,
   ): Promise<ITransactionResult> {
+    const operationClass = this.latencyBudget.classifyOperation(
+      invocation.functionName,
+    );
+    const network = this.latencyBudget.currentNetwork();
+    const startedAt = Date.now();
+
     try {
       const contract = new StellarSDK.Contract(invocation.contractId);
 
@@ -182,6 +193,17 @@ export class ContractService {
       } finally {
         if (timeoutId) clearTimeout(timeoutId);
       }
+
+      // Submission + inclusion + confirmation are completed by the builder's
+      // submit path; record the end-to-end latency against the budget.
+      this.latencyBudget.recordLatency({
+        network,
+        operationClass,
+        phase: TransactionPhase.CONFIRMATION,
+        durationMs: Date.now() - startedAt,
+        success: result.success,
+      });
+
       const decodedResult = this.decodeContractResult(result);
 
       return {
@@ -190,6 +212,13 @@ export class ContractService {
         result: decodedResult,
       };
     } catch (error: unknown) {
+      this.latencyBudget.recordLatency({
+        network,
+        operationClass,
+        phase: TransactionPhase.SUBMISSION,
+        durationMs: Date.now() - startedAt,
+        success: false,
+      });
       // Redacted defensively: this can be the signing path's error, which is
       // derived from the server secret key and must never log it verbatim.
       const message = redactSecretStrings(
@@ -235,8 +264,13 @@ export class ContractService {
     const maxRetries = rpcConfig.rpcMaxRetries;
     const baseDelay = rpcConfig.rpcRetryBaseDelayMs;
     const maxDelay = rpcConfig.rpcRetryMaxDelayMs;
+    const network = this.latencyBudget.currentNetwork();
+    const operationClass = this.latencyBudget.classifyOperation(
+      'verify_confession',
+    );
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const startedAt = Date.now();
       try {
         const contractId = this.stellarConfig.getContractId('confessionAnchor');
         const contract = new StellarSDK.Contract(contractId);
@@ -246,9 +280,24 @@ export class ContractService {
           StellarSDK.nativeToScVal(confessionHash, { type: 'bytes' }),
         );
 
+        this.latencyBudget.recordLatency({
+          network,
+          operationClass,
+          phase: TransactionPhase.CONFIRMATION,
+          durationMs: Date.now() - startedAt,
+          success: true,
+        });
+
         const timestamp = StellarSDK.scValToNative(result as any);
         return timestamp || null;
       } catch (error: unknown) {
+        this.latencyBudget.recordLatency({
+          network,
+          operationClass,
+          phase: TransactionPhase.SUBMISSION,
+          durationMs: Date.now() - startedAt,
+          success: false,
+        });
         const message = error instanceof Error ? error.message : String(error);
         const isRetryable =
           message.toLowerCase().includes('timeout') ||

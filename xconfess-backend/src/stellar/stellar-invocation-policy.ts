@@ -7,26 +7,41 @@ export type StellarInvocationContractName =
   | 'reputationBadges'
   | 'tippingSystem';
 
-export type StellarInvocationSagaPhase = 'forward' | 'compensation';
+/**
+ * User-facing intent that maps to exactly one contract operation. The intent is
+ * what the wallet UI displays to the user; the operation is what actually gets
+ * signed. Keeping the mapping explicit prevents a displayed intent from
+ * silently authorizing a different contract call.
+ */
+export type StellarInvocationIntent =
+  | 'anchor_confession'
+  | 'anchor_confession_batch';
+
+/**
+ * Authorization footprint required by a single contract invocation. Every
+ * entry describes one authorization requirement the signed invocation is
+ * expected to carry. Any requirement not listed here is "unexpected" and must
+ * be rejected before signing.
+ */
+export interface StellarInvocationAuthRequirement {
+  /** Address whose authorization is required (e.g. the invoking account). */
+  addressRole: 'invoker';
+  /** Contract the authorization is granted to. */
+  contractName: StellarInvocationContractName;
+  /** Function on the contract the authorization covers. */
+  functionName: string;
+}
 
 interface StellarInvocationPolicyDefinition {
   allowlistClass: StellarInvocationAllowlistClass;
   contractName: StellarInvocationContractName;
   functionName: string;
+  /** Human-readable intent shown to the user before signing. */
+  intent: StellarInvocationIntent;
   allowedScopes: readonly string[];
   issuedAdminScopes: readonly string[];
-  /**
-   * Saga phase this operation belongs to. Forward steps perform the primary
-   * work; compensation steps reconcile or roll back a partially completed
-   * multi-contract workflow. Defaults to 'forward' when omitted.
-   */
-  sagaPhase?: StellarInvocationSagaPhase;
-  /**
-   * For compensation operations, the forward operation this step compensates.
-   * Used to validate that a saga definition pairs every forward step with an
-   * authorized compensating action.
-   */
-  compensatesOperation?: StellarInvocationOperation;
+  /** Exact authorization footprint the signed invocation must carry. */
+  requiredAuth: readonly StellarInvocationAuthRequirement[];
 }
 
 const STELLAR_INVOCATION_POLICY_DEFINITIONS = {
@@ -34,6 +49,7 @@ const STELLAR_INVOCATION_POLICY_DEFINITIONS = {
     allowlistClass: 'anchoring',
     contractName: 'confessionAnchor',
     functionName: 'anchor_confession',
+    intent: 'anchor_confession',
     allowedScopes: [
       STELLAR_INVOKE_SCOPE_WILDCARD,
       'stellar:invoke-contract:anchoring',
@@ -44,90 +60,36 @@ const STELLAR_INVOCATION_POLICY_DEFINITIONS = {
       'stellar:invoke-contract:anchoring',
       'stellar:invoke-contract:anchor_confession',
     ],
-    sagaPhase: 'forward',
+    requiredAuth: [
+      {
+        addressRole: 'invoker',
+        contractName: 'confessionAnchor',
+        functionName: 'anchor_confession',
+      },
+    ],
   },
-  anchor_confession_compensation: {
-    allowlistClass: 'saga',
+  anchor_confession_batch: {
+    allowlistClass: 'anchoring',
     contractName: 'confessionAnchor',
-    functionName: 'anchor_confession_compensation',
+    functionName: 'anchor_confession_batch',
+    intent: 'anchor_confession_batch',
     allowedScopes: [
       STELLAR_INVOKE_SCOPE_WILDCARD,
-      'stellar:invoke-contract:saga',
-      'stellar:invoke-contract:anchor_confession_compensation',
+      'stellar:invoke-contract:anchoring',
+      'stellar:invoke-contract:anchor_confession_batch',
       STELLAR_INVOKE_SCOPE_LEGACY,
     ],
     issuedAdminScopes: [
-      'stellar:invoke-contract:saga',
-      'stellar:invoke-contract:anchor_confession_compensation',
+      'stellar:invoke-contract:anchoring',
+      'stellar:invoke-contract:anchor_confession_batch',
     ],
-    sagaPhase: 'compensation',
-    compensatesOperation: 'anchor_confession',
-  },
-  award_reputation_badge: {
-    allowlistClass: 'saga',
-    contractName: 'reputationBadges',
-    functionName: 'award_reputation_badge',
-    allowedScopes: [
-      STELLAR_INVOKE_SCOPE_WILDCARD,
-      'stellar:invoke-contract:saga',
-      'stellar:invoke-contract:award_reputation_badge',
-      STELLAR_INVOKE_SCOPE_LEGACY,
+    requiredAuth: [
+      {
+        addressRole: 'invoker',
+        contractName: 'confessionAnchor',
+        functionName: 'anchor_confession_batch',
+      },
     ],
-    issuedAdminScopes: [
-      'stellar:invoke-contract:saga',
-      'stellar:invoke-contract:award_reputation_badge',
-    ],
-    sagaPhase: 'forward',
-  },
-  revoke_reputation_badge: {
-    allowlistClass: 'saga',
-    contractName: 'reputationBadges',
-    functionName: 'revoke_reputation_badge',
-    allowedScopes: [
-      STELLAR_INVOKE_SCOPE_WILDCARD,
-      'stellar:invoke-contract:saga',
-      'stellar:invoke-contract:revoke_reputation_badge',
-      STELLAR_INVOKE_SCOPE_LEGACY,
-    ],
-    issuedAdminScopes: [
-      'stellar:invoke-contract:saga',
-      'stellar:invoke-contract:revoke_reputation_badge',
-    ],
-    sagaPhase: 'compensation',
-    compensatesOperation: 'award_reputation_badge',
-  },
-  record_tip: {
-    allowlistClass: 'saga',
-    contractName: 'tippingSystem',
-    functionName: 'record_tip',
-    allowedScopes: [
-      STELLAR_INVOKE_SCOPE_WILDCARD,
-      'stellar:invoke-contract:saga',
-      'stellar:invoke-contract:record_tip',
-      STELLAR_INVOKE_SCOPE_LEGACY,
-    ],
-    issuedAdminScopes: [
-      'stellar:invoke-contract:saga',
-      'stellar:invoke-contract:record_tip',
-    ],
-    sagaPhase: 'forward',
-  },
-  reverse_tip: {
-    allowlistClass: 'saga',
-    contractName: 'tippingSystem',
-    functionName: 'reverse_tip',
-    allowedScopes: [
-      STELLAR_INVOKE_SCOPE_WILDCARD,
-      'stellar:invoke-contract:saga',
-      'stellar:invoke-contract:reverse_tip',
-      STELLAR_INVOKE_SCOPE_LEGACY,
-    ],
-    issuedAdminScopes: [
-      'stellar:invoke-contract:saga',
-      'stellar:invoke-contract:reverse_tip',
-    ],
-    sagaPhase: 'compensation',
-    compensatesOperation: 'record_tip',
   },
 } as const satisfies Record<string, StellarInvocationPolicyDefinition>;
 
@@ -263,19 +225,120 @@ export function getDefaultAdminStellarInvocationScopes(): string[] {
   return [...scopes];
 }
 
-export function getDefaultAdminStellarInvocationScopesForPhase(
-  phase: StellarInvocationSagaPhase,
-): string[] {
-  const scopes = new Set<string>();
-
-  for (const definition of Object.values(
-    STELLAR_INVOCATION_POLICY_DEFINITIONS,
-  )) {
-    if ((definition.sagaPhase ?? 'forward') !== phase) {
-      continue;
-    }
-    definition.issuedAdminScopes.forEach((scope) => scopes.add(scope));
+/**
+ * Resolve the operation that a user intent maps to. Returns null when the
+ * intent is unknown so callers can fail closed instead of guessing.
+ */
+export function getStellarInvocationOperationForIntent(
+  intent: string | undefined | null,
+): StellarInvocationOperation | null {
+  if (!intent) {
+    return null;
   }
 
-  return [...scopes];
+  for (const [operation, definition] of Object.entries(
+    STELLAR_INVOCATION_POLICY_DEFINITIONS,
+  )) {
+    if (definition.intent === intent) {
+      return operation as StellarInvocationOperation;
+    }
+  }
+
+  return null;
+}
+
+export type StellarInvocationAuthRejectionReason =
+  | 'unknown_operation'
+  | 'unexpected_requirement'
+  | 'missing_requirement'
+  | 'mismatched_requirement';
+
+export interface StellarInvocationAuthValidationResult {
+  ok: boolean;
+  reason?: StellarInvocationAuthRejectionReason;
+  /** Human-readable detail for logs and error responses. */
+  message?: string;
+}
+
+function authRequirementKey(
+  requirement: StellarInvocationAuthRequirement,
+): string {
+  return [
+    requirement.addressRole,
+    requirement.contractName,
+    requirement.functionName,
+  ].join(':');
+}
+
+/**
+ * Validate that the authorization footprint of a signed invocation exactly
+ * matches the footprint declared for the operation. Extra (unexpected)
+ * requirements, missing requirements, or requirements pointing at a different
+ * contract/function are all rejected.
+ */
+export function validateStellarInvocationAuth(
+  operation: string | undefined | null,
+  requirements: readonly StellarInvocationAuthRequirement[] | undefined,
+): StellarInvocationAuthValidationResult {
+  const policy = getStellarInvocationPolicy(operation);
+  if (!policy) {
+    return {
+      ok: false,
+      reason: 'unknown_operation',
+      message: `Unknown Stellar invocation operation: ${String(operation)}`,
+    };
+  }
+
+  const actual = Array.isArray(requirements) ? requirements : [];
+  const expectedKeys = new Set(policy.requiredAuth.map(authRequirementKey));
+  const actualKeys = new Set(actual.map(authRequirementKey));
+
+  for (const requirement of actual) {
+    const key = authRequirementKey(requirement);
+    if (!expectedKeys.has(key)) {
+      const sameContract = policy.requiredAuth.some(
+        (expected) =>
+          expected.addressRole === requirement.addressRole &&
+          expected.contractName === requirement.contractName,
+      );
+      return {
+        ok: false,
+        reason: sameContract ? 'mismatched_requirement' : 'unexpected_requirement',
+        message: `Unexpected authorization requirement for ${policy.operation}: ${key}`,
+      };
+    }
+  }
+
+  for (const expected of policy.requiredAuth) {
+    if (!actualKeys.has(authRequirementKey(expected))) {
+      return {
+        ok: false,
+        reason: 'missing_requirement',
+        message: `Missing authorization requirement for ${policy.operation}: ${authRequirementKey(
+          expected,
+        )}`,
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Assert that the intent displayed to the user resolves to the operation that
+ * is about to be signed. Throws when they diverge so a mismatched intent can
+ * never be signed.
+ */
+export function assertStellarInvocationIntentMatchesOperation(
+  intent: string | undefined | null,
+  operation: string | undefined | null,
+): void {
+  const resolved = getStellarInvocationOperationForIntent(intent);
+  if (!resolved || resolved !== operation) {
+    throw new Error(
+      `Stellar invocation intent "${String(
+        intent,
+      )}" does not match operation "${String(operation)}"`,
+    );
+  }
 }

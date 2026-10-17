@@ -94,6 +94,42 @@ services:
         sync: false
       - key: MAIL_FROM
         value: noreply@xconfess.com
+      # Transaction latency and failure budgets (#277). Bounded, network-specific
+      # thresholds in milliseconds; see docs/operations/transaction-budgets.md.
+      - key: TX_BUDGETS_ENABLED
+        value: true
+      - key: TX_BUDGET_SUBMISSION_MS
+        value: 5000
+      - key: TX_BUDGET_INCLUSION_MS
+        value: 30000
+      - key: TX_BUDGET_CONFIRMATION_MS
+        value: 60000
+      - key: TX_BUDGET_FAILURE_RATE
+        value: 0.05
+      # Deployment configuration drift detection (#284). Non-secret contract
+      # values are compared against Vercel; see docs/operations/config-drift.md.
+      - key: CONFIG_DRIFT_CHECK_ENABLED
+        value: true
+      - key: CONFIG_DRIFT_EXPECTED_FRONTEND_URL
+        value: https://xconfess.vercel.app
+      - key: CONFIG_DRIFT_EXPECTED_BACKEND_URL
+        value: https://xconfess-backend.onrender.com
+      - key: CONFIG_DRIFT_EXPECTED_STELLAR_NETWORK
+        value: testnet
+      - key: CONFIG_DRIFT_EXPECTED_COOKIE_SECURE
+        value: true
+      - key: CONFIG_DRIFT_EXPECTED_COOKIE_SAME_SITE
+        value: none
+      # Regional synthetic checks for privacy-critical flows (#285). Synthetic
+      # journeys never use real user data; see docs/operations/synthetic-checks.md.
+      - key: SYNTHETIC_CHECKS_ENABLED
+        value: true
+      - key: SYNTHETIC_CHECKS_REGIONS
+        value: us-east,eu-west,ap-southeast
+      - key: SYNTHETIC_CHECKS_INTERVAL_MS
+        value: 300000
+      - key: SYNTHETIC_CHECKS_TIMEOUT_MS
+        value: 10000
 
   - type: keyvalue
     name: xconfess-keyvalue

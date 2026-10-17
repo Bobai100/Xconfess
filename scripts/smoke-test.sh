@@ -11,10 +11,21 @@
 #   FRONTEND_URL  (default: http://localhost:3000)
 #   SEED_EMAIL    (default: seed_alice@example.com)
 #   SEED_PASSWORD (default: password123)
+#   SYNTHETIC_REGIONS (default: "" — comma-separated region labels, e.g. "us-east,eu-west")
+#   SYNTHETIC_BASE_URL (default: $BACKEND_URL — regional edge base URL template;
+#                       use {region} placeholder, e.g. "https://{region}.edge.example.com")
+#   SYNTHETIC_TIMEOUT_MS (default: 5000)
+#
+# Regional synthetic checks:
+#   When SYNTHETIC_REGIONS is set, low-volume synthetic journeys are replayed
+#   against each region's edge endpoint. Only synthetic data is used (no real
+#   user data), and per-step availability is reported with bounded labels
+#   (region + step name only — never request bodies, tokens, or user ids).
 #
 # Exit codes:
 #   0 — all critical flows passed
 #   1 — one or more critical flows failed
+=======
 
 set -euo pipefail
 
@@ -24,6 +35,14 @@ FRONTEND_URL="${FRONTEND_URL:-http://localhost:3000}"
 SEED_EMAIL="${SEED_EMAIL:-seed_alice@example.com}"
 SEED_PASSWORD="${SEED_PASSWORD:-password123}"
 VERBOSE="${1:-}"
+
+# Regional synthetic check configuration (opt-in; empty regions disables).
+SYNTHETIC_REGIONS="${SYNTHETIC_REGIONS:-}"
+SYNTHETIC_BASE_URL="${SYNTHETIC_BASE_URL:-${BACKEND_URL}}"
+SYNTHETIC_TIMEOUT_MS="${SYNTHETIC_TIMEOUT_MS:-5000}"
+SYNTHETIC_RESULTS_FILE="smoke-test-synthetic-regions.txt"
+# Bounded label allowlist: only these step names may appear in reports.
+SYNTHETIC_STEPS=("health_live" "health_ready" "feed_list")
 
 RESULTS_FILE="smoke-test-results.txt"
 REQUESTS_LOG="smoke-test-requests.log"
@@ -125,12 +144,76 @@ do_request() {
   fi
 }
 
+# ── Regional synthetic checks ─────────────────────────────────────────────────
+# Normalize a region label to a bounded, safe token (lowercase alnum + dash).
+sanitize_region_label() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//' | cut -c1-32
+}
+
+# Build the regional base URL for a region, substituting the {region} placeholder.
+synthetic_region_url() {
+  local region="$1"
+  echo "${SYNTHETIC_BASE_URL//\{region\}/$region}"
+}
+
+# Run one synthetic step against a regional endpoint.
+# Args: REGION STEP ENDPOINT EXPECTED_CODES
+# Emits a bounded label line: "<region> <step> <status> <http_code>"
+run_synthetic_step() {
+  local region="$1" step="$2" endpoint="$3" expected_codes="$4"
+  local base_url code status
+  base_url=$(synthetic_region_url "$region")
+
+  code=$(curl -s -o /dev/null -m "$(( SYNTHETIC_TIMEOUT_MS / 1000 ))" \
+    -w "%{http_code}" "${base_url}${endpoint}" 2>/dev/null) || code="000"
+
+  if echo "$expected_codes" | grep -qw "$code"; then
+    status="up"
+  else
+    status="down"
+  fi
+
+  # Bounded label only: region + step + status + code. No payloads or ids.
+  echo "${region} ${step} ${status} ${code}" >> "$SYNTHETIC_RESULTS_FILE"
+  echo -e "  [synthetic] region=${region} step=${step} status=${status} http=${code}"
+}
+
+# Replay the synthetic journey across all configured regions.
+run_regional_synthetic_checks() {
+  log_section "9 · Regional Synthetic Checks"
+
+  if [ -z "$SYNTHETIC_REGIONS" ]; then
+    echo "  (skipped — SYNTHETIC_REGIONS not set)"
+    return 0
+  fi
+
+  {
+    echo "# xConfess Regional Synthetic Checks (bounded labels only)"
+    echo "# Generated: $(date)"
+    echo "# region step status http_code"
+  } > "$SYNTHETIC_RESULTS_FILE"
+
+  local region
+  IFS=',' read -ra _regions <<< "$SYNTHETIC_REGIONS"
+  for region in "${_regions[@]}"; do
+    region=$(sanitize_region_label "$region")
+    [ -z "$region" ] && continue
+
+    # Synthetic journey: liveness, readiness, and a read-only feed fetch.
+    # These use no real user data and require no authentication.
+    run_synthetic_step "$region" "health_live"  "/health/live"  "200"
+    run_synthetic_step "$region" "health_ready" "/health/ready" "200 503"
+    run_synthetic_step "$region" "feed_list"    "/confessions?page=1&limit=1" "200"
+  done
+}
+
 # ── Init logs ─────────────────────────────────────────────────────────────────
 {
   echo "xConfess Smoke Test Results"
   echo "Generated: $(date)"
   echo "Backend:  $BACKEND_URL"
   echo "Frontend: $FRONTEND_URL"
+  echo "Synthetic regions: ${SYNTHETIC_REGIONS:-<disabled>}"
   echo "========================================"
 } > "$RESULTS_FILE"
 
@@ -283,6 +366,9 @@ else
   log_fail "Frontend homepage (HTTP $FE_CODE)" "/"
 fi
 
+# ── SECTION 9: Regional synthetic checks ──────────────────────────────────────
+run_regional_synthetic_checks
+
 # ── Results ───────────────────────────────────────────────────────────────────
 log_section "Results"
 
@@ -307,6 +393,7 @@ echo "Pass rate:    ${PASS_RATE}%"
 echo ""
 echo "Results: $RESULTS_FILE"
 echo "Requests log (tokens redacted): $REQUESTS_LOG"
+[ -n "$SYNTHETIC_REGIONS" ] && echo "Regional synthetic results: $SYNTHETIC_RESULTS_FILE"
 
 rm -f /tmp/smoke_cookies.txt
 

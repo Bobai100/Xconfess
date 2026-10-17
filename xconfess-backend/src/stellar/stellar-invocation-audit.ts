@@ -24,6 +24,14 @@ interface StellarAuditRequest {
   requestId?: string;
 }
 
+export interface StellarAuthorizationScopeReview {
+  intent?: string | null;
+  expectedOperation?: string | null;
+  actualOperation?: string | null;
+  authorizationFootprintMatches?: boolean | null;
+  unexpectedAuthorizationRequirements?: readonly string[] | null;
+}
+
 interface BuildStellarInvocationAuditMetadataOptions {
   operation?: string | null;
   allowlistClass?: string | null;
@@ -38,11 +46,7 @@ interface BuildStellarInvocationAuditMetadataOptions {
   expectedSourceAccount?: string | null;
   authorizedScope?: string | null;
   requiredScopes?: readonly string[] | null;
-  sagaId?: string | null;
-  stepIndex?: number | null;
-  totalSteps?: number | null;
-  compensatingAction?: StellarCompensatingAction | null;
-  partialState?: Record<string, unknown> | null;
+  scopeReview?: StellarAuthorizationScopeReview | null;
 }
 
 function createAdminActor(user?: RequestUser): AuditActor | undefined {
@@ -128,29 +132,39 @@ export function buildStellarInvocationAuditMetadata(
     metadata.requiredScopes = [...options.requiredScopes];
   }
 
-  if (options.sagaId) {
-    metadata.sagaId = options.sagaId;
-  }
+  if (options.scopeReview) {
+    const review = options.scopeReview;
+    const scopeReviewMetadata: Record<string, unknown> = {};
 
-  if (typeof options.stepIndex === 'number') {
-    metadata.stepIndex = options.stepIndex;
-  }
+    if (review.intent) {
+      scopeReviewMetadata.intent = review.intent;
+    }
 
-  if (typeof options.totalSteps === 'number') {
-    metadata.totalSteps = options.totalSteps;
-  }
+    if (review.expectedOperation) {
+      scopeReviewMetadata.expectedOperation = review.expectedOperation;
+    }
 
-  if (options.compensatingAction) {
-    metadata.compensatingAction = options.compensatingAction;
-  }
+    if (review.actualOperation) {
+      scopeReviewMetadata.actualOperation = review.actualOperation;
+    }
 
-  if (options.partialState) {
-    metadata.partialState = options.partialState;
-  }
+    if (typeof review.authorizationFootprintMatches === 'boolean') {
+      scopeReviewMetadata.authorizationFootprintMatches =
+        review.authorizationFootprintMatches;
+    }
 
-  if (options.outcome === 'partial') {
-    metadata.partialStateOutcome = true;
-    metadata.reconcilable = true;
+    if (
+      review.unexpectedAuthorizationRequirements &&
+      review.unexpectedAuthorizationRequirements.length > 0
+    ) {
+      scopeReviewMetadata.unexpectedAuthorizationRequirements = [
+        ...review.unexpectedAuthorizationRequirements,
+      ];
+    }
+
+    if (Object.keys(scopeReviewMetadata).length > 0) {
+      metadata.scopeReview = scopeReviewMetadata;
+    }
   }
 
   return metadata;
