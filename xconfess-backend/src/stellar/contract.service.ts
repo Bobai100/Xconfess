@@ -16,9 +16,99 @@ import {
   TransactionPhase,
 } from './transaction-latency-budget.service';
 
+/**
+ * A single step in a multi-contract workflow.
+ *
+ * Each step is an external call. `compensate` (optional) is the compensating
+ * action that must be invoked if a *later* step fails. If no compensating
+ * action is registered the audit record is marked for reconciliation instead.
+ */
+export interface IMultiContractStep {
+  /** Stable, human-readable name used in audit records and logs. */
+  name: string;
+  /** The low-level invocation to perform. */
+  invocation: IContractInvocation;
+  /** Signer secret used to sign this step's transaction. */
+  signerSecret: string;
+  /**
+   * Compensating action for this step. Invoked (in reverse order) when a later
+   * step fails. Must be idempotent — recovery may retry it.
+   */
+  compensate?: (context: IMultiContractContext) => Promise<void>;
+}
+
+export interface IMultiContractContext {
+  /** Identifier of the workflow run, shared by all audit records. */
+  workflowId: string;
+  /** The step that triggered recovery (the failing step). */
+  failedStep: string;
+  /** The step being compensated. */
+  step: string;
+  /** Result of the step being compensated, if it succeeded. */
+  result?: ITransactionResult;
+}
+
+export type MultiContractStepStatus =
+  | 'pending'
+  | 'succeeded'
+  | 'failed'
+  | 'compensated'
+  | 'compensation_failed'
+  | 'needs_reconciliation';
+
+export interface IMultiContractAuditRecord {
+  workflowId: string;
+  step: string;
+  status: MultiContractStepStatus;
+  /** Transaction hash, when the external call produced one. */
+  hash?: string;
+  /** Redacted error message for failed steps / compensations. */
+  error?: string;
+  /** Number of compensation attempts made for this step. */
+  compensationAttempts: number;
+  updatedAt: string;
+}
+
+export interface IMultiContractResult {
+  workflowId: string;
+  success: boolean;
+  /** Per-step audit records, in execution order. */
+  records: IMultiContractAuditRecord[];
+  /** Records that require manual reconciliation (no compensation available). */
+  needsReconciliation: IMultiContractAuditRecord[];
+  /** The error that aborted the workflow, if any (redacted). */
+  error?: string;
+}
+
+/**
+ * Bounded recovery configuration for multi-contract workflows.
+ * Read from the Stellar config so operators can tune rollout behaviour.
+ */
+export interface IMultiContractRecoveryOptions {
+  /** Maximum compensation attempts per step. Defaults to 3. */
+  maxCompensationAttempts?: number;
+  /** Base delay (ms) between compensation retries. Defaults to 100. */
+  compensationRetryBaseDelayMs?: number;
+  /** Maximum delay (ms) between compensation retries. Defaults to 2000. */
+  compensationRetryMaxDelayMs?: number;
+}
+
+const DEFAULT_RECOVERY_OPTIONS: Required<IMultiContractRecoveryOptions> = {
+  maxCompensationAttempts: 3,
+  compensationRetryBaseDelayMs: 100,
+  compensationRetryMaxDelayMs: 2000,
+};
+
 @Injectable()
 export class ContractService {
   private readonly logger = new Logger(ContractService.name);
+
+  /**
+   * In-memory audit trail of multi-contract workflow runs. Bounded to avoid
+   * unbounded growth; oldest entries are evicted first.
+   */
+  private readonly auditTrail = new Map<string, IMultiContractAuditRecord[]>();
+  private static readonly MAX_AUDIT_WORKFLOWS = 1000;
 
   constructor(
     private stellarConfig: StellarConfigService,
@@ -231,6 +321,202 @@ export class ContractService {
     }
 
     return null;
+  }
+
+  /**
+   * Execute a multi-contract workflow with bounded recovery.
+   *
+   * Semantics:
+   * - Steps run sequentially. Every external call is recorded in the audit
+   *   trail *before* it is attempted (status `pending`) and updated after.
+   * - On failure, previously succeeded steps are compensated in reverse order.
+   *   A step without a registered `compensate` action is marked
+   *   `needs_reconciliation` so operators can reconcile backend state.
+   * - Compensation is bounded: at most `maxCompensationAttempts` attempts per
+   *   step with exponential backoff. Exhausted compensations are marked
+   *   `compensation_failed` and surfaced in `needsReconciliation`.
+   * - The workflow never throws for step failures; callers inspect the result.
+   *   Authorization errors (e.g. missing signer) still propagate as thrown
+   *   errors because no external call has been made yet.
+   */
+  async invokeMultiContract(
+    steps: IMultiContractStep[],
+    options: IMultiContractRecoveryOptions = {},
+  ): Promise<IMultiContractResult> {
+    if (!Array.isArray(steps) || steps.length === 0) {
+      throw new Error('invokeMultiContract requires at least one step');
+    }
+    for (const step of steps) {
+      if (!step.name || !step.invocation || !step.signerSecret) {
+        throw new Error(
+          'invokeMultiContract step requires name, invocation and signerSecret',
+        );
+      }
+    }
+
+    const workflowId = this.generateWorkflowId();
+    const records: IMultiContractAuditRecord[] = steps.map((step) => ({
+      workflowId,
+      step: step.name,
+      status: 'pending' as MultiContractStepStatus,
+      compensationAttempts: 0,
+      updatedAt: new Date().toISOString(),
+    }));
+    this.storeAudit(workflowId, records);
+
+    const succeeded: Array<{ index: number; result: ITransactionResult }> = [];
+    let failure: { index: number; error: unknown } | undefined;
+
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      try {
+        const result = await this.invokeContract(
+          step.invocation,
+          step.signerSecret,
+        );
+        records[i].status = 'succeeded';
+        records[i].hash = result.hash;
+        records[i].updatedAt = new Date().toISOString();
+        succeeded.push({ index: i, result });
+      } catch (error: unknown) {
+        records[i].status = 'failed';
+        records[i].error = redactSecretStrings(
+          error instanceof Error ? error.message : String(error),
+        );
+        records[i].updatedAt = new Date().toISOString();
+        failure = { index: i, error };
+        break;
+      }
+    }
+
+    if (!failure) {
+      return {
+        workflowId,
+        success: true,
+        records,
+        needsReconciliation: [],
+      };
+    }
+
+    const failedStep = steps[failure.index].name;
+    const recovery = { ...DEFAULT_RECOVERY_OPTIONS, ...options };
+    const needsReconciliation: IMultiContractAuditRecord[] = [];
+
+    // Compensate in reverse order of success.
+    for (let s = succeeded.length - 1; s >= 0; s--) {
+      const { index, result } = succeeded[s];
+      const step = steps[index];
+      const record = records[index];
+
+      if (!step.compensate) {
+        record.status = 'needs_reconciliation';
+        record.updatedAt = new Date().toISOString();
+        needsReconciliation.push(record);
+        this.logger.warn(
+          `Workflow ${workflowId}: step "${step.name}" has no compensation; marked for reconciliation`,
+        );
+        continue;
+      }
+
+      const context: IMultiContractContext = {
+        workflowId,
+        failedStep,
+        step: step.name,
+        result,
+      };
+
+      const compensated = await this.runCompensation(
+        step,
+        record,
+        context,
+        recovery,
+      );
+      if (!compensated) {
+        needsReconciliation.push(record);
+      }
+    }
+
+    return {
+      workflowId,
+      success: false,
+      records,
+      needsReconciliation,
+      error: redactSecretStrings(
+        failure.error instanceof Error
+          ? failure.error.message
+          : String(failure.error),
+      ),
+    };
+  }
+
+  /**
+   * Retrieve the audit trail for a workflow run (for reconciliation tooling).
+   */
+  getMultiContractAudit(workflowId: string): IMultiContractAuditRecord[] {
+    const records = this.auditTrail.get(workflowId);
+    return records ? records.map((r) => ({ ...r })) : [];
+  }
+
+  /**
+   * Run a single step's compensation with bounded retries and backoff.
+   * Returns true when compensation succeeded, false when it was exhausted.
+   */
+  private async runCompensation(
+    step: IMultiContractStep,
+    record: IMultiContractAuditRecord,
+    context: IMultiContractContext,
+    recovery: Required<IMultiContractRecoveryOptions>,
+  ): Promise<boolean> {
+    const maxAttempts = Math.max(1, recovery.maxCompensationAttempts);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      record.compensationAttempts = attempt;
+      try {
+        await step.compensate!(context);
+        record.status = 'compensated';
+        record.updatedAt = new Date().toISOString();
+        return true;
+      } catch (error: unknown) {
+        const message = redactSecretStrings(
+          error instanceof Error ? error.message : String(error),
+        );
+        record.error = message;
+        record.updatedAt = new Date().toISOString();
+        this.logger.warn(
+          `Workflow ${context.workflowId}: compensation for "${step.name}" failed (attempt ${attempt}/${maxAttempts}): ${message}`,
+        );
+        if (attempt < maxAttempts) {
+          const delay = Math.min(
+            recovery.compensationRetryBaseDelayMs * Math.pow(2, attempt - 1),
+            recovery.compensationRetryMaxDelayMs,
+          );
+          await new Promise((res) => setTimeout(res, delay));
+        }
+      }
+    }
+
+    record.status = 'compensation_failed';
+    record.updatedAt = new Date().toISOString();
+    this.logger.error(
+      `Workflow ${context.workflowId}: compensation for "${step.name}" exhausted after ${maxAttempts} attempts; marked for reconciliation`,
+    );
+    return false;
+  }
+
+  private storeAudit(
+    workflowId: string,
+    records: IMultiContractAuditRecord[],
+  ): void {
+    this.auditTrail.set(workflowId, records);
+    if (this.auditTrail.size > ContractService.MAX_AUDIT_WORKFLOWS) {
+      const oldest = this.auditTrail.keys().next().value;
+      if (oldest !== undefined) {
+        this.auditTrail.delete(oldest);
+      }
+    }
+  }
+
+  private generateWorkflowId(): string {
+    return `wf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
   }
 
   /**

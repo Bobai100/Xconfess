@@ -59,11 +59,45 @@ export type TipResponseState =
   | 'failed'
   | 'conflict';
 
+/**
+ * Ledger finality states for a user-visible tip transaction (issue #270).
+ *
+ * A *submitted* transaction is not the same as an *included and finalized*
+ * one. These states model the verified transitions only:
+ *
+ * - `accepted`  — the transaction was accepted into the ledger/mempool but is
+ *                 not yet included in a closed ledger.
+ * - `included`  — the transaction is included in a ledger but finality has not
+ *                 yet been confirmed (e.g. not enough ledger confirmations).
+ * - `finalized` — the transaction is included and finality is confirmed.
+ * - `failed`    — the transaction failed terminally (rejected, invalid, or
+ *                 failed on-chain).
+ * - `unknown`   — the current state cannot be determined from RPC observations
+ *                 (e.g. delayed or conflicting observations).
+ */
+export type TipFinalityState =
+  | 'accepted'
+  | 'included'
+  | 'finalized'
+  | 'failed'
+  | 'unknown';
+
 export interface TipVerificationResult {
   tip: Tip;
   isNew: boolean;
   isIdempotent: boolean;
   state: TipResponseState;
+  /**
+   * Ledger finality of the underlying transaction (issue #270). Only verified
+   * transitions are exposed; `unknown` is returned when RPC observations are
+   * delayed or conflicting.
+   */
+  finality: TipFinalityState;
+  /**
+   * Stable logical transaction identifier shared by the original transaction
+   * and any fee-bump replacements (issue #271).
+   */
+  logicalTxId: string;
   conflictDetails?: {
     reason: 'DIFFERENT_CONFESSION' | 'ALREADY_PROCESSING' | 'ALREADY_VERIFIED';
     originalConfessionId?: string;
@@ -81,6 +115,18 @@ interface ProcessedTransactionData {
   amount: number;
   senderAddress: string | null;
   receiptMetadata: SettlementReceiptMetadata;
+  /**
+   * Fee-bump lineage (issue #271). When the observed transaction is a
+   * fee-bump, `originalTxHash` is the inner transaction hash and
+   * `replacementTxHash` is the outer (fee-bump) hash. Both are null for a
+   * plain transaction.
+   */
+  originalTxHash: string | null;
+  replacementTxHash: string | null;
+  /**
+   * Ledger finality derived from the Horizon observation (issue #270).
+   */
+  finality: TipFinalityState;
 }
 
 // PostgreSQL unique-violation error code
@@ -96,6 +142,11 @@ const PG_UNIQUE_VIOLATION = '23505';
 export class TippingService {
   private static readonly MAX_RECEIPT_PROOF_METADATA_LEN = 128;
   private static readonly LOCK_TIMEOUT_MS = 30_000; // 30 seconds
+  /**
+   * Number of ledger confirmations required before a transaction is treated
+   * as `finalized` (issue #270). Configurable via `TIP_FINALITY_CONFIRMATIONS`.
+   */
+  private static readonly DEFAULT_FINALITY_CONFIRMATIONS = 1;
   private readonly logger = new Logger(TippingService.name);
 
   constructor(
@@ -239,6 +290,28 @@ export class TippingService {
         tipId: existingByIdempotencyKey.id,
         originalConfessionId: existingByIdempotencyKey.confessionId,
       });
+    }
+
+    // ── 2b. Fee-bump replacement reconciliation (issue #271) ─────────────
+    //
+    // A fee-bumped transaction produces a *new* hash for the same logical
+    // operation. If the submitted hash is already known as a replacement (or
+    // as the original of a replacement) for this confession, resolve to the
+    // existing logical tip instead of creating a duplicate record.
+    const existingByLineage = await this.findTipByLineage(
+      confessionId,
+      dto.txId,
+    );
+    if (existingByLineage) {
+      this.logger.debug({
+        message: 'Fee-bump lineage replay detected',
+        requestId,
+        confessionId,
+        txHash: dto.txId,
+        tipId: existingByLineage.id,
+        status: existingByLineage.verificationStatus,
+      });
+      return this.resolveIdempotentOutcome(existingByLineage);
     }
 
     // ── 3. Atomic sentinel INSERT — the single-credit gate ───────────────
@@ -417,6 +490,52 @@ export class TippingService {
 
       const processedData = await this.processTransactionData(txData, dto.txId);
 
+      // ── 6b. Fee-bump lineage reconciliation (issue #271) ────────────────
+      //
+      // If the observed transaction is a fee-bump, the inner (original) hash
+      // may already have a tip row. In that case we must not create a second
+      // logical record: we fold the replacement hash into the existing row.
+      if (processedData.originalTxHash) {
+        const originalTip = await this.tipRepository.findOne({
+          where: { txId: processedData.originalTxHash },
+        });
+        if (originalTip && originalTip.id !== sentinelTip.id) {
+          if (originalTip.confessionId !== confessionId) {
+            await this.tipRepository.delete({ id: sentinelTip.id });
+            throw new ConflictException({
+              message: `Transaction ${dto.txId} is a fee-bump replacement for a transaction bound to a different confession`,
+              state: 'conflict' as TipResponseState,
+              conflictReason: 'DIFFERENT_CONFESSION',
+              originalConfessionId: originalTip.confessionId,
+              canRetry: false,
+            });
+          }
+
+          this.logger.debug({
+            message: 'Fee-bump replacement folded into existing logical tip',
+            requestId,
+            confessionId,
+            originalTxHash: processedData.originalTxHash,
+            replacementTxHash: processedData.replacementTxHash,
+            tipId: originalTip.id,
+          });
+
+          // Drop the sentinel we just created; the original row owns the
+          // logical operation. Persist the replacement lineage on it.
+          await this.tipRepository.delete({ id: sentinelTip.id });
+          await this.recordReplacementLineage(
+            originalTip.id,
+            processedData.originalTxHash,
+            processedData.replacementTxHash,
+            processedData.finality,
+          );
+          const refreshed = await this.tipRepository.findOne({
+            where: { id: originalTip.id },
+          });
+          return this.resolveIdempotentOutcome(refreshed ?? originalTip);
+        }
+      }
+
       // ── 7. Amount bounds validation ─────────────────────────────────────
       if (processedData.amount < MIN_TIP_AMOUNT) {
         await this.updateRetryMetadata(sentinelTip.id, 'invalid_amount', {
@@ -477,9 +596,14 @@ export class TippingService {
       sentinelTip.senderAddress = processedData.senderAddress;
       sentinelTip.verificationStatus = TipVerificationStatus.VERIFIED;
       sentinelTip.verifiedAt = new Date();
-      sentinelTip.lastChainStatus = 'verified';
+      sentinelTip.lastChainStatus = processedData.finality;
       sentinelTip.lastCheckedAt = new Date();
-      sentinelTip.reconciliationMetadata = reconciliationMetadata;
+      sentinelTip.reconciliationMetadata = {
+        ...reconciliationMetadata,
+        finality: processedData.finality,
+        originalTxHash: processedData.originalTxHash,
+        replacementTxHash: processedData.replacementTxHash,
+      };
       sentinelTip.processingLock = null;
       sentinelTip.lockedAt = null;
       sentinelTip.lockedBy = null;
@@ -582,7 +706,14 @@ export class TippingService {
         isNew: true,
       });
 
-      return { tip: savedTip, isNew: true, isIdempotent: false, state: 'verified' };
+      return {
+        tip: savedTip,
+        isNew: true,
+        isIdempotent: false,
+        state: 'verified',
+        finality: processedData.finality,
+        logicalTxId: this.resolveLogicalTxId(savedTip),
+      };
     } catch (error) {
       // Best-effort: release the processing lock so the reconciler can retry.
       // If the sentinel row itself is the problem (e.g. amount/fetch error),
@@ -695,9 +826,18 @@ export class TippingService {
    * Issue #1687.
    */
   private resolveIdempotentOutcome(tip: Tip): TipVerificationResult {
+    const finality = this.resolveFinalityFromTip(tip);
+    const logicalTxId = this.resolveLogicalTxId(tip);
     switch (tip.verificationStatus) {
       case TipVerificationStatus.VERIFIED:
-        return { tip, isNew: false, isIdempotent: true, state: 'duplicate' };
+        return {
+          tip,
+          isNew: false,
+          isIdempotent: true,
+          state: 'duplicate',
+          finality,
+          logicalTxId,
+        };
 
       case TipVerificationStatus.PENDING:
         throw new ConflictException({
@@ -731,6 +871,160 @@ export class TippingService {
           canRetry: false,
         });
     }
+  }
+
+  /**
+   * Resolve the stable logical transaction identifier for a tip row
+   * (issue #271). The logical id is the original transaction hash when the
+   * row records fee-bump lineage, otherwise the row's own txId.
+   */
+  private resolveLogicalTxId(tip: Tip): string {
+    const metadata = tip.reconciliationMetadata as
+      | Record<string, any>
+      | null
+      | undefined;
+    const originalTxHash =
+      typeof metadata?.originalTxHash === 'string'
+        ? metadata.originalTxHash
+        : null;
+    return originalTxHash ?? tip.txId;
+  }
+
+  /**
+   * Map a persisted tip row onto a finality state (issue #270). Only verified
+   * transitions are exposed; anything we cannot prove is `unknown`.
+   */
+  private resolveFinalityFromTip(tip: Tip): TipFinalityState {
+    if (tip.verificationStatus === TipVerificationStatus.REJECTED) {
+      return 'failed';
+    }
+    if (tip.verificationStatus === TipVerificationStatus.CONFLICT) {
+      return 'unknown';
+    }
+    if (tip.verificationStatus === TipVerificationStatus.VERIFIED) {
+      const metadata = tip.reconciliationMetadata as
+        | Record<string, any>
+        | null
+        | undefined;
+      const recorded = metadata?.finality;
+      if (
+        recorded === 'accepted' ||
+        recorded === 'included' ||
+        recorded === 'finalized' ||
+        recorded === 'failed' ||
+        recorded === 'unknown'
+      ) {
+        return recorded;
+      }
+      // Legacy rows predate finality tracking; a verified row is finalized.
+      return 'finalized';
+    }
+    // PENDING / STALE_PENDING — accepted but not yet proven finalized.
+    return 'accepted';
+  }
+
+  /**
+   * Find a tip row that already owns the logical operation for a submitted
+   * hash, either as the original transaction or as a fee-bump replacement
+   * (issue #271).
+   */
+  private async findTipByLineage(
+    confessionId: string,
+    txHash: string,
+  ): Promise<Tip | null> {
+    const byOriginal = await this.tipRepository.findOne({
+      where: { confessionId, txId: txHash },
+    });
+    if (byOriginal) {
+      return byOriginal;
+    }
+
+    // Look for a row whose reconciliation metadata records this hash as a
+    // replacement (or as the original of a replacement).
+    const candidates = await this.tipRepository
+      .createQueryBuilder('tip')
+      .where('tip.confessionId = :confessionId', { confessionId })
+      .andWhere(
+        "(tip.reconciliationMetadata ->> 'replacementTxHash' = :txHash OR tip.reconciliationMetadata ->> 'originalTxHash' = :txHash)",
+        { txHash },
+      )
+      .getMany();
+
+    return candidates.length > 0 ? candidates[0] : null;
+  }
+
+  /**
+   * Persist fee-bump lineage and finality onto an existing logical tip row
+   * (issue #271). Idempotent: re-recording the same lineage is a no-op.
+   */
+  private async recordReplacementLineage(
+    tipId: string,
+    originalTxHash: string | null,
+    replacementTxHash: string | null,
+    finality: TipFinalityState,
+  ): Promise<void> {
+    const existing = await this.tipRepository.findOne({ where: { id: tipId } });
+    if (!existing) {
+      return;
+    }
+    const metadata = {
+      ...(existing.reconciliationMetadata ?? {}),
+      originalTxHash,
+      replacementTxHash,
+      finality,
+    };
+    await this.tipRepository.update(tipId, {
+      reconciliationMetadata: metadata,
+      lastChainStatus: finality,
+      lastCheckedAt: new Date(),
+    });
+  }
+
+  /**
+   * Derive the finality state from a Horizon transaction observation
+   * (issue #270). Only verified transitions are exposed; anything ambiguous
+   * (missing ledger, conflicting success flags) resolves to `unknown`.
+   */
+  private deriveFinality(txData: any): TipFinalityState {
+    if (!txData || typeof txData !== 'object') {
+      return 'unknown';
+    }
+
+    // Horizon reports `successful: false` for transactions included in a
+    // ledger but failed on-chain — a terminal failure.
+    if (txData.successful === false) {
+      return 'failed';
+    }
+
+    const ledger = Number(txData.ledger);
+    if (!Number.isFinite(ledger) || ledger <= 0) {
+      // Accepted into the mempool but not yet included in a ledger.
+      return 'accepted';
+    }
+
+    const latestLedger = Number(txData.latest_ledger ?? txData.ledger);
+    const confirmations = Number.isFinite(latestLedger)
+      ? latestLedger - ledger + 1
+      : 1;
+    const required = this.getRequiredFinalityConfirmations();
+
+    if (confirmations >= required) {
+      return 'finalized';
+    }
+    if (confirmations >= 1) {
+      return 'included';
+    }
+    return 'unknown';
+  }
+
+  private getRequiredFinalityConfirmations(): number {
+    const configured = Number(
+      this.configService?.get<string>('TIP_FINALITY_CONFIRMATIONS'),
+    );
+    if (Number.isFinite(configured) && configured >= 1) {
+      return Math.floor(configured);
+    }
+    return TippingService.DEFAULT_FINALITY_CONFIRMATIONS;
   }
 
   /**
@@ -878,7 +1172,26 @@ export class TippingService {
         ? null
         : paymentOp.from ?? null;
 
-      return { amount, senderAddress, receiptMetadata };
+      // Fee-bump lineage (issue #271): Horizon exposes the inner transaction
+      // hash on `inner_transaction.hash` for fee-bump envelopes.
+      const innerHash =
+        typeof txData?.inner_transaction?.hash === 'string' &&
+        txData.inner_transaction.hash.length > 0
+          ? txData.inner_transaction.hash
+          : null;
+      const originalTxHash = innerHash;
+      const replacementTxHash = innerHash ? txId : null;
+
+      const finality = this.deriveFinality(txData);
+
+      return {
+        amount,
+        senderAddress,
+        receiptMetadata,
+        originalTxHash,
+        replacementTxHash,
+        finality,
+      };
     } catch (error) {
       if (error instanceof BadRequestException) throw error;
       throw new BadRequestException(

@@ -4,7 +4,18 @@ import {
 } from '../audit-log/audit-log.service';
 import { RequestUser } from '../auth/interfaces/jwt-payload.interface';
 
-export type StellarInvocationOutcome = 'success' | 'failed' | 'denied';
+export type StellarInvocationOutcome =
+  | 'success'
+  | 'failed'
+  | 'denied'
+  | 'partial';
+
+export type StellarCompensatingAction =
+  | 'none'
+  | 'compensated'
+  | 'compensation_failed'
+  | 'reconciliation_required'
+  | 'skipped';
 
 interface StellarAuditRequest {
   headers: Record<string, string | string[] | undefined>;

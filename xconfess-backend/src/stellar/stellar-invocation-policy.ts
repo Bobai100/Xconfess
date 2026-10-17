@@ -1,7 +1,7 @@
 export const STELLAR_INVOKE_SCOPE_LEGACY = 'stellar:invoke-contract';
 export const STELLAR_INVOKE_SCOPE_WILDCARD = 'stellar:invoke-contract:*';
 
-export type StellarInvocationAllowlistClass = 'anchoring';
+export type StellarInvocationAllowlistClass = 'anchoring' | 'saga';
 export type StellarInvocationContractName =
   | 'confessionAnchor'
   | 'reputationBadges'
@@ -99,6 +99,7 @@ export type StellarInvocationOperation =
 export interface StellarInvocationPolicy
   extends StellarInvocationPolicyDefinition {
   operation: StellarInvocationOperation;
+  sagaPhase: StellarInvocationSagaPhase;
 }
 
 export const STELLAR_INVOKE_ALLOWED_OPERATIONS = Object.freeze(
@@ -126,7 +127,52 @@ export function getStellarInvocationPolicy(
   return {
     operation: operation as StellarInvocationOperation,
     ...definition,
+    sagaPhase: definition.sagaPhase ?? 'forward',
   };
+}
+
+export function isStellarInvocationCompensation(
+  operation?: string | null,
+): boolean {
+  return getStellarInvocationPolicy(operation)?.sagaPhase === 'compensation';
+}
+
+/**
+ * Returns the compensation operation authorized to reconcile the given
+ * forward operation, or null when no compensating action is defined.
+ */
+export function getStellarInvocationCompensationOperation(
+  operation?: string | null,
+): StellarInvocationOperation | null {
+  if (!operation) {
+    return null;
+  }
+
+  for (const [candidate, definition] of Object.entries(
+    STELLAR_INVOCATION_POLICY_DEFINITIONS,
+  ) as [StellarInvocationOperation, StellarInvocationPolicyDefinition][]) {
+    if (definition.compensatesOperation === operation) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Returns the scopes required to authorize a saga step. Compensation steps
+ * require their own explicit scope in addition to the shared saga scope, so a
+ * caller holding only forward-step scopes cannot trigger reconciliation.
+ */
+export function getRequiredStellarInvocationScopes(
+  operation?: string | null,
+): string[] {
+  const policy = getStellarInvocationPolicy(operation);
+  if (!policy) {
+    return [];
+  }
+
+  return [...policy.allowedScopes];
 }
 
 export function hasAnyStellarInvocationScope(
