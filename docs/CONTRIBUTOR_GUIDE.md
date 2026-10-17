@@ -234,54 +234,81 @@ extend to groups.
 - Only active members with the `invite` capability (owner, moderators, or
   members when the conversation allows member invites) may create invites.
 - Invites are scoped to a single conversation and a single invitee, expire, and
-  are single-use. Redeeming an expired, revoked, or already-used invite fails
-  with `410`/`409` respectively.
-- Inviting a blocked user, or inviting into a conversation where either party
-  has blocked the other, is rejected with `403`.
+  are single-use.
 
-### History Visibility
+## Conversation-Level Blocking And Report Handoff
 
-- New members see history from the point of their join by default. Conversations
-  may opt into full-history visibility, in which case the join response includes
-  the backfill cursor.
-- Removed or departed members lose access to new messages immediately and keep
-  read access only to the history window they were entitled to while active.
-- History reads are authorized per message window; requests outside the
-  member's window are rejected with `403` rather than silently truncated.
+Blocking, reporting, and conversation access interact, so the backend defines
+precedence and preserves only the safety evidence it needs. All of this is
+enforced at the owning boundary; clients must not infer block or report state
+locally.
 
-### Blocking
+### Atomic State Transitions
 
-- If any active member has blocked another, the blocked pair cannot exchange
-  messages within the conversation and cannot be added to the same conversation.
-- Blocking does not remove existing membership but suppresses fanout between the
-  blocked pair; the rest of the conversation continues to receive messages.
+- A block is a single atomic transition: the block record, the conversation
+  access change, and the delivery-suppression flag are written together or not
+  at all. A partial block is never observable.
+- A report is likewise atomic: the report record and its handoff marker are
+  written in one transaction. If the handoff write fails, the report is not
+  reported as filed and the caller receives an error to retry.
+- Both transitions are idempotent: repeating a block or report for the same
+  target returns the existing state rather than creating duplicates.
 
-### Fanout Limits
+### Precedence When States Conflict
 
-- Fanout is bounded by a configurable per-conversation member cap
-  (`CONVERSATION_MAX_MEMBERS`, default `100`). Invites and joins that would
-  exceed the cap are rejected with `422`.
-- Fanout is delivered per active, non-blocked member; delivery failures are
-  retried and surfaced, never silently dropped.
+- A block takes precedence over conversation access: once a block is in place,
+  the blocked party can no longer read, send to, or be fanned out the
+  conversation, even if they were previously a member.
+- A report does not by itself change conversation access. Reporting and
+  blocking are independent; a reporter may block separately, and a block does
+  not implicitly file a report.
+- If a block and a report target the same conversation, the block's delivery
+  suppression applies immediately while the report is handed off for review.
+
+### Reporter Privacy
+
+- The blocked party is never told who reported them, and report metadata is
+  never included in conversation reads, previews, or fanout to the blocked
+  party.
+- Only the minimum safety evidence is retained: the report id, conversation
+  id, reporter id (visible only to authorized reviewers), target id, reason
+  code, and timestamp. Message bodies are not copied into the report record.
+
+### Delivery Suppression And Queued Messages
+
+- After a block, new messages to the blocked party are suppressed at the
+  boundary and the sender receives a generic failure that does not reveal the
+  block reason.
+- Messages already queued for delivery when the block lands are dropped before
+  fanout; they are not delivered late. The sender is not retroactively
+  notified of the drop.
+- Suppression is checked at send time and again at fanout time so a race
+  between queueing and blocking cannot leak a message.
+
+### Appeal Implications
+
+- A block may be appealed through the moderation flow; filing an appeal does
+  not lift the block. The block stays in effect until a reviewer resolves the
+  appeal.
+- Resolving an appeal in the blocked party's favor removes the block
+  atomically and restores access per the conversation's membership rules.
+
+### Authorization And Failure Semantics
+
+- Only a participant may block or report within a conversation; unauthorized
+  requests are rejected with `403` at the owning boundary.
+- Blocking or reporting a non-participant is rejected with `404` so the caller
+  cannot probe membership.
+- Failed transitions surface an error and are safe to retry; the caller never
+  sees a success for a transition that did not commit.
 
 ### Testing Expectations
 
-Backend tests for this area must cover the expected path plus the rejection
-cases above (unauthorized invite, expired/used invite, blocked invitee,
-over-cap join, out-of-window history read) and the regression risk of a
-one-to-one permission being reused for a group. Run them with:
+Backend tests for this area must cover the expected path plus rejection cases
+(unauthorized block/report, non-participant target), the atomicity of partial
+failures, delivery suppression of already-queued messages, and the regression
+risk of reporter identity leaking to the blocked party. Run them with:
 
 ```bash
 npm run backend:test && npm run frontend:test
 ```
-
-## Accessibility Contributor Test Harness
-
-The accessibility harness gives every contributor a consistent, low-friction
-way to run the same checks locally. It is wired into the standard frontend
-commands, so a clean checkout can run it without extra setup:
-
-```bash
-npm run frontend:lint        # static a11y lint rules
-npm run frontend:test        # component-level a11y assertions
-npm run frontend:test:e2e    # browser-level a11y checks
