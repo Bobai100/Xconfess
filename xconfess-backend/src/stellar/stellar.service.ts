@@ -21,12 +21,72 @@ export interface AnchorData {
   anchoredAt: Date;
 }
 
+/**
+ * Bounded label sets for transaction latency metrics. Keeping these closed
+ * prevents unbounded cardinality in downstream metric stores.
+ */
+export const TX_LATENCY_NETWORKS = ['mainnet', 'testnet', 'futurenet', 'unknown'] as const;
+export type TxLatencyNetwork = (typeof TX_LATENCY_NETWORKS)[number];
+
+export const TX_LATENCY_OPERATIONS = [
+  'payment',
+  'anchor',
+  'verification',
+  'balance',
+  'other',
+] as const;
+export type TxLatencyOperation = (typeof TX_LATENCY_OPERATIONS)[number];
+
+export const TX_LATENCY_PHASES = [
+  'submission',
+  'inclusion',
+  'confirmation',
+] as const;
+export type TxLatencyPhase = (typeof TX_LATENCY_PHASES)[number];
+
+export interface TxLatencyBudget {
+  /** Soft budget: breaches are logged as warnings. */
+  warnMs: number;
+  /** Hard budget: breaches are logged as errors and flagged for alerting. */
+  criticalMs: number;
+}
+
+export interface TxLatencySample {
+  network: TxLatencyNetwork;
+  operation: TxLatencyOperation;
+  phase: TxLatencyPhase;
+  durationMs: number;
+  success: boolean;
+  breach: 'none' | 'warn' | 'critical';
+}
+
+export interface TxLatencySnapshot {
+  network: TxLatencyNetwork;
+  operation: TxLatencyOperation;
+  phase: TxLatencyPhase;
+  count: number;
+  failures: number;
+  breaches: number;
+  criticalBreaches: number;
+  totalMs: number;
+  maxMs: number;
+  lastMs: number;
+}
+
+const DEFAULT_LATENCY_BUDGETS: Record<TxLatencyPhase, TxLatencyBudget> = {
+  submission: { warnMs: 2_000, criticalMs: 5_000 },
+  inclusion: { warnMs: 10_000, criticalMs: 30_000 },
+  confirmation: { warnMs: 15_000, criticalMs: 45_000 },
+};
+
 @Injectable()
 export class StellarService {
   private readonly logger = new Logger(StellarService.name);
   private readonly contractId: string;
   private readonly network: string;
   private readonly horizonUrl: string;
+  private readonly latencyBudgets: Record<TxLatencyPhase, TxLatencyBudget>;
+  private readonly latencySamples = new Map<string, TxLatencySnapshot>();
 
   constructor(
     private readonly configService: ConfigService,
@@ -45,6 +105,206 @@ export class StellarService {
       'STELLAR_HORIZON_URL',
       'https://horizon-testnet.stellar.org',
     );
+    this.latencyBudgets = this.loadLatencyBudgets();
+  }
+
+  /**
+   * Resolve per-phase latency budgets from configuration, falling back to
+   * conservative defaults. Invalid values are ignored with a warning so a bad
+   * env var cannot silently disable breach detection.
+   */
+  private loadLatencyBudgets(): Record<TxLatencyPhase, TxLatencyBudget> {
+    const budgets: Record<TxLatencyPhase, TxLatencyBudget> = {
+      submission: { ...DEFAULT_LATENCY_BUDGETS.submission },
+      inclusion: { ...DEFAULT_LATENCY_BUDGETS.inclusion },
+      confirmation: { ...DEFAULT_LATENCY_BUDGETS.confirmation },
+    };
+
+    for (const phase of TX_LATENCY_PHASES) {
+      const envKey = `STELLAR_TX_LATENCY_${phase.toUpperCase()}_BUDGET_MS`;
+      const raw = this.configService.get<string | number>(envKey);
+      if (raw === undefined || raw === null || raw === '') {
+        continue;
+      }
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        this.logger.warn(
+          `Ignoring invalid ${envKey}="${String(raw)}"; using default budget`,
+        );
+        continue;
+      }
+      const warnMs = parsed;
+      const criticalMs = Math.max(
+        warnMs,
+        Math.round(warnMs * 2.5),
+      );
+      budgets[phase] = { warnMs, criticalMs };
+    }
+
+    return budgets;
+  }
+
+  /**
+   * Normalize the configured network into a bounded label value.
+   */
+  private getLatencyNetworkLabel(): TxLatencyNetwork {
+    const normalized = (this.network || '').toLowerCase();
+    return (TX_LATENCY_NETWORKS as readonly string[]).includes(normalized)
+      ? (normalized as TxLatencyNetwork)
+      : 'unknown';
+  }
+
+  /**
+   * Normalize an operation class into a bounded label value.
+   */
+  private getLatencyOperationLabel(
+    operation: TxLatencyOperation | string,
+  ): TxLatencyOperation {
+    const normalized = (operation || '').toLowerCase();
+    return (TX_LATENCY_OPERATIONS as readonly string[]).includes(normalized)
+      ? (normalized as TxLatencyOperation)
+      : 'other';
+  }
+
+  private getLatencyKey(
+    network: TxLatencyNetwork,
+    operation: TxLatencyOperation,
+    phase: TxLatencyPhase,
+  ): string {
+    return `${network}|${operation}|${phase}`;
+  }
+
+  /**
+   * Record a single latency observation, compare it against the configured
+   * budget for the phase, and emit structured logs / alert signals on breach.
+   * Failure paths are measured the same way as successes so degraded
+   * providers are visible even when transactions never complete.
+   */
+  recordTransactionLatency(
+    operation: TxLatencyOperation | string,
+    phase: TxLatencyPhase,
+    durationMs: number,
+    success: boolean,
+  ): TxLatencySample {
+    const network = this.getLatencyNetworkLabel();
+    const opLabel = this.getLatencyOperationLabel(operation);
+    const safeDuration = Number.isFinite(durationMs) && durationMs >= 0
+      ? durationMs
+      : 0;
+    const budget = this.latencyBudgets[phase];
+
+    let breach: TxLatencySample['breach'] = 'none';
+    if (safeDuration >= budget.criticalMs) {
+      breach = 'critical';
+    } else if (safeDuration >= budget.warnMs) {
+      breach = 'warn';
+    }
+
+    const key = this.getLatencyKey(network, opLabel, phase);
+    const existing = this.latencySamples.get(key);
+    if (existing) {
+      existing.count += 1;
+      existing.totalMs += safeDuration;
+      existing.maxMs = Math.max(existing.maxMs, safeDuration);
+      existing.lastMs = safeDuration;
+      if (!success) {
+        existing.failures += 1;
+      }
+      if (breach !== 'none') {
+        existing.breaches += 1;
+      }
+      if (breach === 'critical') {
+        existing.criticalBreaches += 1;
+      }
+    } else {
+      this.latencySamples.set(key, {
+        network,
+        operation: opLabel,
+        phase,
+        count: 1,
+        failures: success ? 0 : 1,
+        breaches: breach === 'none' ? 0 : 1,
+        criticalBreaches: breach === 'critical' ? 1 : 0,
+        totalMs: safeDuration,
+        maxMs: safeDuration,
+        lastMs: safeDuration,
+      });
+    }
+
+    const logPayload = {
+      metric: 'stellar_tx_latency_ms',
+      network,
+      operation: opLabel,
+      phase,
+      durationMs: Math.round(safeDuration),
+      success,
+      breach,
+      warnBudgetMs: budget.warnMs,
+      criticalBudgetMs: budget.criticalMs,
+    };
+
+    if (breach === 'critical') {
+      this.logger.error({
+        ...logPayload,
+        message: `Stellar ${phase} latency exceeded critical budget`,
+        alert: true,
+      });
+    } else if (breach === 'warn') {
+      this.logger.warn({
+        ...logPayload,
+        message: `Stellar ${phase} latency exceeded warning budget`,
+      });
+    } else {
+      this.logger.debug(logPayload);
+    }
+
+    return {
+      network,
+      operation: opLabel,
+      phase,
+      durationMs: safeDuration,
+      success,
+      breach,
+    };
+  }
+
+  /**
+   * Run an async operation while measuring its latency for the given phase.
+   * The original result or error is always propagated unchanged.
+   */
+  private async measurePhase<T>(
+    operation: TxLatencyOperation,
+    phase: TxLatencyPhase,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const startedAt = Date.now();
+    let success = false;
+    try {
+      const result = await fn();
+      success = true;
+      return result;
+    } finally {
+      this.recordTransactionLatency(
+        operation,
+        phase,
+        Date.now() - startedAt,
+        success,
+      );
+    }
+  }
+
+  /**
+   * Snapshot of aggregated latency metrics for observability endpoints/tests.
+   */
+  getTransactionLatencySnapshot(): TxLatencySnapshot[] {
+    return Array.from(this.latencySamples.values()).map((s) => ({ ...s }));
+  }
+
+  /**
+   * Reset aggregated latency metrics (used by tests and on config reload).
+   */
+  resetTransactionLatencyMetrics(): void {
+    this.latencySamples.clear();
   }
 
   /**
@@ -116,7 +376,9 @@ export class StellarService {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         const server = this.stellarConfig.getServer();
-        const tx = await server.transactions().transaction(txHash).call();
+        const tx = await this.measurePhase('verification', 'inclusion', () =>
+          server.transactions().transaction(txHash).call(),
+        );
         return {
           hash: tx.hash,
           success: tx.successful,
@@ -222,7 +484,9 @@ export class StellarService {
         { memo },
       );
       const signedTx = this.txBuilder.signTransaction(tx, serverSecret);
-      const result = await this.txBuilder.submitTransaction(signedTx);
+      const result = await this.measurePhase('payment', 'submission', () =>
+        this.txBuilder.submitTransaction(signedTx),
+      );
       return {
         hash: result.hash,
         success: result.successful,
@@ -296,9 +560,11 @@ export class StellarService {
 
         let response: Response;
         try {
-          response = await fetch(this.getHorizonTxUrl(txHash), {
-            signal: controller.signal,
-          });
+          response = await this.measurePhase('verification', 'confirmation', () =>
+            fetch(this.getHorizonTxUrl(txHash), {
+              signal: controller.signal,
+            }),
+          );
         } finally {
           clearTimeout(timeoutId);
         }

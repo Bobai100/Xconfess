@@ -4,18 +4,59 @@ import * as StellarSDK from '@stellar/stellar-sdk';
 import { StellarConfigService } from './stellar-config.service';
 import { ITransactionOptions } from './interfaces/stellar-config.interface';
 import { redactSecretStrings } from '../utils/redact-secrets';
+import {
+  TransactionLatencyService,
+  TransactionOperationClass,
+  TransactionPhase,
+} from './transaction-latency.service';
 
 @Injectable()
 export class TransactionBuilderService {
   private readonly logger = new Logger(TransactionBuilderService.name);
 
-  constructor(private stellarConfig: StellarConfigService) {}
+  constructor(
+    private stellarConfig: StellarConfigService,
+    private transactionLatency: TransactionLatencyService,
+  ) {}
 
   /**
    * Build a Stellar transaction with operations
    * Applies fee budget checks and backoff if fees exceed policy
    */
   async buildTransaction(
+    sourcePublicKey: string,
+    operations: any[],
+    options?: ITransactionOptions,
+  ): Promise<any> {
+    const operationClass = TransactionLatencyService.classifyOperations(
+      operations,
+    );
+    const startedAt = Date.now();
+    try {
+      const transaction = await this.buildTransactionInternal(
+        sourcePublicKey,
+        operations,
+        options,
+      );
+      this.transactionLatency.record(
+        TransactionPhase.BUILD,
+        operationClass,
+        Date.now() - startedAt,
+        true,
+      );
+      return transaction;
+    } catch (error) {
+      this.transactionLatency.record(
+        TransactionPhase.BUILD,
+        operationClass,
+        Date.now() - startedAt,
+        false,
+      );
+      throw error;
+    }
+  }
+
+  private async buildTransactionInternal(
     sourcePublicKey: string,
     operations: any[],
     options?: ITransactionOptions,
@@ -139,11 +180,46 @@ export class TransactionBuilderService {
   /**
    * Submit transaction to network with bounded retries for transient failures
    */
-  async submitTransaction(transaction: any): Promise<any> {
+  async submitTransaction(
+    transaction: any,
+    operationClass: TransactionOperationClass = TransactionOperationClass.OTHER,
+  ): Promise<any> {
     const maxRetries = this.stellarConfig.getConfig().rpcMaxRetries;
     const baseDelay = this.stellarConfig.getConfig().rpcRetryBaseDelayMs;
     const maxDelay = this.stellarConfig.getConfig().rpcRetryMaxDelayMs;
 
+    const startedAt = Date.now();
+    try {
+      const result = await this.submitTransactionInternal(
+        transaction,
+        maxRetries,
+        baseDelay,
+        maxDelay,
+      );
+      this.transactionLatency.record(
+        TransactionPhase.SUBMISSION,
+        operationClass,
+        Date.now() - startedAt,
+        true,
+      );
+      return result;
+    } catch (error) {
+      this.transactionLatency.record(
+        TransactionPhase.SUBMISSION,
+        operationClass,
+        Date.now() - startedAt,
+        false,
+      );
+      throw error;
+    }
+  }
+
+  private async submitTransactionInternal(
+    transaction: any,
+    maxRetries: number,
+    baseDelay: number,
+    maxDelay: number,
+  ): Promise<any> {
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
@@ -206,5 +282,35 @@ export class TransactionBuilderService {
 
     const message = lastError instanceof Error ? lastError.message : String(lastError);
     throw new Error(`Transaction submission failed after ${maxRetries + 1} attempts: ${message}`);
+  }
+
+  /**
+   * Record inclusion/confirmation latency observed by callers once the
+   * transaction is observed on-chain. Bounded labels only.
+   */
+  recordInclusionLatency(
+    operationClass: TransactionOperationClass,
+    latencyMs: number,
+    success: boolean,
+  ): void {
+    this.transactionLatency.record(
+      TransactionPhase.INCLUSION,
+      operationClass,
+      latencyMs,
+      success,
+    );
+  }
+
+  recordConfirmationLatency(
+    operationClass: TransactionOperationClass,
+    latencyMs: number,
+    success: boolean,
+  ): void {
+    this.transactionLatency.record(
+      TransactionPhase.CONFIRMATION,
+      operationClass,
+      latencyMs,
+      success,
+    );
   }
 }

@@ -25,6 +25,11 @@ import {
   MIN_TIP_AMOUNT,
   TIP_PRECISION,
 } from './tipping.constants';
+import {
+  TransactionLatencyBudgetService,
+  TransactionOperationClass,
+  TransactionPhase,
+} from '../observability/transaction-latency-budget.service';
 
 export interface TipStats {
   totalAmount: number;
@@ -105,6 +110,8 @@ export class TippingService {
     private readonly configService?: ConfigService,
     @Optional()
     private readonly analyticsEventService?: AnalyticsEventService,
+    @Optional()
+    private readonly latencyBudgetService?: TransactionLatencyBudgetService,
   ) {}
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -304,6 +311,10 @@ export class TippingService {
     }
 
     // ── 5. On-chain verification ──────────────────────────────────────────
+    const network = this.getAnalyticsNetwork();
+    const operationClass = TransactionOperationClass.TIP_VERIFICATION;
+    const submissionStartedAt = Date.now();
+
     try {
       let isValid = false;
       try {
@@ -311,7 +322,22 @@ export class TippingService {
           dto.txId,
           requestId,
         );
+        this.recordPhaseLatency(
+          network,
+          operationClass,
+          TransactionPhase.SUBMISSION,
+          submissionStartedAt,
+          requestId,
+        );
       } catch (verifyError: any) {
+        this.recordPhaseLatency(
+          network,
+          operationClass,
+          TransactionPhase.SUBMISSION,
+          submissionStartedAt,
+          requestId,
+          'network_error',
+        );
         this.logger.warn({
           message: 'Network error verifying transaction, marking for retry',
           requestId,
@@ -350,13 +376,29 @@ export class TippingService {
       }
 
       // ── 6. Fetch Horizon data ─────────────────────────────────────────
+      const inclusionStartedAt = Date.now();
       let txData: any;
       try {
         txData = await this.fetchTransactionData(dto.txId);
+        this.recordPhaseLatency(
+          network,
+          operationClass,
+          TransactionPhase.INCLUSION,
+          inclusionStartedAt,
+          requestId,
+        );
       } catch (fetchError: any) {
         const isRetryable =
           fetchError instanceof GatewayTimeoutException ||
           fetchError instanceof NotFoundException;
+        this.recordPhaseLatency(
+          network,
+          operationClass,
+          TransactionPhase.INCLUSION,
+          inclusionStartedAt,
+          requestId,
+          isRetryable ? 'network_error' : 'invalid_transaction',
+        );
         if (isRetryable) {
           await this.updateRetryMetadata(sentinelTip.id, 'fetch_retryable', {
             error: fetchError.message,
@@ -419,6 +461,7 @@ export class TippingService {
       }
 
       // ── 8. Finalise the sentinel row as VERIFIED (single write) ────────
+      const confirmationStartedAt = Date.now();
       const reconciliationMetadata = {
         verifiedBy: 'user_request',
         processedData: {
@@ -442,10 +485,16 @@ export class TippingService {
       sentinelTip.lockedBy = null;
 
       const savedTip = await this.tipRepository.save(sentinelTip);
+      this.recordPhaseLatency(
+        network,
+        operationClass,
+        TransactionPhase.CONFIRMATION,
+        confirmationStartedAt,
+        requestId,
+      );
       const amountAtomic = Math.round(
         processedData.amount * 10_000_000,
       ).toString();
-      const network = this.getAnalyticsNetwork();
 
       this.analyticsEventService
         ?.record({
@@ -589,6 +638,46 @@ export class TippingService {
     return this.configService?.get<string>('STELLAR_NETWORK') === 'mainnet'
       ? 'mainnet'
       : 'testnet';
+  }
+
+  /**
+   * Record a single transaction phase latency observation against the
+   * network-specific budget. Bounded labels only (network, operation class,
+   * phase, outcome) — never tx hashes or user identifiers — so the metric
+   * cardinality stays predictable. Issue #277.
+   */
+  private recordPhaseLatency(
+    network: AnalyticsNetwork,
+    operationClass: TransactionOperationClass,
+    phase: TransactionPhase,
+    startedAt: number,
+    requestId?: string,
+    outcome: 'success' | 'network_error' | 'invalid_transaction' = 'success',
+  ): void {
+    if (!this.latencyBudgetService) {
+      return;
+    }
+
+    try {
+      this.latencyBudgetService.recordLatency({
+        network,
+        operationClass,
+        phase,
+        outcome,
+        durationMs: Date.now() - startedAt,
+        requestId,
+      });
+    } catch (err) {
+      // Observability must never break the settlement path.
+      this.logger.warn({
+        message: 'Failed to record transaction latency metric',
+        requestId,
+        network,
+        operationClass,
+        phase,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   private async findTipByIdempotencyKey(
