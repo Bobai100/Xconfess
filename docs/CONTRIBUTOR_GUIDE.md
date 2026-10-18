@@ -113,6 +113,52 @@ If a full check cannot run locally because a dependency, Docker service, or
 platform tool is unavailable, document the failed command and the exact blocker
 in the pull request body.
 
+## Reviewer Guidelines And Calibration
+
+Moderation reviewers interpret ambiguous policy cases. To keep decisions
+consistent without letting consensus replace policy review, reviewer guidance is
+versioned and reviewers are calibrated against anonymized exercises.
+
+### Versioned Annotation Guidelines
+
+- Guidelines are versioned; every review decision records the guideline version
+  it was made under so past decisions remain reproducible.
+- Publishing a new guideline version is an authorized action (moderator/admin)
+  enforced at the owning backend boundary; unauthorized publishes are rejected
+  with `403`.
+- A decision referencing an unknown or retired guideline version is rejected
+  with `422` rather than silently falling back to the latest version.
+
+### Anonymized Calibration Exercises
+
+- Calibration exercises present anonymized cases (no reporter or author
+  identity) so reviewers judge the policy question, not the person.
+- Exercise responses are stored separately from live moderation decisions and
+  never affect a real case outcome.
+- Only authorized reviewers may fetch exercises or submit responses;
+  unauthorized access is rejected at the boundary.
+
+### Measuring Agreement
+
+- Reviewer agreement (e.g. inter-rater agreement such as Cohen's or Fleiss'
+  kappa) is computed over calibration responses and reported as a signal.
+- Agreement is **not** a substitute for policy review: a high-agreement but
+  policy-incorrect answer is still wrong, and consensus never auto-resolves a
+  live case.
+- Agreement metrics are advisory; final decisions remain with authorized
+  reviewers applying the current guideline version.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path plus rejection cases
+(unauthorized guideline publish, unknown guideline version, unauthorized
+calibration access) and the regression risk that agreement metrics are treated
+as advisory rather than as an automatic decision. Run them with:
+
+```bash
+npm run backend:test
+```
+
 ## Message Retention And Expiry
 
 Private messages have an explicit, enforceable lifecycle. Retention is chosen
@@ -225,7 +271,7 @@ extend to groups.
   below.
 - **Remove** — only the conversation owner or an authorized moderator may
   remove another member. Removing a non-member is a no-op success; removing
-  yourself must go through the leave path.
+yourself must go through the leave path.
 - Every transition is idempotent and records the actor, target, and reason so
   audit trails stay consistent.
 
@@ -234,56 +280,6 @@ extend to groups.
 - Only active members with the `invite` capability (owner, moderators, or
   members when the conversation allows member invites) may create invites.
 - Invites are scoped to a single conversation and a single invitee, expire, and
-  are single-use.
+  
 
-## Multilingual Search Normalization
-
-Search queries and indexed text are normalized and tokenized by the backend at
-the search boundary so that equivalent input matches regardless of Unicode form,
-diacritics, or language-specific token boundaries. Clients must send raw query
-text and must not pre-normalize it.
-
-### Normalization Rules
-
-- Text is normalized to Unicode NFKC before tokenization, so composed and
-  decomposed forms (e.g. `é` vs `e` + combining accent) match.
-- Diacritics are folded for Latin-script languages so `café` matches `cafe`.
-- Case is folded using locale-aware lowercasing for the detected language.
-- The same normalization is applied to both the query and the indexed text; a
-  mismatch between the two is a bug.
-
-### Tokenization Per Language
-
-- Supported languages (`en`, `fr`, `es`, `de`, `pt`, `ar`, `zh`, `ja`) each
-  define their own token boundaries. CJK languages tokenize per character or
-  bigram rather than on whitespace; Arabic and Latin languages split on
-  whitespace and punctuation.
-- The language is taken from an explicit request hint when present, otherwise
-  detected from the query, otherwise falls back to the default language.
-
-### Fallback For Unknown Languages
-
-- Unknown or unsupported languages use a safe fallback: NFKC normalization,
-  case folding, and whitespace/punctuation tokenization without diacritic
-  folding that could corrupt non-Latin scripts.
-- Malformed input (invalid UTF-8, lone surrogates, control characters) is
-  sanitized before normalization; it never throws and never reaches the index
-  unnormalized.
-
-### Authorization And Failure Semantics
-
-- Search requires an authenticated session; unauthorized requests are rejected
-  with `403` at the search boundary.
-- Normalization failures fall back to the safe fallback path rather than
-  returning an error, and are logged without query content.
-
-### Testing Expectations
-
-Backend tests for this area must cover the expected path plus mixed-script
-input, malformed input, and the fallback for unknown languages, and the
-rejection case for unauthorized search. Fixtures live alongside the search
-tests. Run them with:
-
-```bash
-npm run backend:test
-```
+/* … truncated 2197 chars — edit only what you need near the top … */
