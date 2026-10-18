@@ -5,6 +5,25 @@ import { StellarConfigService } from './stellar-config.service';
 import { ITransactionOptions } from './interfaces/stellar-config.interface';
 import { redactSecretStrings } from '../utils/redact-secrets';
 import {
+  PendingSubmissionStore,
+  PendingSubmissionRecord,
+} from './pending-submission.store';
+
+/**
+ * Options controlling durable, idempotent submission.
+ *
+ * `intentKey` is a caller-supplied, stable identifier for the *operation
+ * intent* (e.g. `tip:<tipId>` or `anchor:<anchorId>`). When supplied, the
+ * builder records the intent before touching the network and reconciles
+ * against it on retry, so a timeout after submission can never produce a
+ * duplicate tip or anchor.
+ */
+export interface ISubmitOptions {
+  intentKey?: string;
+  /** How long a pending record is considered authoritative before expiry. */
+  pendingTtlMs?: number;
+}
+import {
   AccountSequenceCoordinator,
   AccountSequenceLease,
 } from './account-sequence-coordinator.service';
@@ -20,6 +39,7 @@ export class TransactionBuilderService {
 
   constructor(
     private stellarConfig: StellarConfigService,
+    private readonly pendingStore: PendingSubmissionStore,
     private sequenceCoordinator: AccountSequenceCoordinator,
     private transactionLatency: TransactionLatencyService,
   ) {}
@@ -194,9 +214,161 @@ export class TransactionBuilderService {
   }
 
   /**
-   * Submit transaction to network with bounded retries for transient failures
+   * Submit transaction to network with bounded retries for transient failures.
+   *
+   * When `options.intentKey` is provided the submission becomes idempotent:
+   *  1. A durable pending record is written *before* the first network call.
+   *  2. On entry (and on every retry) the store is consulted; if a previous
+   *     attempt already landed a transaction hash, that result is returned
+   *     instead of submitting again.
+   *  3. Ambiguous outcomes (timeouts / connection resets) leave the record in
+   *     `pending` so a later call reconciles via `reconcilePendingSubmission`.
    */
   async submitTransaction(
+    transaction: any,
+    options: ISubmitOptions = {},
+    operationClass: TransactionOperationClass = TransactionOperationClass.OTHER,
+  ): Promise<any> {
+    const { intentKey } = options;
+    if (!intentKey) {
+      return this.submitWithRetries(transaction, operationClass);
+    }
+
+    const ttlMs =
+      options.pendingTtlMs ??
+      this.stellarConfig.getConfig().pendingSubmissionTtlMs;
+
+    // Reconcile first: a prior attempt may have already landed.
+    const existing = await this.pendingStore.get(intentKey);
+    if (existing && !this.pendingStore.isExpired(existing, ttlMs)) {
+      if (existing.status === 'confirmed' && existing.txHash) {
+        this.logger.log(
+          `Intent ${intentKey} already confirmed as ${existing.txHash}; skipping submission`,
+        );
+        return { hash: existing.txHash, ledger: existing.ledger, reconciled: true };
+      }
+      if (existing.status === 'pending') {
+        const reconciled = await this.reconcilePendingSubmission(
+          intentKey,
+          existing,
+        );
+        if (reconciled) {
+          return reconciled;
+        }
+      }
+    }
+
+    const txHash = this.safeTransactionHash(transaction);
+    const record: PendingSubmissionRecord = {
+      intentKey,
+      txHash,
+      status: 'pending',
+      attempts: (existing?.attempts ?? 0) + 1,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await this.pendingStore.put(record);
+
+    try {
+      const result = await this.submitWithRetries(transaction, operationClass);
+      await this.pendingStore.put({
+        ...record,
+        status: 'confirmed',
+        txHash: result?.hash ?? txHash,
+        ledger: result?.ledger,
+        updatedAt: new Date().toISOString(),
+      });
+      return result;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      const definitive = this.isDefinitiveFailure(error);
+      await this.pendingStore.put({
+        ...record,
+        status: definitive ? 'failed' : 'pending',
+        lastError: message,
+        updatedAt: new Date().toISOString(),
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Look up a previously recorded intent and, if the network already has the
+   * transaction, promote the record to `confirmed`. Returns the submission
+   * result when reconciliation succeeds, otherwise `null`.
+   */
+  async reconcilePendingSubmission(
+    intentKey: string,
+    record?: PendingSubmissionRecord,
+  ): Promise<any | null> {
+    const pending = record ?? (await this.pendingStore.get(intentKey));
+
+      return null;
+    }
+
+    try {
+      const server = this.stellarConfig.getServer();
+      const tx = await server.getTransaction(pending.txHash);
+      const status = (tx as { status?: string }).status;
+      if (status === 'SUCCESS') {
+        await this.pendingStore.put({
+          ...pending,
+          status: 'confirmed',
+          ledger: (tx as { ledger?: number }).ledger,
+          updatedAt: new Date().toISOString(),
+        });
+        this.logger.log(
+          `Reconciled intent ${intentKey} to confirmed tx ${pending.txHash}`,
+        );
+        return {
+          hash: pending.txHash,
+          ledger: (tx as { ledger?: number }).ledger,
+          reconciled: true,
+        };
+      }
+      if (status === 'FAILED') {
+        await this.pendingStore.put({
+          ...pending,
+          status: 'failed',
+          lastError: 'reconciled: transaction failed on-chain',
+          updatedAt: new Date().toISOString(),
+        });
+        return null;
+      }
+      // NOT_FOUND: still ambiguous, leave pending for a later retry.
+      return null;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `Reconciliation lookup for intent ${intentKey} failed: ${message}`,
+      );
+      return null;
+    }
+  }
+
+  private safeTransactionHash(transaction: any): string | undefined {
+    try {
+      if (typeof transaction?.hash === 'function') {
+        return transaction.hash().toString('hex');
+      }
+    } catch {
+      // Hash computation is best-effort; the record is still durable.
+    }
+    return undefined;
+  }
+
+  private isDefinitiveFailure(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return (
+      message.includes('non-retryable') ||
+      message.includes('tx_bad_auth') ||
+      message.includes('tx_bad_seq') ||
+      message.includes('tx_malformed') ||
+      message.includes('tx_not_supported')
+    );
+  }
+
+  private async submitWithRetries(
     transaction: any,
     operationClass: TransactionOperationClass = TransactionOperationClass.OTHER,
   ): Promise<any> {
@@ -206,8 +378,7 @@ export class TransactionBuilderService {
     const lease = sourceAccountId
       ? await this.sequenceCoordinator.acquire(sourceAccountId)
       : undefined;
-
-    const maxRetries = this.stellarConfig.getConfig().rpcMaxRetries;
+  }
     const baseDelay = this.stellarConfig.getConfig().rpcRetryBaseDelayMs;
     const maxDelay = this.stellarConfig.getConfig().rpcRetryMaxDelayMs;
     const startedAt = Date.now();

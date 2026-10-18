@@ -34,6 +34,23 @@ export interface IdempotencyCheckResult {
 }
 
 /**
+ * Result of a reconciliation lookup keyed by operation intent.
+ *
+ * - `found` false → no record exists for this intent; the caller may safely
+ *                   submit the operation (it has not been attempted before).
+ * - `found` true  → a record exists; `record.status` tells the caller whether
+ *                   the operation is `processing` (ambiguous / in-flight),
+ *                   `completed` (already applied – do NOT resubmit), or
+ *                   `failed` (safe to retry with the same intent key).
+ */
+export interface IntentReconciliationResult {
+  found: boolean;
+  record: ConfessionIdempotencyRecord | null;
+  cachedResponse: AnonymousConfession | null;
+  cachedStatus: number | null;
+}
+
+/**
  * IdempotencyService – confession-scoped idempotency enforcement.
  *
  * Algorithm (atomic, race-safe):
@@ -127,6 +144,75 @@ export class ConfessionIdempotencyService {
     await this.recordRepo.update(record.id, {
       status: 'failed' as IdempotencyStatus,
     });
+  }
+
+  /**
+   * Reconcile an ambiguous submission outcome by looking up the durable
+   * idempotency record keyed by the operation intent (the idempotency key).
+   *
+   * This is a read-only lookup: it never creates, mutates or resets a record,
+   * so it is safe to call after a network timeout where the caller does not
+   * know whether the original submission reached the backend. Callers use the
+   * returned status to decide whether to resubmit:
+   *
+   *   - not found      → safe to submit (no prior attempt recorded).
+   *   - 'processing'   → outcome still ambiguous; caller should keep polling
+   *                      or surface a "pending" state rather than resubmit.
+   *   - 'completed'    → already applied; return the cached response and do
+   *                      NOT resubmit (prevents duplicate tipping/anchoring).
+   *   - 'failed'       → prior attempt failed; safe to retry with same key.
+   *
+   * @param idempotencyKey  The operation-intent key supplied by the client.
+   * @param payloadHash     Optional expected payload hash. When provided and it
+   *                        does not match the stored hash, a 409 Conflict is
+   *                        thrown (the key was reused for a different intent).
+   */
+  async reconcileByIntent(
+    idempotencyKey: string,
+    payloadHash?: string,
+  ): Promise<IntentReconciliationResult> {
+    const record = await this.recordRepo.findOne({
+      where: { idempotencyKey },
+    });
+
+    if (!record) {
+      return {
+        found: false,
+        record: null,
+        cachedResponse: null,
+        cachedStatus: null,
+      };
+    }
+
+    if (payloadHash !== undefined && record.payloadHash !== payloadHash) {
+      throw new ConflictException(
+        'Idempotency key replay conflict: the request body does not match the original submission.',
+      );
+    }
+
+    if (record.status === 'completed' && record.responseBody) {
+      const confession = record.confessionId
+        ? await this.dataSource
+            .getRepository(AnonymousConfession)
+            .findOne({ where: { id: record.confessionId } })
+        : null;
+
+      return {
+        found: true,
+        record,
+        cachedResponse: confession,
+        cachedStatus: record.responseStatus,
+      };
+    }
+
+    // 'processing' (ambiguous / in-flight) or 'failed' (retryable): return the
+    // record as-is so the caller can decide without mutating durable state.
+    return {
+      found: true,
+      record,
+      cachedResponse: null,
+      cachedStatus: null,
+    };
   }
 
   // ──────────────────────────────────────────────────────────────────────────

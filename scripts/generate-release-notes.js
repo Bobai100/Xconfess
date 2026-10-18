@@ -18,16 +18,27 @@
  *   --output <file>    Write to file instead of stdout
  *   --check-unreleased Fail with exit 1 if there are unreleased entries with no tag
  *   --sbom <file>      Path to SBOM/provenance manifest to validate and reference
+ *   --previous-manifest <file>  Previous deployment manifest for diffing
+ *   --previous-abi <file>       Previous ABI artifact for diffing
+ *   --check-storage    Fail with exit 1 if contract storage compatibility has
+ *                      blocking conditions (ABI removals/changes, storage
+ *                      version migration required, irreversible migrations)
  *
  * Acceptance criteria (issue #134):
  *   - Notes identify breaking changes, flags, migrations, rollback constraints,
  *     and support actions
  *   - Unreleased entries are detectable (--check-unreleased flag)
  *
+ * Acceptance criteria (issue #280):
+ *   - Release report includes a contract storage compatibility section
+ *     combining ABI diff, storage version, migration requirements, and
+ *     deployment manifest differences with explicit blocking conditions
+ *
  * Exit codes:
  *   0  Success
  *   1  --check-unreleased: unreleased entries found
  *   1  --sbom: malformed or missing provenance metadata
+ *   1  --check-storage: blocking storage compatibility conditions found
  *   2  Usage error
  */
 
@@ -48,6 +59,9 @@ function parseArgs(argv = process.argv.slice(2)) {
     output: null,
     checkUnreleased: false,
     sbom: null,
+    previousManifest: null,
+    previousAbi: null,
+    checkStorage: false,
   };
   for (let i = 0; i < argv.length; i++) {
     switch (argv[i]) {
@@ -57,6 +71,9 @@ function parseArgs(argv = process.argv.slice(2)) {
       case '--output':         opts.output = argv[++i]; break;
       case '--check-unreleased': opts.checkUnreleased = true; break;
       case '--sbom':           opts.sbom = argv[++i]; break;
+      case '--previous-manifest': opts.previousManifest = argv[++i]; break;
+      case '--previous-abi':   opts.previousAbi = argv[++i]; break;
+      case '--check-storage':  opts.checkStorage = true; break;
       case '--help': case '-h':
         console.log(fs.readFileSync(__filename, 'utf8').split('\n')
           .filter(l => l.startsWith(' *')).map(l => l.replace(/^ \* ?/, '')).join('\n'));
@@ -270,6 +287,284 @@ function getContractMetadata() {
   }
 }
 
+// ── Contract storage compatibility report ────────────────────────────────────
+// Combines ABI diff, storage version, migration requirements, and deployment
+// manifest differences into a single pre-release report with explicit
+// blocking conditions. Inputs are read from the deployment manifest and the
+// generated ABI artifacts; missing inputs are reported as blocking so a
+// release cannot silently ship without storage compatibility evidence.
+const CONTRACT_ARTIFACTS_DIR = path.join(REPO_ROOT, 'contracts', 'artifacts');
+const CONTRACT_STORAGE_VERSION_FILE = path.join(REPO_ROOT, 'contracts', 'storage-version.json');
+
+function readJsonIfExists(absPath) {
+  if (!fs.existsSync(absPath)) return { exists: false, doc: null, error: null };
+  try {
+    return { exists: true, doc: JSON.parse(fs.readFileSync(absPath, 'utf8')), error: null };
+  } catch (err) {
+    return { exists: true, doc: null, error: err.message };
+  }
+}
+
+function normalizeAbiEntries(abi) {
+  // Accept either a raw array of entries or an object with an `entries` field.
+  const entries = Array.isArray(abi) ? abi : (abi && Array.isArray(abi.entries) ? abi.entries : []);
+  return entries
+    .filter(e => e && typeof e === 'object')
+    .map(e => ({
+      kind: e.kind || e.type || 'unknown',
+      name: e.name || null,
+      inputs: Array.isArray(e.inputs) ? e.inputs.map(i => `${i.name || ''}:${i.type || ''}`) : [],
+      outputs: Array.isArray(e.outputs) ? e.outputs.map(o => o.type || '') : [],
+    }))
+    .sort((a, b) => `${a.kind}:${a.name}`.localeCompare(`${b.kind}:${b.name}`));
+}
+
+function diffAbi(previousAbi, currentAbi) {
+  const prev = normalizeAbiEntries(previousAbi);
+  const curr = normalizeAbiEntries(currentAbi);
+  const key = e => `${e.kind}:${e.name}`;
+  const prevMap = new Map(prev.map(e => [key(e), e]));
+  const currMap = new Map(curr.map(e => [key(e), e]));
+
+  const added = [];
+  const removed = [];
+  const changed = [];
+  for (const [k, e] of currMap) {
+    if (!prevMap.has(k)) {
+      added.push(e);
+    } else {
+      const before = prevMap.get(k);
+      if (JSON.stringify(before.inputs) !== JSON.stringify(e.inputs) ||
+          JSON.stringify(before.outputs) !== JSON.stringify(e.outputs)) {
+        changed.push({ before, after: e });
+      }
+    }
+  }
+  for (const [k, e] of prevMap) {
+    if (!currMap.has(k)) removed.push(e);
+  }
+  return { added, removed, changed, hasChanges: added.length + removed.length + changed.length > 0 };
+}
+
+function diffManifests(previousManifest, currentManifest) {
+  const prevContracts = (previousManifest && previousManifest.contracts) || {};
+  const currContracts = (currentManifest && currentManifest.contracts) || {};
+  const added = [];
+  const removed = [];
+  const changed = [];
+  for (const name of Object.keys(currContracts)) {
+    if (!(name in prevContracts)) {
+      added.push(name);
+    } else if (JSON.stringify(prevContracts[name]) !== JSON.stringify(currContracts[name])) {
+      changed.push(name);
+    }
+  }
+  for (const name of Object.keys(prevContracts)) {
+    if (!(name in currContracts)) removed.push(name);
+  }
+  const networkChanged = (previousManifest?.network || null) !== (currentManifest?.network || null);
+  return { added, removed, changed, networkChanged, hasChanges: added.length + removed.length + changed.length > 0 || networkChanged };
+}
+
+function buildContractStorageReport(opts = {}) {
+  const blocking = [];
+  const warnings = [];
+
+  const currentManifest = getContractMetadata();
+  if (!currentManifest) {
+    blocking.push('Deployment manifest `deployments/testnet.json` is missing or unreadable.');
+  }
+
+  const previousManifestPath = opts.previousManifest
+    ? (path.isAbsolute(opts.previousManifest) ? opts.previousManifest : path.join(REPO_ROOT, opts.previousManifest))
+    : null;
+  let previousManifest = null;
+  if (previousManifestPath) {
+    const read = readJsonIfExists(previousManifestPath);
+    if (read.error) {
+      blocking.push(`Previous deployment manifest is not valid JSON: ${read.error}`);
+    } else if (!read.exists) {
+      blocking.push(`Previous deployment manifest not found: ${opts.previousManifest}`);
+    } else {
+      previousManifest = read.doc;
+    }
+  } else {
+    warnings.push('No previous deployment manifest supplied (--previous-manifest <file>); manifest diff skipped.');
+  }
+
+  const manifestDiff = previousManifest && currentManifest
+    ? diffManifests(previousManifest, currentManifest)
+    : null;
+
+  // Storage version
+  const storageRead = readJsonIfExists(CONTRACT_STORAGE_VERSION_FILE);
+  let storageVersion = null;
+  let previousStorageVersion = null;
+  if (storageRead.error) {
+    blocking.push(`Storage version file is not valid JSON: ${storageRead.error}`);
+  } else if (!storageRead.exists) {
+    blocking.push('Storage version file `contracts/storage-version.json` is missing.');
+  } else {
+    storageVersion = storageRead.doc?.version ?? null;
+    previousStorageVersion = storageRead.doc?.previousVersion ?? null;
+    if (storageVersion === null) {
+      blocking.push('Storage version file is missing a `version` field.');
+    }
+    if (previousStorageVersion !== null && storageVersion !== null && previousStorageVersion !== storageVersion) {
+      const migrationRequired = storageRead.doc?.migrationRequired !== false;
+      if (migrationRequired) {
+        blocking.push(
+          `Storage version changed (${previousStorageVersion} → ${storageVersion}) and requires a migration. ` +
+          'Provide a migration plan and set `migrationRequired: false` only after it is applied.'
+        );
+      } else {
+        warnings.push(`Storage version changed (${previousStorageVersion} → ${storageVersion}) with migrationRequired=false.`);
+      }
+    }
+  }
+
+  // ABI diff
+  const currentAbiPath = path.join(CONTRACT_ARTIFACTS_DIR, 'abi.json');
+  const previousAbiPath = opts.previousAbi
+    ? (path.isAbsolute(opts.previousAbi) ? opts.previousAbi : path.join(REPO_ROOT, opts.previousAbi))
+    : path.join(CONTRACT_ARTIFACTS_DIR, 'abi.previous.json');
+
+  const currentAbiRead = readJsonIfExists(currentAbiPath);
+  if (currentAbiRead.error) {
+    blocking.push(`Current ABI artifact is not valid JSON: ${currentAbiRead.error}`);
+  } else if (!currentAbiRead.exists) {
+    blocking.push('Current ABI artifact `contracts/artifacts/abi.json` is missing.');
+  }
+
+  let abiDiff = null;
+  if (currentAbiRead.exists && !currentAbiRead.error) {
+    const previousAbiRead = readJsonIfExists(previousAbiPath);
+    if (previousAbiRead.error) {
+      blocking.push(`Previous ABI artifact is not valid JSON: ${previousAbiRead.error}`);
+    } else if (!previousAbiRead.exists) {
+      warnings.push('No previous ABI artifact found; ABI diff skipped.');
+    } else {
+      abiDiff = diffAbi(previousAbiRead.doc, currentAbiRead.doc);
+      if (abiDiff.removed.length > 0) {
+        blocking.push(
+          `ABI removed ${abiDiff.removed.length} entry(ies): ` +
+          abiDiff.removed.map(e => `${e.kind}:${e.name || '(anonymous)'}`).join(', ')
+        );
+      }
+      if (abiDiff.changed.length > 0) {
+        blocking.push(
+          `ABI changed ${abiDiff.changed.length} entry(ies): ` +
+          abiDiff.changed.map(c => `${c.after.kind}:${c.after.name || '(anonymous)'}`).join(', ')
+        );
+      }
+    }
+  }
+
+  // Migration requirements
+  const migrations = getMigrationMetadata();
+  const irreversible = migrations.filter(m => m.rollbackNote);
+  const risky = migrations.filter(m => m.rollbackRisk);
+  if (irreversible.length > 0) {
+    blocking.push(
+      `${irreversible.length} migration(s) have no down() method: ` +
+      irreversible.map(m => m.filename).join(', ')
+    );
+  }
+  if (risky.length > 0) {
+    warnings.push(
+      `${risky.length} migration(s) add NOT NULL columns without defaults: ` +
+      risky.map(m => m.filename).join(', ')
+    );
+  }
+
+  return {
+    ok: blocking.length === 0,
+    blocking,
+    warnings,
+    storageVersion,
+    previousStorageVersion,
+    abiDiff,
+    manifestDiff,
+    migrations: {
+      total: migrations.length,
+      irreversible: irreversible.map(m => m.filename),
+      risky: risky.map(m => m.filename),
+    },
+  };
+}
+
+function renderContractStorageReport(report) {
+  const lines = [];
+  lines.push(`## 🧱 Contract Storage Compatibility`);
+  lines.push('');
+  lines.push(`Status: ${report.ok ? '✅ no blocking conditions' : '❌ BLOCKING conditions present'}`);
+  lines.push('');
+
+  lines.push('### Storage version');
+  if (report.storageVersion === null) {
+    lines.push('- _unknown (storage-version.json missing or invalid)_');
+  } else {
+    lines.push(`- Current: \`${report.storageVersion}\``);
+    lines.push(`- Previous: \`${report.previousStorageVersion ?? '(none)'}\``);
+  }
+  lines.push('');
+
+  lines.push('### ABI diff');
+  if (!report.abiDiff) {
+    lines.push('- _ABI diff unavailable (missing previous or current artifact)_');
+  } else if (!report.abiDiff.hasChanges) {
+    lines.push('- No ABI changes detected.');
+  } else {
+    if (report.abiDiff.added.length) {
+      lines.push(`- Added: ${report.abiDiff.added.map(e => `\`${e.kind}:${e.name || '(anonymous)'}\``).join(', ')}`);
+    }
+    if (report.abiDiff.removed.length) {
+      lines.push(`- Removed: ${report.abiDiff.removed.map(e => `\`${e.kind}:${e.name || '(anonymous)'}\``).join(', ')} ⚠️`);
+    }
+    if (report.abiDiff.changed.length) {
+      lines.push(`- Changed: ${report.abiDiff.changed.map(c => `\`${c.after.kind}:${c.after.name || '(anonymous)'}\``).join(', ')} ⚠️`);
+    }
+  }
+  lines.push('');
+
+  lines.push('### Migration requirements');
+  lines.push(`- Total migrations: ${report.migrations.total}`);
+  if (report.migrations.irreversible.length) {
+    lines.push(`- Irreversible (no down()): ${report.migrations.irreversible.map(f => `\`${f}\``).join(', ')}`);
+  }
+  if (report.migrations.risky.length) {
+    lines.push(`- Rollback risk (NOT NULL without default): ${report.migrations.risky.map(f => `\`${f}\``).join(', ')}`);
+  }
+  lines.push('');
+
+  lines.push('### Deployment manifest diff');
+  if (!report.manifestDiff) {
+    lines.push('- _Manifest diff unavailable (no previous manifest supplied)_');
+  } else if (!report.manifestDiff.hasChanges) {
+    lines.push('- No manifest changes detected.');
+  } else {
+    if (report.manifestDiff.networkChanged) lines.push('- Network changed ⚠️');
+    if (report.manifestDiff.added.length) lines.push(`- Added contracts: ${report.manifestDiff.added.join(', ')}`);
+    if (report.manifestDiff.removed.length) lines.push(`- Removed contracts: ${report.manifestDiff.removed.join(', ')} ⚠️`);
+    if (report.manifestDiff.changed.length) lines.push(`- Changed contracts: ${report.manifestDiff.changed.join(', ')}`);
+  }
+  lines.push('');
+
+  lines.push('### Blocking conditions');
+  if (report.blocking.length === 0) {
+    lines.push('- None.');
+  } else {
+    for (const b of report.blocking) lines.push(`- [ ] ${b}`);
+  }
+  if (report.warnings.length > 0) {
+    lines.push('');
+    lines.push('### Warnings');
+    for (const w of report.warnings) lines.push(`- ${w}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
 // ── Feature flag scan ─────────────────────────────────────────────────────────
 function getFeatureFlags() {
   // Scan for feature flag references in the codebase
@@ -304,7 +599,7 @@ function getFeatureFlags() {
 }
 
 // ── Report generation ─────────────────────────────────────────────────────────
-function generateMarkdown(opts, commits, categories, migrations, contractMeta, featureFlags, sbom) {
+function generateMarkdown(opts, commits, categories, migrations, contractMeta, featureFlags, sbom, storageReport) {
   const lines = [];
   const now = new Date().toISOString().split('T')[0];
   const lastTag = getLastReleaseTag();
@@ -382,6 +677,11 @@ function generateMarkdown(opts, commits, categories, migrations, contractMeta, f
   }
   lines.push('');
 
+  // ── Contract storage compatibility ────────────────────────────────────────
+  if (storageReport) {
+    lines.push(renderContractStorageReport(storageReport));
+  }
+
   // ── SBOM / provenance ─────────────────────────────────────────────────────
   lines.push(`## 📦 SBOM & Provenance`);
   if (sbom && sbom.doc) {
@@ -443,6 +743,14 @@ function generateMarkdown(opts, commits, categories, migrations, contractMeta, f
   lines.push('- [ ] Support team notified of any user-visible changes');
   lines.push('- [ ] Rollback procedure confirmed (see `docs/disaster-recovery-runbook.md`)');
   lines.push('- [ ] SBOM artifact generated, validated, and attached to the release');
+  if (storageReport) {
+    if (storageReport.ok) {
+      lines.push('- [ ] Contract storage compatibility report reviewed (no blocking conditions)');
+    } else {
+      lines.push('- [ ] **BLOCKING**: Contract storage compatibility conditions resolved');
+      for (const b of storageReport.blocking) lines.push(`  - [ ] ${b}`);
+    }
+  }
   if (categories.breaking.length > 0) {
     lines.push('- [ ] **BREAKING**: Customer notification sent before deploy');
     lines.push('- [ ] **BREAKING**: Integration documentation updated');
@@ -464,7 +772,7 @@ function generateMarkdown(opts, commits, categories, migrations, contractMeta, f
   return lines.join('\n');
 }
 
-function generateJson(opts, commits, categories, migrations, contractMeta, featureFlags, sbom) {
+function generateJson(opts, commits, categories, migrations, contractMeta, featureFlags, sbom, storageReport) {
   return JSON.stringify({
     generated: new Date().toISOString(),
     from: opts.from,
@@ -483,11 +791,23 @@ function generateJson(opts, commits, categories, migrations, contractMeta, featu
     contracts: contractMeta,
     featureFlags,
     sbom: summarizeSbom(sbom),
+    contractStorage: storageReport
+      ? {
+          ok: storageReport.ok,
+          blocking: storageReport.blocking,
+          warnings: storageReport.warnings,
+          storageVersion: storageReport.storageVersion,
+          previousStorageVersion: storageReport.previousStorageVersion,
+          abiDiff: storageReport.abiDiff,
+          manifestDiff: storageReport.manifestDiff,
+          migrations: storageReport.migrations,
+        }
+      : null,
     hasUnreleased: getUnreleasedCommits().length > 0,
   }, null, 2);
 }
 
-function generateChecklist(opts, commits, categories, migrations, contractMeta, featureFlags, sbom) {
+function generateChecklist(opts, commits, categories, migrations, contractMeta, featureFlags, sbom, storageReport) {
   const checks = [];
   const hasBreaking = categories.breaking.length > 0;
   const hasMigrations = migrations.length > 0;
@@ -517,6 +837,15 @@ function generateChecklist(opts, commits, categories, migrations, contractMeta, 
   if (hasContracts) {
     checks.push('[ ] Contract manifest reviewed');
     checks.push('[!] Soroban contracts are irreversible — forward-fix only');
+  }
+  if (storageReport) {
+    if (storageReport.ok) {
+      checks.push('[ ] Contract storage compatibility report reviewed (no blocking conditions)');
+    } else {
+      checks.push('[!] BLOCKING: contract storage compatibility conditions must be resolved');
+      for (const b of storageReport.blocking) checks.push(`    [ ] ${b}`);
+    }
+    for (const w of storageReport.warnings) checks.push(`    [~] ${w}`);
   }
   if (featureFlags.length > 0) {
     checks.push(`[ ] Feature flags verified for target environment: ${featureFlags.join(', ')}`);
@@ -557,17 +886,22 @@ function main() {
     }
   }
 
+  const storageReport = buildContractStorageReport({
+    previousManifest: opts.previousManifest,
+    previousAbi: opts.previousAbi,
+  });
+
   let output;
   switch (opts.format) {
     case 'json':
-      output = generateJson(opts, commits, categories, migrations, contractMeta, featureFlags, sbom);
+      output = generateJson(opts, commits, categories, migrations, contractMeta, featureFlags, sbom, storageReport);
       break;
     case 'checklist':
-      output = generateChecklist(opts, commits, categories, migrations, contractMeta, featureFlags, sbom);
+      output = generateChecklist(opts, commits, categories, migrations, contractMeta, featureFlags, sbom, storageReport);
       break;
     case 'markdown':
     default:
-      output = generateMarkdown(opts, commits, categories, migrations, contractMeta, featureFlags, sbom);
+      output = generateMarkdown(opts, commits, categories, migrations, contractMeta, featureFlags, sbom, storageReport);
       break;
   }
 
@@ -587,6 +921,34 @@ function main() {
       process.exit(1);
     }
   }
+
+  // --check-storage: fail if contract storage compatibility has blocking conditions
+  if (opts.checkStorage) {
+    if (!storageReport.ok) {
+      console.error('\nFAIL: contract storage compatibility has blocking conditions:');
+      for (const b of storageReport.blocking) console.error(`  - ${b}`);
+      process.exit(1);
+    }
+  }
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  parseArgs,
+  parseConventionalCommit,
+  categorizeCommits,
+  validateSbom,
+  summarizeSbom,
+  getMigrationMetadata,
+  getContractMetadata,
+  diffAbi,
+  diffManifests,
+  buildContractStorageReport,
+  renderContractStorageReport,
+  generateMarkdown,
+  generateJson,
+  generateChecklist,
+};

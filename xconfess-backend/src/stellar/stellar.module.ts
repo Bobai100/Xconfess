@@ -17,6 +17,7 @@ import { SorobanEventCheckpoint } from './entities/soroban-event-checkpoint.enti
 import { AnonymousConfession } from '../confession/entities/confession.entity';
 import { Tip } from '../tipping/entities/tip.entity';
 import { SorobanEventCheckpointService } from './soroban-event-checkpoint.service';
+import { SorobanEventRangeVerifierService } from './soroban-event-range-verifier.service';
 import { StellarRpcEndpointPoolService } from './stellar-rpc-endpoint-pool.service';
 import { AccountSequenceCoordinatorService } from './account-sequence-coordinator.service';
 
@@ -42,6 +43,7 @@ import { AccountSequenceCoordinatorService } from './account-sequence-coordinato
     StellarReconciliationWorker,
     ReputationReconciliationWorker,
     SorobanEventCheckpointService,
+    SorobanEventRangeVerifierService,
     StellarRpcEndpointPoolService,
     AccountSequenceCoordinatorService,
   ],
@@ -53,6 +55,7 @@ import { AccountSequenceCoordinatorService } from './account-sequence-coordinato
     ContractService,
     DeploymentMetadataService,
     SorobanEventCheckpointService,
+    SorobanEventRangeVerifierService,
     StellarRpcEndpointPoolService,
     AccountSequenceCoordinatorService,
   ],

@@ -20,7 +20,13 @@ import { ContractService } from './contract.service';
 import { VerifyTransactionDto } from './dto/verify-transaction.dto';
 import { InvokeContractDto } from './dto/invoke-contract.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RolesGuard } from '../auth/roles.guard';
+import { Roles } from '../auth/roles.decorator';
+import { UserRole } from '../users/user.entity';
 import { StellarInvokeContractGuard } from './guards/stellar-invoke-contract.guard';
+import { EventRangeVerifierService } from './event-range-verifier.service';
+import { VerifyEventRangeDto } from './dto/verify-event-range.dto';
+import { ReprocessEventRangeDto } from './dto/reprocess-event-range.dto';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditActionType } from '../audit-log/audit-log.entity';
 import { AuthenticatedRequest } from '../auth/interfaces/jwt-payload.interface';
@@ -42,6 +48,7 @@ export class StellarController {
     private contractService: ContractService,
     private configService: ConfigService,
     private auditLogService: AuditLogService,
+    private eventRangeVerifierService: EventRangeVerifierService,
   ) {}
 
   @Get('anchors')
@@ -218,6 +225,88 @@ export class StellarController {
       });
       throw err;
     }
+  }
+
+  @Post('events/verify-range')
+  @RequestCost(COST.CHAIN) // reads ledger data from the network
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @ApiOperation({
+    summary: 'Verify indexed Soroban event ranges against ledger data (admin)',
+    description:
+      'Read-only comparison of checkpointed indexed event ranges with the ' +
+      'events returned by the network. Reports gaps and misclassifications ' +
+      'grouped by checkpoint. Never mutates indexed state.',
+  })
+  @ApiResponse({ status: 200, description: 'Event range verification report' })
+  @ApiResponse({ status: 400, description: 'Invalid range or checkpoint parameters' })
+  @ApiResponse({ status: 403, description: 'Caller is not an administrator' })
+  async verifyEventRange(
+    @Body() dto: VerifyEventRangeDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    const requestId = req.requestId as string | undefined;
+    this.logger.log({
+      message: 'Event range verification started',
+      requestId,
+      fromLedger: dto.fromLedger,
+      toLedger: dto.toLedger,
+      checkpointId: dto.checkpointId,
+    });
+    const report = await this.eventRangeVerifierService.verifyRange({
+      fromLedger: dto.fromLedger,
+      toLedger: dto.toLedger,
+      checkpointId: dto.checkpointId,
+      contractIds: dto.contractIds,
+    });
+    this.logger.log({
+      message: 'Event range verification completed',
+      requestId,
+      gaps: report.gaps.length,
+      misclassified: report.misclassified.length,
+    });
+    return report;
+  }
+
+  @Post('events/reprocess-range')
+  @RequestCost(COST.CHAIN) // re-reads ledger data and rewrites indexed ranges
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @ApiOperation({
+    summary: 'Trigger bounded reprocessing of an indexed event range (admin)',
+    description:
+      'Re-fetches a bounded ledger range and rewrites the indexed events for ' +
+      'it. The range is capped by the configured maximum span; requests that ' +
+      'exceed the cap are rejected. Only gaps or misclassifications reported ' +
+      'by the verifier should be reprocessed.',
+  })
+  @ApiResponse({ status: 200, description: 'Bounded reprocessing result' })
+  @ApiResponse({ status: 400, description: 'Invalid or oversized range' })
+  @ApiResponse({ status: 403, description: 'Caller is not an administrator' })
+  async reprocessEventRange(
+    @Body() dto: ReprocessEventRangeDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    const requestId = req.requestId as string | undefined;
+    this.logger.log({
+      message: 'Event range reprocessing started',
+      requestId,
+      fromLedger: dto.fromLedger,
+      toLedger: dto.toLedger,
+      checkpointId: dto.checkpointId,
+    });
+    const result = await this.eventRangeVerifierService.reprocessRange({
+      fromLedger: dto.fromLedger,
+      toLedger: dto.toLedger,
+      checkpointId: dto.checkpointId,
+      contractIds: dto.contractIds,
+    });
+    this.logger.log({
+      message: 'Event range reprocessing completed',
+      requestId,
+      reprocessed: result.reprocessed,
+    });
+    return result;
   }
 
   private async auditStellarInvocation(

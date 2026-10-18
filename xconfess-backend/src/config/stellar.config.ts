@@ -3,7 +3,6 @@
 import { registerAs } from '@nestjs/config';
 
 /**
-/**
  * Parse a comma-separated list of Stellar Soroban RPC endpoints.
  * Falls back to the single `STELLAR_SOROBAN_RPC_URL` (or the public testnet
  * default) when no explicit endpoint list is configured.
@@ -25,11 +24,16 @@ function parseRpcEndpoints(): string[] {
   return Array.from(new Set(endpoints));
 }
 
+function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  const normalized = value.trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+  return defaultValue;
+}
+
 /**
  * Bounded label enums for transaction latency/failure metrics.
- * These labels are intentionally closed sets so that metric cardinality
- * remains bounded and safe for aggregation.
- */
  * These labels are intentionally closed sets so that metric cardinality
  * remains bounded and safe for aggregation.
  */
@@ -289,6 +293,16 @@ export default registerAs('stellar', () => {
       Number(process.env.STELLAR_RPC_RETRY_BASE_DELAY_MS) || 1000,
     rpcRetryMaxDelayMs:
       Number(process.env.STELLAR_RPC_RETRY_MAX_DELAY_MS) || 10000,
+
+    eventVerifier: {
+      enabled: parseBoolean(process.env.STELLAR_EVENT_VERIFIER_ENABLED, false),
+      maxLedgerRange:
+        Number(process.env.STELLAR_EVENT_VERIFIER_MAX_LEDGER_RANGE) || 1000,
+      reprocessingBatchSize:
+        Number(process.env.STELLAR_EVENT_VERIFIER_REPROCESSING_BATCH_SIZE) || 100,
+      scheduleCron:
+        process.env.STELLAR_EVENT_VERIFIER_SCHEDULE_CRON || '*/15 * * * *',
+    },
 
     // Health-aware RPC failover settings.
     rpcEndpoints: parseRpcEndpoints(),

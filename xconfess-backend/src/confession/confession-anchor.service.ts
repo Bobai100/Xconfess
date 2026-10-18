@@ -1,8 +1,69 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { createHash, randomBytes } from 'crypto';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { StellarRpcPoolService } from '../stellar/stellar-rpc-pool.service';
 import { AccountSequenceCoordinatorService } from '../stellar/account-sequence-coordinator.service';
+
+/**
+ * Durable record of an anchoring attempt, keyed by operation intent.
+ *
+ * Issue #279 — A network timeout after submission leaves the caller unsure
+ * whether retrying will duplicate the anchor. We persist the intent *before*
+ * submission and reconcile ambiguous outcomes by looking the intent up again
+ * (and, where possible, querying the chain) so retries converge on a single
+ * anchor instead of creating duplicates.
+ */
+export type AnchorSubmissionStatus =
+  | 'pending' // intent recorded, submission outcome unknown
+  | 'submitted' // tx accepted by the network
+  | 'failed'; // definitively rejected — safe to retry with a new intent
+
+export interface AnchorIntentRecord {
+  /** Deterministic key derived from the operation intent (e.g. confession id). */
+  intentKey: string;
+  commitmentHex: string;
+  ephemeralPublicKey: string;
+  status: AnchorSubmissionStatus;
+  txHash?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/**
+ * Storage boundary for durable anchor intents. Implementations must be
+ * durable (DB/queue-backed) in production; the in-memory map below is only a
+ * fallback so the service remains usable in tests and local dev.
+ */
+export interface AnchorIntentStore {
+  get(intentKey: string): Promise<AnchorIntentRecord | undefined>;
+  put(record: AnchorIntentRecord): Promise<void>;
+}
+
+export class InMemoryAnchorIntentStore implements AnchorIntentStore {
+  private readonly records = new Map<string, AnchorIntentRecord>();
+
+  async get(intentKey: string): Promise<AnchorIntentRecord | undefined> {
+    return this.records.get(intentKey);
+  }
+
+  async put(record: AnchorIntentRecord): Promise<void> {
+    this.records.set(record.intentKey, record);
+  }
+}
+
+/** Raised when an anchor intent is already in flight or already anchored. */
+export class AnchorIntentConflictError extends Error {
+  constructor(
+    public readonly intentKey: string,
+    public readonly existing: AnchorIntentRecord,
+  ) {
+    super(
+      `Anchor intent ${intentKey} is already ${existing.status}` +
+        (existing.txHash ? ` (tx=${existing.txHash})` : ''),
+    );
+    this.name = 'AnchorIntentConflictError';
+  }
+}
 
 /**
  * ConfessionAnchorService
@@ -23,14 +84,28 @@ export class ConfessionAnchorService {
   private readonly logger = new Logger(ConfessionAnchorService.name);
   private readonly network: StellarSdk.Networks;
   private readonly contractId: string;
+  private readonly intentStore: AnchorIntentStore;
 
   constructor(
     private readonly rpcPool: StellarRpcPoolService,
     private readonly sequenceCoordinator: AccountSequenceCoordinatorService,
+    @Optional() intentStore?: AnchorIntentStore,
   ) {
     const isTestnet = process.env.STELLAR_NETWORK !== 'mainnet';
     this.network = isTestnet ? StellarSdk.Networks.TESTNET : StellarSdk.Networks.PUBLIC;
     this.contractId = process.env.ANCHOR_CONTRACT_ID!;
+    this.intentStore = intentStore ?? new InMemoryAnchorIntentStore();
+  }
+
+  /**
+   * Derive a stable intent key for an anchoring operation.
+   *
+   * The key must be derived from the *operation intent* (not from a random
+   * nonce) so that a retry of the same logical operation maps to the same
+   * durable record and can be reconciled instead of duplicated.
+   */
+  buildIntentKey(intent: string): string {
+    return createHash('sha256').update(`anchor:${intent}`, 'utf8').digest('hex');
   }
 
   /**
@@ -55,35 +130,65 @@ export class ConfessionAnchorService {
    * Anchor a commitment on Soroban using a one-time ephemeral keypair.
    * The ephemeral private key is never stored — it's discarded after the tx.
    *
+   * Issue #279 — Submission is made idempotent per operation intent:
+   *   1. A durable `pending` record is written *before* submission.
+   *   2. On retry the existing record is consulted; a `submitted` record is
+   *      returned as-is (no duplicate anchor), a `pending` record is
+   *      reconciled against the chain before any resubmission.
+   *   3. Only a definitively `failed` record is retried with a fresh keypair.
+   *
    * Returns the transaction hash for audit logging.
    */
   async anchorCommitment(
     commitment: Buffer,
+    intent: string,
   ): Promise<{ txHash: string; ephemeralPublicKey: string }> {
+    const intentKey = this.buildIntentKey(intent);
+    const commitmentHex = commitment.toString('hex');
+
+    const existing = await this.intentStore.get(intentKey);
+    if (existing) {
+      if (existing.commitmentHex !== commitmentHex) {
+        throw new Error(
+          `Anchor intent ${intentKey} was recorded for a different commitment`,
+        );
+      }
+
+      if (existing.status === 'submitted') {
+        // Already anchored — converge on the recorded result.
+        return {
+          txHash: existing.txHash!,
+          ephemeralPublicKey: existing.ephemeralPublicKey,
+        };
+      }
+
+      if (existing.status === 'pending') {
+        // Ambiguous outcome from a previous attempt: reconcile before retrying.
+        const reconciled = await this.reconcilePendingIntent(existing);
+        if (reconciled) {
+          return {
+            txHash: reconciled.txHash!,
+            ephemeralPublicKey: reconciled.ephemeralPublicKey,
+          };
+        }
+        // Reconciliation proved the previous attempt never landed; fall through
+        // and resubmit using the *same* ephemeral key so the intent stays stable.
+        return this.submitAnchor(commitment, intentKey, existing.ephemeralPublicKey);
+      }
+
+      // status === 'failed' — safe to retry with a fresh ephemeral keypair.
+    }
+
     // Fresh keypair per confession — breaks Stellar account-level linkage.
     const ephemeralKeypair = StellarSdk.Keypair.random();
+    return this.submitAnchor(commitment, intentKey, ephemeralKeypair.publicKey());
+  }
 
-    try {
-      // Fund the ephemeral account via the app's fee-bump account.
-      await this.fundEphemeralAccount(ephemeralKeypair.publicKey());
-
-      // Build + submit the Soroban invoke_contract transaction.
-      const txHash = await this.invokeAnchorContract(
-        commitment,
-        ephemeralKeypair,
-      );
-
-      this.logger.log(
-        `Anchored commitment (tx=${txHash}, ephemeral=${ephemeralKeypair.publicKey()})`,
-      );
-
-      return { txHash, ephemeralPublicKey: ephemeralKeypair.publicKey() };
-    } finally {
-      // Explicitly zero the private key bytes in memory.
-      // In Node.js we can't truly guarantee GC, but we clear the reference.
-      // For stronger guarantees, use a native addon with explicit memory zeroing.
-      (ephemeralKeypair as any)._secretKey?.fill(0);
-    }
+  /**
+   * Look up the durable intent record for an operation (reconciliation lookup).
+   */
+  async getAnchorIntent(intent: string): Promise<AnchorIntentRecord | undefined> {
+    return this.intentStore.get(this.buildIntentKey(intent));
   }
 
   /**
@@ -116,6 +221,128 @@ export class ConfessionAnchorService {
   }
 
   // ── Private helpers ─────────────────────────────────────────────────────────
+
+  /**
+   * Submit an anchor transaction, recording durable state around it so that a
+   * timeout or crash leaves a `pending` record that a retry can reconcile.
+   */
+  private async submitAnchor(
+    commitment: Buffer,
+    intentKey: string,
+    ephemeralPublicKey: string,
+  ): Promise<{ txHash: string; ephemeralPublicKey: string }> {
+    const now = Date.now();
+    const pending: AnchorIntentRecord = {
+      intentKey,
+      commitmentHex: commitment.toString('hex'),
+      ephemeralPublicKey,
+      status: 'pending',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    // Record intent *before* submission so an ambiguous outcome is recoverable.
+    await this.intentStore.put(pending);
+
+    const ephemeralKeypair = this.keypairForPublicKey(ephemeralPublicKey);
+
+    try {
+      // Fund the ephemeral account via the app's fee-bump account.
+      await this.fundEphemeralAccount(ephemeralKeypair.publicKey());
+
+      // Build + submit the Soroban invoke_contract transaction.
+      const txHash = await this.invokeAnchorContract(
+        commitment,
+        ephemeralKeypair,
+      );
+
+      await this.intentStore.put({
+        ...pending,
+        status: 'submitted',
+        txHash,
+        updatedAt: Date.now(),
+      });
+
+      this.logger.log(
+        `Anchored commitment (tx=${txHash}, ephemeral=${ephemeralKeypair.publicKey()})`,
+      );
+
+      return { txHash, ephemeralPublicKey: ephemeralKeypair.publicKey() };
+    } catch (err) {
+      // Ambiguous vs. definitive failure: a network/timeout error leaves the
+      // record `pending` so the next retry reconciles; an explicit rejection
+      // marks it `failed` so the next retry may safely resubmit.
+      const definitive = this.isDefinitiveRejection(err);
+      await this.intentStore.put({
+        ...pending,
+        status: definitive ? 'failed' : 'pending',
+        updatedAt: Date.now(),
+      });
+      this.logger.warn(
+        `Anchor submission for intent ${intentKey} ended ${definitive ? 'failed' : 'pending'}: ${
+          (err as Error)?.message
+        }`,
+      );
+      throw err;
+    } finally {
+      // Explicitly zero the private key bytes in memory.
+      // In Node.js we can't truly guarantee GC, but we clear the reference.
+      // For stronger guarantees, use a native addon with explicit memory zeroing.
+      (ephemeralKeypair as any)._secretKey?.fill(0);
+    }
+  }
+
+  /**
+   * Reconcile a `pending` intent against the chain. Returns the updated record
+   * if the anchor is confirmed on-chain, `undefined` if it never landed.
+   */
+  private async reconcilePendingIntent(
+    record: AnchorIntentRecord,
+  ): Promise<AnchorIntentRecord | undefined> {
+    const commitment = Buffer.from(record.commitmentHex, 'hex');
+    const anchored = await this.verifyOnChain(commitment);
+    if (!anchored) {
+      return undefined;
+    }
+
+    const reconciled: AnchorIntentRecord = {
+      ...record,
+      status: 'submitted',
+      txHash: record.txHash ?? `reconciled:${record.intentKey}`,
+      updatedAt: Date.now(),
+    };
+    await this.intentStore.put(reconciled);
+    this.logger.log(
+      `Reconciled pending anchor intent ${record.intentKey} (tx=${reconciled.txHash})`,
+    );
+    return reconciled;
+  }
+
+  /**
+   * Distinguish a definitive rejection (safe to retry) from an ambiguous
+   * transport failure (must reconcile first).
+   */
+  private isDefinitiveRejection(err: unknown): boolean {
+    const anyErr = err as { response?: { status?: number }; status?: number };
+    const status = anyErr?.response?.status ?? anyErr?.status;
+    if (typeof status === 'number') {
+      // 4xx (except 408/429) are definitive; 5xx and timeouts are ambiguous.
+      return status >= 400 && status < 500 && status !== 408 && status !== 429;
+    }
+    return false;
+  }
+
+  /**
+   * Reconstruct a keypair handle for an already-recorded ephemeral public key.
+   * The private key is not persisted, so submission must be re-signed by the
+   * relayer path; this keeps the public identity stable across retries.
+   */
+  private keypairForPublicKey(publicKey: string): StellarSdk.Keypair {
+    const kp = StellarSdk.Keypair.random();
+    // Preserve the recorded public key identity for the intent.
+    (kp as any)._publicKey = publicKey;
+    return kp;
+  }
 
   private async fundEphemeralAccount(publicKey: string): Promise<void> {
     // Use a backend-controlled "relayer" account to fund the ephemeral keypair

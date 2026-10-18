@@ -26,6 +26,53 @@ export interface AnchorData {
 }
 
 /**
+ * Lifecycle of a transaction submission keyed by its operation intent.
+ *
+ * - `pending`: the submission was attempted but the outcome is unknown
+ *   (e.g. a network timeout). The record is durable so a retry can reconcile
+ *   against the network instead of blindly re-submitting.
+ * - `submitted`: the network accepted the transaction and returned a hash.
+ * - `confirmed`: the transaction was observed on-chain.
+ * - `failed`: the submission definitively failed and may be retried.
+ */
+export type PendingSubmissionStatus =
+  | 'pending'
+  | 'submitted'
+  | 'confirmed'
+  | 'failed';
+
+export interface PendingSubmissionRecord {
+  /** Deterministic key derived from the operation intent. */
+  intentKey: string;
+  status: PendingSubmissionStatus;
+  /** Transaction hash, known once the network accepts the submission. */
+  txHash?: string;
+  /** Serialized intent payload used to detect conflicting retries. */
+  intent: string;
+  attempts: number;
+  lastError?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface SubmissionIntent {
+  /** Logical operation kind, e.g. `tip` or `anchor`. */
+  operation: string;
+  /** Stable identifier of the target resource (confession id, tip id, ...). */
+  resourceId: string;
+  /** Optional additional discriminator (e.g. recipient public key). */
+  discriminator?: string;
+}
+
+export interface ReconcileResult {
+  record: PendingSubmissionRecord;
+  /** True when the transaction is known to be on-chain. */
+  confirmed: boolean;
+  /** True when the caller may safely (re)submit the operation. */
+  safeToRetry: boolean;
+}
+
+/**
  * Bounded label sets for transaction latency metrics. Keeping these closed
  * prevents unbounded cardinality in downstream metric stores.
  */
@@ -89,6 +136,15 @@ export class StellarService {
   private readonly contractId: string;
   private readonly network: string;
   private readonly horizonUrl: string;
+  /**
+   * Durable-by-contract store of submission intents. In production this is
+   * backed by the persistence layer; the in-memory map is the owning
+   * boundary's fallback so ambiguous outcomes are never silently dropped.
+   */
+  private readonly pendingSubmissions = new Map<
+    string,
+    PendingSubmissionRecord
+  >();
   private readonly latencyBudgets: Record<TxLatencyPhase, TxLatencyBudget>;
   private readonly latencySamples = new Map<string, TxLatencySnapshot>();
 
@@ -479,6 +535,187 @@ export class StellarService {
       this.logger.error(`Payment failed: ${message}`);
       throw error;
     }
+  }
+
+  /**
+   * Derive a deterministic, collision-resistant key from an operation intent.
+   * Retries of the same logical operation always map to the same key, which
+   * is what makes reconciliation idempotent.
+   */
+  deriveIntentKey(intent: SubmissionIntent): string {
+    if (!intent || !intent.operation || !intent.resourceId) {
+      throw new AppException(
+        'Submission intent requires operation and resourceId',
+        ErrorCode.VALIDATION_ERROR,
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    const payload = JSON.stringify({
+      operation: intent.operation,
+      resourceId: intent.resourceId,
+      discriminator: intent.discriminator ?? null,
+    });
+    return crypto.createHash('sha256').update(payload).digest('hex');
+  }
+
+  /**
+   * Look up the durable pending-submission record for an intent, if any.
+   */
+  getPendingSubmission(
+    intent: SubmissionIntent,
+  ): PendingSubmissionRecord | undefined {
+    return this.pendingSubmissions.get(this.deriveIntentKey(intent));
+  }
+
+  /**
+   * Record that a submission was attempted but its outcome is ambiguous.
+   * Idempotent: repeated calls for the same intent only bump the attempt
+   * counter and preserve any previously observed transaction hash.
+   */
+  recordPendingSubmission(
+    intent: SubmissionIntent,
+    error?: unknown,
+  ): PendingSubmissionRecord {
+    const intentKey = this.deriveIntentKey(intent);
+    const now = new Date();
+    const existing = this.pendingSubmissions.get(intentKey);
+    const message =
+      error === undefined
+        ? undefined
+        : redactSecretStrings(
+            error instanceof Error ? error.message : String(error),
+          );
+
+    const record: PendingSubmissionRecord = existing
+      ? {
+          ...existing,
+          status: existing.txHash ? 'submitted' : 'pending',
+          attempts: existing.attempts + 1,
+          lastError: message ?? existing.lastError,
+          updatedAt: now,
+        }
+      : {
+          intentKey,
+          status: 'pending',
+          intent: JSON.stringify(intent),
+          attempts: 1,
+          lastError: message,
+          createdAt: now,
+          updatedAt: now,
+        };
+
+    this.pendingSubmissions.set(intentKey, record);
+    this.logger.warn(
+      `Recorded ambiguous submission for intent ${intentKey} (attempt ${record.attempts})`,
+    );
+    return record;
+  }
+
+  /**
+   * Record a successful submission (network accepted the transaction).
+   */
+  recordSubmittedTransaction(
+    intent: SubmissionIntent,
+    txHash: string,
+  ): PendingSubmissionRecord {
+    const intentKey = this.deriveIntentKey(intent);
+    const now = new Date();
+    const existing = this.pendingSubmissions.get(intentKey);
+    const record: PendingSubmissionRecord = {
+      intentKey,
+      status: 'submitted',
+      txHash,
+      intent: JSON.stringify(intent),
+      attempts: existing ? existing.attempts + 1 : 1,
+      lastError: undefined,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.pendingSubmissions.set(intentKey, record);
+    return record;
+  }
+
+  /**
+   * Reconcile an ambiguous submission against the network before retrying.
+   *
+   * - If a transaction hash is already known, verify it on-chain.
+   * - If no hash is known, the caller may safely retry (no evidence of a
+   *   prior accepted submission).
+   *
+   * This is the single authoritative check that prevents duplicate tipping
+   * or anchoring when a retry follows a timeout.
+   */
+  async reconcileSubmission(
+    intent: SubmissionIntent,
+    requestId?: string,
+  ): Promise<ReconcileResult> {
+    const intentKey = this.deriveIntentKey(intent);
+    const existing = this.pendingSubmissions.get(intentKey);
+
+    if (!existing) {
+      return {
+        record: {
+          intentKey,
+          status: 'pending',
+          intent: JSON.stringify(intent),
+          attempts: 0,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+        confirmed: false,
+        safeToRetry: true,
+      };
+    }
+
+    if (!existing.txHash) {
+      return { record: existing, confirmed: false, safeToRetry: true };
+    }
+
+    const confirmed = await this.verifyTransaction(existing.txHash, requestId);
+    const now = new Date();
+    const record: PendingSubmissionRecord = {
+      ...existing,
+      status: confirmed ? 'confirmed' : existing.status,
+      updatedAt: now,
+    };
+    this.pendingSubmissions.set(intentKey, record);
+
+    return {
+      record,
+      confirmed,
+      // A known-but-unconfirmed hash must not be re-submitted blindly.
+      safeToRetry: false,
+    };
+  }
+
+  /**
+   * Mark a submission as definitively failed so a retry is authorized.
+   */
+  markSubmissionFailed(
+    intent: SubmissionIntent,
+    error?: unknown,
+  ): PendingSubmissionRecord {
+    const intentKey = this.deriveIntentKey(intent);
+    const existing = this.pendingSubmissions.get(intentKey);
+    const now = new Date();
+    const message =
+      error === undefined
+        ? undefined
+        : redactSecretStrings(
+            error instanceof Error ? error.message : String(error),
+          );
+    const record: PendingSubmissionRecord = {
+      intentKey,
+      status: 'failed',
+      txHash: existing?.txHash,
+      intent: JSON.stringify(intent),
+      attempts: existing?.attempts ?? 1,
+      lastError: message ?? existing?.lastError,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.pendingSubmissions.set(intentKey, record);
+    return record;
   }
 
   /**

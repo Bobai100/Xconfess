@@ -3,6 +3,16 @@ use crate::confession::Confession;
 use crate::reaction::Reaction;
 use crate::report::Report;
 
+/// Current on-chain storage layout version.
+///
+/// Bump this whenever the persisted storage layout changes in a way that
+/// requires a migration. The pre-release compatibility report reads this
+/// value as the deterministic source of truth for the storage version.
+pub const STORAGE_VERSION: u32 = 1;
+
+/// Minimum storage version that can be upgraded in place without a migration.
+pub const MIN_COMPATIBLE_STORAGE_VERSION: u32 = 1;
+
 /// Snapshot summaries for indexer consumption
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +24,30 @@ pub struct CheckpointSummary {
     pub latest_reaction_id: u64,
     pub latest_report_id: u64,
     pub version_marker: u32, // allows backward-compatible upgrades
+    /// Storage layout version the snapshot was produced from.
+    pub storage_version: u32,
+    /// Whether an upgrade from the previous release requires a migration.
+    pub migration_required: bool,
+}
+
+/// Returns whether a migration is required to move from `from_version` to
+/// `to_version`.
+///
+/// Semantics:
+/// - Identical versions never require a migration.
+/// - Downgrades are rejected (treated as requiring a migration) because the
+///   on-chain layout cannot be safely rolled back in place.
+/// - Upgrades require a migration whenever the source version is below
+///   [`MIN_COMPATIBLE_STORAGE_VERSION`] or the target version is newer than
+///   the source.
+pub fn migration_required(from_version: u32, to_version: u32) -> bool {
+    if from_version == to_version {
+        return false;
+    }
+    if to_version < from_version {
+        return true;
+    }
+    from_version < MIN_COMPATIBLE_STORAGE_VERSION || to_version > from_version
 }
 
 /// Snapshot page for paginated reading
@@ -49,6 +83,8 @@ pub fn get_checkpoint_summary(
         latest_reaction_id,
         latest_report_id,
         version_marker: 1,
+        storage_version: STORAGE_VERSION,
+        migration_required: migration_required(MIN_COMPATIBLE_STORAGE_VERSION, STORAGE_VERSION),
     }
 }
 

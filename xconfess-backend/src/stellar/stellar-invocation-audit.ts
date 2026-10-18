@@ -8,7 +8,14 @@ export type StellarInvocationOutcome =
   | 'success'
   | 'failed'
   | 'denied'
+  | 'pending'
   | 'partial';
+
+export type StellarReconciliationResult =
+  | 'confirmed'
+  | 'not_found'
+  | 'still_pending'
+  | 'failed';
 
 export type StellarCompensatingAction =
   | 'none'
@@ -46,6 +53,10 @@ interface BuildStellarInvocationAuditMetadataOptions {
   expectedSourceAccount?: string | null;
   authorizedScope?: string | null;
   requiredScopes?: readonly string[] | null;
+  operationIntent?: string | null;
+  pendingStatus?: string | null;
+  reconciliationResult?: StellarReconciliationResult | null;
+  reconciliationAttempts?: number | null;
   scopeReview?: StellarAuthorizationScopeReview | null;
 }
 
@@ -130,6 +141,25 @@ export function buildStellarInvocationAuditMetadata(
 
   if (options.requiredScopes && options.requiredScopes.length > 0) {
     metadata.requiredScopes = [...options.requiredScopes];
+  }
+
+  if (options.operationIntent) {
+    metadata.operationIntent = options.operationIntent;
+  }
+
+  if (options.pendingStatus) {
+    metadata.pendingStatus = options.pendingStatus;
+  }
+
+  if (options.reconciliationResult) {
+    metadata.reconciliationResult = options.reconciliationResult;
+  }
+
+  if (
+    typeof options.reconciliationAttempts === 'number' &&
+    Number.isFinite(options.reconciliationAttempts)
+  ) {
+    metadata.reconciliationAttempts = options.reconciliationAttempts;
   }
 
   if (options.scopeReview) {
