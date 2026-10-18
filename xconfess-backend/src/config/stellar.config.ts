@@ -3,7 +3,33 @@
 import { registerAs } from '@nestjs/config';
 
 /**
+/**
+ * Parse a comma-separated list of Stellar Soroban RPC endpoints.
+ * Falls back to the single `STELLAR_SOROBAN_RPC_URL` (or the public testnet
+ * default) when no explicit endpoint list is configured.
+ */
+function parseRpcEndpoints(): string[] {
+  const raw = process.env.STELLAR_SOROBAN_RPC_URLS;
+  const fallback =
+    process.env.STELLAR_SOROBAN_RPC_URL ||
+    'https://soroban-rpc-testnet.stellar.org';
+
+  const endpoints = (raw ? raw.split(',') : [])
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0);
+
+  if (endpoints.length === 0) {
+    endpoints.push(fallback);
+  }
+
+  return Array.from(new Set(endpoints));
+}
+
+/**
  * Bounded label enums for transaction latency/failure metrics.
+ * These labels are intentionally closed sets so that metric cardinality
+ * remains bounded and safe for aggregation.
+ */
  * These labels are intentionally closed sets so that metric cardinality
  * remains bounded and safe for aggregation.
  */
@@ -263,6 +289,35 @@ export default registerAs('stellar', () => {
       Number(process.env.STELLAR_RPC_RETRY_BASE_DELAY_MS) || 1000,
     rpcRetryMaxDelayMs:
       Number(process.env.STELLAR_RPC_RETRY_MAX_DELAY_MS) || 10000,
+
+    // Health-aware RPC failover settings.
+    rpcEndpoints: parseRpcEndpoints(),
+    rpcHealthProbeIntervalMs:
+      Number(process.env.STELLAR_RPC_HEALTH_PROBE_INTERVAL_MS) || 30000,
+    rpcHealthProbeTimeoutMs:
+      Number(process.env.STELLAR_RPC_HEALTH_PROBE_TIMEOUT_MS) || 5000,
+    rpcHealthFailureThreshold:
+      Number(process.env.STELLAR_RPC_HEALTH_FAILURE_THRESHOLD) || 2,
+    rpcHealthRecoveryThreshold:
+      Number(process.env.STELLAR_RPC_HEALTH_RECOVERY_THRESHOLD) || 2,
+    rpcCooldownMs: Number(process.env.STELLAR_RPC_COOLDOWN_MS) || 60000,
+
+    // Read calls are idempotent and may retry across healthy endpoints.
+    rpcReadMaxAttempts: Number(process.env.STELLAR_RPC_READ_MAX_ATTEMPTS) || 3,
+    rpcReadRetryBaseDelayMs:
+      Number(process.env.STELLAR_RPC_READ_RETRY_BASE_DELAY_MS) || 500,
+    rpcReadRetryMaxDelayMs:
+      Number(process.env.STELLAR_RPC_READ_RETRY_MAX_DELAY_MS) || 5000,
+
+    // Writes only fail over when the previous endpoint did not accept them.
+    rpcSubmitMaxAttempts:
+      Number(process.env.STELLAR_RPC_SUBMIT_MAX_ATTEMPTS) || 2,
+    rpcSubmitRetryBaseDelayMs:
+      Number(process.env.STELLAR_RPC_SUBMIT_RETRY_BASE_DELAY_MS) || 1000,
+    rpcSubmitRetryMaxDelayMs:
+      Number(process.env.STELLAR_RPC_SUBMIT_RETRY_MAX_DELAY_MS) || 5000,
+    rpcSubmitFailoverEnabled:
+      (process.env.STELLAR_RPC_SUBMIT_FAILOVER_ENABLED || 'true') === 'true',
 
     // Network-specific transaction latency and failure budgets
     transactionLatencyBudgets,

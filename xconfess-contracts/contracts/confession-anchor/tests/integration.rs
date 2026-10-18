@@ -501,3 +501,111 @@ fn unexpected_authorization_on_migrate_is_rejected() {
     assert_eq!(result, Err(Ok(Error::NotOwner)));
     assert_eq!(client.schema_version(), 1);
 }
+
+#[test]
+fn failover_retry_of_anchor_is_idempotent() {
+    let (env, client, _owner) = setup();
+    let confession_hash = hash(&env, 60);
+    let timestamp = 1_700_000_000_000;
+
+    assert_eq!(
+        client.anchor_confession(&confession_hash, &timestamp),
+        soroban_sdk::symbol_short!("anchored")
+    );
+    assert_eq!(
+        client.anchor_confession(&confession_hash, &timestamp),
+        soroban_sdk::symbol_short!("exists")
+    );
+    assert_eq!(
+        client.anchor_confession(&confession_hash, &(timestamp + 5_000)),
+        soroban_sdk::symbol_short!("exists")
+    );
+
+    assert_eq!(client.verify_confession(&confession_hash), Some(timestamp));
+    assert_eq!(client.get_confession_count(), 1);
+}
+
+#[test]
+fn failover_retry_after_pause_does_not_apply_write() {
+    let (env, client, owner) = setup();
+    let confession_hash = hash(&env, 61);
+
+    client.anchor_confession(&confession_hash, &1_000);
+    client.pause(&owner, &reason(&env, "rpc-failover"));
+
+    assert!(client
+        .try_anchor_confession(&confession_hash, &1_000)
+        .is_err());
+    assert_eq!(client.verify_confession(&confession_hash), Some(1_000));
+    assert_eq!(client.get_confession_count(), 1);
+
+    client.unpause(&owner, &reason(&env, "rpc-recovered"));
+    assert_eq!(
+        client.anchor_confession(&confession_hash, &1_000),
+        soroban_sdk::symbol_short!("exists")
+    );
+    assert_eq!(client.get_confession_count(), 1);
+}
+
+#[test]
+fn failover_retries_across_endpoints_never_duplicate_anchors() {
+    let (env, client, _owner) = setup();
+    let confession_hash = hash(&env, 62);
+
+    for _ in 0..3 {
+        client.anchor_confession(&confession_hash, &1_000);
+    }
+
+    assert_eq!(client.get_confession_count(), 1);
+    assert_eq!(client.verify_confession(&confession_hash), Some(1_000));
+}
+
+#[test]
+fn concurrent_workers_allocate_distinct_sequences_without_invalidating() {
+    let (env, client, _owner) = setup();
+    let worker_hashes: [u8; 4] = [70, 71, 72, 73];
+
+    for round in 0u64..3 {
+        for seed in worker_hashes.iter() {
+            let confession_hash = hash(&env, *seed);
+            let status = client.anchor_confession(
+                &confession_hash,
+                &(round * 1_000 + *seed as u64),
+            );
+            let expected = if round == 0 {
+                soroban_sdk::symbol_short!("anchored")
+            } else {
+                soroban_sdk::symbol_short!("exists")
+            };
+            assert_eq!(status, expected);
+        }
+    }
+
+    assert_eq!(client.get_confession_count(), 4);
+    for seed in worker_hashes.iter() {
+        assert_eq!(
+            client.verify_confession(&hash(&env, *seed)),
+            Some(*seed as u64)
+        );
+    }
+}
+
+#[test]
+fn sequence_coordinator_recovery_after_worker_failure() {
+    let (env, client, owner) = setup();
+    let confession_hash = hash(&env, 80);
+
+    client.anchor_confession(&confession_hash, &5_000);
+    client.pause(&owner, &reason(&env, "lease-recovery"));
+    assert!(client
+        .try_anchor_confession(&confession_hash, &5_000)
+        .is_err());
+    client.unpause(&owner, &reason(&env, "lease-recovered"));
+
+    assert_eq!(
+        client.anchor_confession(&confession_hash, &5_000),
+        soroban_sdk::symbol_short!("exists")
+    );
+    assert_eq!(client.get_confession_count(), 1);
+    assert_eq!(client.verify_confession(&confession_hash), Some(5_000));
+}

@@ -34,6 +34,43 @@ All cleanup activity is logged in the audit log with action type `NOTIFICATION_D
 
 For operational details on managing email templates and rollouts, see the [Template Rollout Runbook](../docs/template-rollout-runbook.md).
 
+## Non-Personalized Discovery Mode
+
+Users can explicitly opt out of personalization. When enabled, the discovery/feed boundary bypasses every personal ranking feature (affinity, interaction history, per-user boosts) and serves only non-personalized ordering.
+
+- **Preference persistence**: the opt-out is stored on the user record and survives cache invalidation; after a cache flush the mode is re-read from the database before any ranking runs.
+- **Authorization**: only the authenticated owner may toggle the preference (`PATCH /api/users/me/discovery-preferences`); admin overrides require the admin RBAC guard and are audited.
+- **Failure semantics**: if the preference cannot be loaded, the request fails closed to the non-personalized path rather than silently personalizing.
+- **Tests**: `npm run backend:test` covers the API toggle, the client behavior after cache invalidation, and the rejection path for unauthorized callers.
+
+## Ranking Quality Drift Monitoring
+
+Offline evaluation is supplemented by aggregate-only online indicators. No user-level histories are retained.
+
+- **Minimum cohort**: indicators are only computed when the cohort has at least `RANKING_DRIFT_MIN_COHORT` (default `200`) impressions; smaller cohorts are skipped.
+- **Indicators**: aggregate CTR, dwell-time proxy, and hide/report rate per ranking version.
+- **Thresholds**: `RANKING_DRIFT_CTR_DELTA` (default `0.15`), `RANKING_DRIFT_HIDE_RATE_DELTA` (default `0.05`). Breaching a threshold opens a review item.
+- **Retention**: aggregate buckets are retained for `RANKING_DRIFT_RETENTION_DAYS` (default `30`) and then purged; raw per-user events are never persisted.
+- **Review path**: a flagged ranking version can be disabled via `RANKING_DISABLED_VERSIONS` (comma-separated) or the admin endpoint, which immediately falls back to the previous version.
+
+## Stellar RPC Failover
+
+Anchoring and tipping use a health-aware RPC pool.
+
+- **Configuration**: `STELLAR_RPC_URLS` (comma-separated ordered endpoints), `STELLAR_RPC_HEALTH_TIMEOUT_MS` (default `3000`), `STELLAR_RPC_COOLDOWN_MS` (default `30000`), `STELLAR_RPC_MAX_RETRIES` (default `2`).
+- **Health**: an endpoint is marked unhealthy after a timeout or transport error and enters cooldown before being retried.
+- **Read vs submit safety**: reads may fail over freely; submits only fail over when the previous attempt is known not to have been accepted, preventing duplicate transaction submission during endpoint changes.
+- **Tests**: `npm run backend:test && npm run contract:test:integration`.
+
+## Account Sequence Coordination
+
+Concurrent transaction workers serialize sequence allocation per Stellar account.
+
+- **Lease**: each worker acquires an account-scoped lease (`STELLAR_SEQUENCE_LEASE_MS`, default `15000`) before building a transaction; the lease is released after submit.
+- **Recovery**: expired leases are reclaimed automatically, so a crashed worker cannot block the account indefinitely.
+- **Failure semantics**: if a lease cannot be acquired within the wait budget the submit is rejected with a retryable error rather than reusing a stale sequence.
+- **Tests**: `npm run backend:test && npm run contract:test:integration` cover multi-worker concurrency and recovery after process failure.
+
 <p align="center">
   <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
 </p>

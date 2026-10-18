@@ -84,6 +84,13 @@ export class User {
   })
   privacySettings!: PrivacySettings;
 
+  /**
+   * Explicit personalization preference. When false, the user has opted out
+   * of personalized ranking and discovery results must be non-personalized.
+   */
+  @Column({ name: 'personalization_enabled', default: true })
+  personalizationEnabled!: boolean;
+
   // Two-factor authentication (TOTP) fields
   @Column({ name: 'totp_enabled', default: false })
   totpEnabled!: boolean;
@@ -134,6 +141,10 @@ export class User {
   hasDataProcessingConsent(): boolean {
     if (!this.privacySettings) return true;
     return this.privacySettings.dataProcessingConsent !== false;
+  }
+
+  isPersonalizationEnabled(): boolean {
+    return this.personalizationEnabled !== false;
   }
 
   @CreateDateColumn()

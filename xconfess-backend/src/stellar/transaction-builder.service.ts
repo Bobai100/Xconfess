@@ -5,6 +5,10 @@ import { StellarConfigService } from './stellar-config.service';
 import { ITransactionOptions } from './interfaces/stellar-config.interface';
 import { redactSecretStrings } from '../utils/redact-secrets';
 import {
+  AccountSequenceCoordinator,
+  AccountSequenceLease,
+} from './account-sequence-coordinator.service';
+import {
   TransactionLatencyService,
   TransactionOperationClass,
   TransactionPhase,
@@ -16,6 +20,7 @@ export class TransactionBuilderService {
 
   constructor(
     private stellarConfig: StellarConfigService,
+    private sequenceCoordinator: AccountSequenceCoordinator,
     private transactionLatency: TransactionLatencyService,
   ) {}
 
@@ -32,11 +37,13 @@ export class TransactionBuilderService {
       operations,
     );
     const startedAt = Date.now();
+    const lease = await this.sequenceCoordinator.acquire(sourcePublicKey);
     try {
-      const transaction = await this.buildTransactionInternal(
+      const transaction = await this.buildTransactionWithLease(
         sourcePublicKey,
         operations,
         options,
+        lease,
       );
       this.transactionLatency.record(
         TransactionPhase.BUILD,
@@ -53,13 +60,16 @@ export class TransactionBuilderService {
         false,
       );
       throw error;
+    } finally {
+      await this.sequenceCoordinator.release(lease);
     }
   }
 
-  private async buildTransactionInternal(
+  private async buildTransactionWithLease(
     sourcePublicKey: string,
     operations: any[],
-    options?: ITransactionOptions,
+    options: ITransactionOptions | undefined,
+    lease: AccountSequenceLease,
   ): Promise<any> {
     const maxFee = this.stellarConfig.getConfig().maxFeeBudget;
     const feeBackoffMs = this.stellarConfig.getConfig().feeBackoffMs;
@@ -87,9 +97,15 @@ export class TransactionBuilderService {
       }
 
       try {
-        // Load source account
+        // Load source account. The coordinator pins the sequence we are allowed
+        // to build against so a stale network read cannot reuse a sequence.
         const server = this.stellarConfig.getServer();
         const sourceAccount = await server.loadAccount(sourcePublicKey);
+        const pinnedSequence = this.sequenceCoordinator.nextSequence(
+          lease,
+          sourceAccount.sequenceNumber(),
+        );
+        sourceAccount.sequenceNumber = () => pinnedSequence;
 
         const txBuilder = new StellarSDK.TransactionBuilder(sourceAccount, {
           fee: options?.fee || feeEstimate.toString(),
@@ -184,11 +200,18 @@ export class TransactionBuilderService {
     transaction: any,
     operationClass: TransactionOperationClass = TransactionOperationClass.OTHER,
   ): Promise<any> {
+    // Hold the account sequence lease across submission so a retry or a
+    // concurrent worker cannot interleave a competing sequence.
+    const sourceAccountId = this.getSourceAccountId(transaction);
+    const lease = sourceAccountId
+      ? await this.sequenceCoordinator.acquire(sourceAccountId)
+      : undefined;
+
     const maxRetries = this.stellarConfig.getConfig().rpcMaxRetries;
     const baseDelay = this.stellarConfig.getConfig().rpcRetryBaseDelayMs;
     const maxDelay = this.stellarConfig.getConfig().rpcRetryMaxDelayMs;
-
     const startedAt = Date.now();
+
     try {
       const result = await this.submitTransactionInternal(
         transaction,
@@ -211,6 +234,22 @@ export class TransactionBuilderService {
         false,
       );
       throw error;
+    } finally {
+      if (lease) {
+        await this.sequenceCoordinator.release(lease);
+      }
+    }
+  }
+
+  private getSourceAccountId(transaction: any): string | undefined {
+    try {
+      const source = transaction?.source;
+      if (!source) {
+        return undefined;
+      }
+      return typeof source === 'string' ? source : source.accountId?.();
+    } catch {
+      return undefined;
     }
   }
 
@@ -246,6 +285,14 @@ export class TransactionBuilderService {
             txCode === 'tx_malformed' ||
             txCode === 'tx_not_supported'
           ) {
+            if (txCode === 'tx_bad_seq') {
+              // Sequence was consumed or invalidated elsewhere; drop the cached
+              // sequence so the next build re-reads from the network.
+              const accountId = this.getSourceAccountId(transaction);
+              if (accountId) {
+                this.sequenceCoordinator.invalidate(accountId);
+              }
+            }
             throw new Error(`Transaction failed (non-retryable): ${JSON.stringify(resultCodes)}`);
           }
         }

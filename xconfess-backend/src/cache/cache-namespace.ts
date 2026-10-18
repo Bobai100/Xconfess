@@ -25,6 +25,8 @@ export const CacheNamespace = {
   VIEWS: 'views',
   SESSION: 'session',
   NOTIFICATION: 'notification',
+  SEARCH_DISCOVERY: 'search-discovery',
+  SEQUENCE_LEASE: 'sequence-lease',
 } as const;
 
 export const AnalyticsEntityType = {
@@ -40,6 +42,16 @@ export const UserEntityType = {
   PROFILE: 'profile',
   SETTINGS: 'settings',
   SESSIONS: 'sessions',
+  PERSONALIZATION: 'personalization',
+} as const;
+
+export const SearchDiscoveryEntityType = {
+  RESULTS: 'results',
+  FEED: 'feed',
+} as const;
+
+export const SequenceLeaseEntityType = {
+  ACCOUNT: 'account',
 } as const;
 
 export const ConfessionEntityType = {
@@ -199,6 +211,57 @@ export const UserCacheKeys = {
       .entity(UserEntityType.SETTINGS)
       .identifier(userId)
       .build(),
+
+  /**
+   * User personalization preference: user:personalization:uuid
+   */
+  personalization: (userId: string): string =>
+    new CacheKeyBuilder(CacheNamespace.USER)
+      .entity(UserEntityType.PERSONALIZATION)
+      .identifier(userId)
+      .build(),
+};
+
+/**
+ * Pre-built key generators for non-personalized search/discovery results.
+ *
+ * Discovery results are cached per user so that a personalization opt-out can
+ * deterministically invalidate every cached variant for that user.
+ */
+export const SearchDiscoveryCacheKeys = {
+  /**
+   * Discovery results: search-discovery:results:uuid[:mode]
+   */
+  results: (userId: string, mode: string = 'non-personalized'): string =>
+    new CacheKeyBuilder(CacheNamespace.SEARCH_DISCOVERY)
+      .entity(SearchDiscoveryEntityType.RESULTS)
+      .identifier(userId)
+      .context(mode)
+      .build(),
+
+  /**
+   * Discovery feed: search-discovery:feed:uuid[:mode]
+   */
+  feed: (userId: string, mode: string = 'non-personalized'): string =>
+    new CacheKeyBuilder(CacheNamespace.SEARCH_DISCOVERY)
+      .entity(SearchDiscoveryEntityType.FEED)
+      .identifier(userId)
+      .context(mode)
+      .build(),
+};
+
+/**
+ * Pre-built key generators for account sequence leases.
+ */
+export const SequenceLeaseCacheKeys = {
+  /**
+   * Account sequence lease: sequence-lease:account:<accountId>
+   */
+  account: (accountId: string): string =>
+    new CacheKeyBuilder(CacheNamespace.SEQUENCE_LEASE)
+      .entity(SequenceLeaseEntityType.ACCOUNT)
+      .identifier(accountId)
+      .build(),
 };
 
 /**
@@ -214,4 +277,20 @@ export const InvalidationPrefixes = {
   viewsConfession: `${CacheNamespace.VIEWS}:confession`,
   viewsUser: `${CacheNamespace.VIEWS}:user`,
   userProfile: `${CacheNamespace.USER}:${UserEntityType.PROFILE}`,
+  userPersonalization: `${CacheNamespace.USER}:${UserEntityType.PERSONALIZATION}`,
+  searchDiscovery: `${CacheNamespace.SEARCH_DISCOVERY}`,
+  searchDiscoveryResults: `${CacheNamespace.SEARCH_DISCOVERY}:${SearchDiscoveryEntityType.RESULTS}`,
+  searchDiscoveryFeed: `${CacheNamespace.SEARCH_DISCOVERY}:${SearchDiscoveryEntityType.FEED}`,
+  sequenceLease: `${CacheNamespace.SEQUENCE_LEASE}`,
 };
+
+/**
+ * Build the invalidation prefixes for a single user's discovery caches.
+ *
+ * Called whenever a user's personalization preference changes so that stale
+ * personalized results cannot be served after opting out (or back in).
+ */
+export const userDiscoveryInvalidationPrefixes = (userId: string): string[] => [
+  `${InvalidationPrefixes.searchDiscoveryResults}:${userId}`,
+  `${InvalidationPrefixes.searchDiscoveryFeed}:${userId}`,
+];

@@ -35,6 +35,12 @@ export interface ViewState {
   direction: SortDirection;
   /** Free-text query. Never contains sensitive values by default. */
   query: string;
+  /**
+   * When true, personal ranking features are bypassed and results are
+   * non-personalized. Persisted in the URL so the preference survives
+   * reloads and is explicit in shared links.
+   */
+  personalized: boolean;
 }
 
 export interface SearchFiltersProps {
@@ -67,6 +73,21 @@ export interface SearchFiltersProps {
 const SORT_PARAM = 'sort';
 const DIRECTION_PARAM = 'dir';
 const QUERY_PARAM = 'q';
+const PERSONALIZED_PARAM = 'personalized';
+
+/**
+ * Parse the personalization flag. Defaults to `true` (personalized) when the
+ * param is absent; only an explicit opt-out (`personalized=0|false|off|no`)
+ * disables personalization. Unknown values fall back to the safe default.
+ */
+function parsePersonalized(value: string | null | undefined): boolean {
+  if (value === null || value === undefined) return true;
+  const lower = value.trim().toLowerCase();
+  if (lower === '0' || lower === 'false' || lower === 'off' || lower === 'no') {
+    return false;
+  }
+  return true;
+}
 
 /** Keys that must never be serialized into the URL. */
 const SENSITIVE_KEYS = new Set([
@@ -169,7 +190,9 @@ export function parseViewState(
   // Cap length and strip control characters to keep URLs safe and bounded.
   const query = rawQuery.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 200);
 
-  return { filters: parsedFilters, sort, direction, query };
+  const personalized = parsePersonalized(params.get(PERSONALIZED_PARAM));
+
+  return { filters: parsedFilters, sort, direction, query, personalized };
 }
 
 /**
@@ -200,6 +223,10 @@ export function serializeViewState(
   }
   if (state.query) {
     params.set(QUERY_PARAM, state.query);
+  }
+  // Only serialize the opt-out; the personalized default is omitted.
+  if (state.personalized === false) {
+    params.set(PERSONALIZED_PARAM, '0');
   }
 
   return params;
@@ -324,6 +351,13 @@ export default function SearchFilters({
     [state, applyState],
   );
 
+  const updatePersonalized = useCallback(
+    (personalized: boolean) => {
+      applyState({ ...state, personalized }, 'push');
+    },
+    [state, applyState],
+  );
+
   // Announcement text for the polite live region. Kept in state (not derived)
   // so repeated identical resets still produce a fresh announcement.
   const [announcement, setAnnouncement] = useState('');
@@ -339,6 +373,7 @@ export default function SearchFilters({
       sort: resolvedDefaultSort,
       direction: defaultDirection,
       query: '',
+      personalized: true,
     };
     applyState(next, 'push');
     setAnnouncement('Filters reset.');
@@ -357,7 +392,8 @@ export default function SearchFilters({
     activeFilterCount > 0 ||
     state.query !== '' ||
     state.sort !== resolvedDefaultSort ||
-    state.direction !== defaultDirection;
+    state.direction !== defaultDirection ||
+    !state.personalized;
 
   // Build the status sentence announced to assistive tech. Result count is
   // only included when the caller supplies it.
@@ -448,6 +484,23 @@ export default function SearchFilters({
           <option value="asc">Ascending</option>
           <option value="desc">Descending</option>
         </select>
+      </div>
+
+      <div className="search-filters__personalization">
+        <label htmlFor="search-filters-personalized" className="search-filters__label">
+          <input
+            id="search-filters-personalized"
+            type="checkbox"
+            checked={state.personalized}
+            onChange={(event) => updatePersonalized(event.target.checked)}
+          />
+          Personalize results
+        </label>
+        {!state.personalized && (
+          <p className="search-filters__personalization-note" role="status">
+            Non-personalized mode: hidden user signals are not used for ranking.
+          </p>
+        )}
       </div>
 
       <button
