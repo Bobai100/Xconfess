@@ -59,7 +59,7 @@ export type DraftSyncState =
   | "failed"
   | "conflict";
 
-export type DraftConflictReason = "remote_updated" | "remote_deleted";
+export type DraftConflictReason = "remote_updated" | "remote_deleted" | "tab_conflict";
 
 /**
  * A local draft edit that could not be reconciled with the server because

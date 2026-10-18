@@ -15,6 +15,7 @@ import { WebSocketIndicator } from "@/app/components/common/WebSocketIndicator";
 import { NetworkStatusProvider } from "@/app/lib/providers/NetworkStatusProvider";
 import ShortcutsProvider from "@/app/components/common/ShortcutsProvider";
 import { WalletProvider } from "@/lib/providers/WalletProvider";
+import { I18nProvider } from "./lib/i18n";
 
 export const metadata: Metadata = {
   title: "xConfess - Anonymous Confessions",
@@ -87,28 +88,30 @@ export default function RootLayout({
           }}
         />
         <ErrorBoundary>
-          <ThemeProvider>
-            <AuthProvider>
-              <WalletProvider>
-              <NetworkStatusProvider>
-                <QueryProvider>
-                  <ToastProvider>
-                    <ShortcutsProvider>
-                    <NetworkBanner />
-                    <WebSocketIndicator />
-                    {children}
+          <I18nProvider>
+            <ThemeProvider>
+              <AuthProvider>
+                <WalletProvider>
+                <NetworkStatusProvider>
+                  <QueryProvider>
+                    <ToastProvider>
+                      <ShortcutsProvider>
+                      <NetworkBanner />
+                      <WebSocketIndicator />
+                      {children}
 
-                    </ShortcutsProvider>
+                      </ShortcutsProvider>
 
-                    {/* Onboarding system */}
-                    <OnboardingFlow />
-                    <HelpButton />
-                  </ToastProvider>
-                </QueryProvider>
-              </NetworkStatusProvider>
-              </WalletProvider>
-            </AuthProvider>
-          </ThemeProvider>
+                      {/* Onboarding system */}
+                      <OnboardingFlow />
+                      <HelpButton />
+                    </ToastProvider>
+                  </QueryProvider>
+                </NetworkStatusProvider>
+                </WalletProvider>
+              </AuthProvider>
+            </ThemeProvider>
+          </I18nProvider>
         </ErrorBoundary>
       </body>
     </html>

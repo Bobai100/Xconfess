@@ -211,14 +211,18 @@ export const DraftManager: React.FC<DraftManagerProps> = ({
   };
 
   const handleResolveConflict = async (
-    resolution: "keep-local" | "keep-remote" | "discard-local",
+    resolution: "keep-local" | "keep-remote" | "discard-local" | "save-as-copy",
   ) => {
     if (!activeConflict) return;
     const { draftId, reason, remote } = activeConflict;
     const ok = await resolveConflict(draftId, resolution);
     if (!ok) return;
 
-    if (resolution === "keep-remote" && reason === "remote_updated" && remote) {
+    if (
+      resolution === "keep-remote" &&
+      (reason === "remote_updated" || reason === "tab_conflict") &&
+      remote
+    ) {
       onLoadDraft(remote);
       lastSavedRef.current = JSON.stringify({
         title: remote.title,
@@ -234,6 +238,10 @@ export const DraftManager: React.FC<DraftManagerProps> = ({
     if (resolution === "keep-local") {
       // The retained local content is now the synced baseline.
       lastSavedRef.current = JSON.stringify(currentDraft);
+    }
+
+    if (resolution === "save-as-copy") {
+      toast.success("Draft saved as a separate copy.");
     }
 
     setSaveStatus("saved");
@@ -292,7 +300,9 @@ export const DraftManager: React.FC<DraftManagerProps> = ({
             <span className="text-amber-300">
               {activeConflict.reason === "remote_deleted"
                 ? "This draft was deleted remotely while you were offline."
-                : "This draft was changed elsewhere while you were offline."}
+                : activeConflict.reason === "tab_conflict"
+                  ? "This draft was edited in another browser tab."
+                  : "This draft was changed elsewhere while you were offline."}
             </span>
           )}
         </div>
@@ -300,12 +310,16 @@ export const DraftManager: React.FC<DraftManagerProps> = ({
         {activeConflict && (
           <div
             role="alert"
+            aria-live="assertive"
+            aria-atomic="true"
             className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-100"
           >
             <p className="font-medium">
               {activeConflict.reason === "remote_deleted"
                 ? "This draft was deleted remotely while you were offline."
-                : "This draft was changed elsewhere while you were offline."}
+                : activeConflict.reason === "tab_conflict"
+                  ? "This draft was edited in another browser tab."
+                  : "This draft was changed elsewhere while you were offline."}
             </p>
             <p className="mt-1 text-amber-200/80">
               Your local version is kept in the editor. Choose how to resolve:
@@ -320,15 +334,23 @@ export const DraftManager: React.FC<DraftManagerProps> = ({
                   ? "Save mine as a new draft"
                   : "Keep my version"}
               </button>
-              {activeConflict.reason === "remote_updated" && (
+              {(activeConflict.reason === "remote_updated" ||
+                activeConflict.reason === "tab_conflict") && (
                 <button
                   type="button"
                   onClick={() => void handleResolveConflict("keep-remote")}
                   className="underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 rounded"
                 >
-                  Use the newer version
+                  Use {activeConflict.reason === "tab_conflict" ? "other tab's" : "the newer"} version
                 </button>
               )}
+              <button
+                type="button"
+                onClick={() => void handleResolveConflict("save-as-copy")}
+                className="underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 rounded"
+              >
+                Save as separate draft
+              </button>
               <button
                 type="button"
                 onClick={() => void handleResolveConflict("discard-local")}
