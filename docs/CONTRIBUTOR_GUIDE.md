@@ -159,6 +159,55 @@ as advisory rather than as an automatic decision. Run them with:
 npm run backend:test
 ```
 
+## Safe Policy Replay
+
+Policy migrations need a way to estimate how decisions would change under a new
+policy version **without** touching live user content or notifying anyone. The
+replay command runs over a selected set of moderation cases in isolation.
+
+### Running A Replay
+
+```bash
+npm run backend:replay -- \
+  --policy-version <new-version> \
+  --cases <case-id,case-id,...>
+```
+
+- Replay is an authorized action (moderator/admin) enforced at the owning
+  backend boundary; unauthorized invocations are rejected with `403`.
+- An unknown or retired target policy version is rejected with `422`.
+
+### Isolation Guarantees
+
+- Replay never mutates live user content, never writes production decision
+  records, and never triggers notifications or fanout.
+- Replay reads cases into an isolated evaluation context; results are written
+  only to the diff report, not to the case store.
+
+### Redaction
+
+- Replay inputs and outputs redact identifiers: user ids, author/reporter
+  identity, and raw content are replaced with stable opaque tokens.
+- The diff report contains only redacted tokens, decision labels, and counts —
+  never raw content or personal identifiers.
+
+### Diff Report
+
+- The report compares the recorded decision against the decision the new policy
+  version would produce, per case, and summarizes changed vs unchanged counts.
+- The report is advisory: it cannot apply decisions to production records.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path plus rejection cases
+(unauthorized replay, unknown policy version) and the regression risk that a
+replay mutates live content, writes production decisions, or leaks identifiers.
+Run them with:
+
+```bash
+npm run backend:test
+```
+
 ## Message Retention And Expiry
 
 Private messages have an explicit, enforceable lifecycle. Retention is chosen
@@ -232,54 +281,4 @@ unread totals from local timestamps.
   idempotent: duplicate events are dropped and out-of-order events are buffered
   or discarded rather than reordering previews.
 - Delayed delivery must not move a conversation ahead of a newer one; the
-  server sequence, not arrival time, decides position.
-
-### Unread Reconciliation
-
-- Unread counts are reconciled from authoritative server state (the unread
-  endpoint), not incremented optimistically from client events alone.
-- Reconciliation requires an authenticated session; unauthenticated or
-  unauthorized requests are rejected at the owning boundary and the client
-  keeps its last known counts rather than guessing.
-- On failure, clients surface the error and retry reconciliation; they must not
-  silently reset counts to zero.
-
-### Testing Expectations
-
-Backend tests for this area must cover the expected path plus delayed,
-duplicate, and out-of-order delivery, and the rejection/failure cases for
-unauthorized reconciliation. Run them with:
-
-```bash
-npm run backend:test
-```
-
-## Multi-Member Conversation Authorization
-
-Group conversations have their own authorization model. Membership, invites,
-history visibility, blocking, and fanout are all enforced by the backend at the
-ownership boundary; clients must not assume one-to-one messaging permissions
-extend to groups.
-
-### Membership Transitions
-
-- **Join** — a user may join only via an accepted invite or an explicit
-  self-join policy enabled for the conversation. Direct joins without either
-  are rejected with `403`.
-- **Leave** — any active member may leave. Leaving removes the member from
-  future fanout but preserves their historical access per the history rules
-  below.
-- **Remove** — only the conversation owner or an authorized moderator may
-  remove another member. Removing a non-member is a no-op success; removing
-yourself must go through the leave path.
-- Every transition is idempotent and records the actor, target, and reason so
-  audit trails stay consistent.
-
-### Invite Authorization
-
-- Only active members with the `invite` capability (owner, moderators, or
-  members when the conversation allows member invites) may create invites.
-- Invites are scoped to a single conversation and a single invitee, expire, and
-  
-
-/* … truncated 2197 chars — edit only what you need near the top … */
+  server sequen
