@@ -378,3 +378,9 @@ When adding a new API endpoint, follow the [API endpoint contributor checklist](
 
 <!-- handsoff-issue-249 -->
 - #249: [Advanced] Add user-controlled delivery and read receipt semantics
+
+<!-- handsoff-issue-250 -->
+- #250: [Advanced] Add per-device notification controls for private conversations
+
+<!-- handsoff-issue-253 -->
+- #253: [Advanced] Make private attachment delivery resumable and access-scoped

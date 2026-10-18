@@ -113,6 +113,116 @@ If a full check cannot run locally because a dependency, Docker service, or
 platform tool is unavailable, document the failed command and the exact blocker
 in the pull request body.
 
+## Conversation Ordering And Unread Reconciliation
+
+Conversation previews and unread counts are owned by the backend. Clients must
+treat the server as the single source of truth and never derive ordering or
+unread totals from local timestamps.
+
+### Deterministic Ordering
+
+- Conversation previews are ordered by a stable, server-assigned monotonic
+  sequence (not client `createdAt`/`updatedAt`). Ties are broken by the
+  conversation id so the order is total and reproducible.
+- Each message and preview carries an event cursor. Clients apply events in
+  cursor order and ignore any event whose cursor is not greater than the last
+  applied cursor for that conversation.
+
+### Reconnect Replay
+
+- On reconnect, clients resume from their last applied cursor. Replay is
+  idempotent: duplicate events are dropped and out-of-order events are buffered
+  or discarded rather than reordering previews.
+- Delayed delivery must not move a conversation ahead of a newer one; the
+  server sequence, not arrival time, decides position.
+
+### Unread Reconciliation
+
+- Unread counts are reconciled from authoritative server state (the unread
+  endpoint), not incremented optimistically from client events alone.
+- Reconciliation requires an authenticated session; unauthenticated or
+  unauthorized requests are rejected at the owning boundary and the client
+  keeps its last known counts rather than guessing.
+- On failure, clients surface the error and retry reconciliation; they must not
+  silently reset counts to zero.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path plus delayed,
+duplicate, and out-of-order delivery, and the rejection/failure cases for
+unauthorized reconciliation. Run them with:
+
+```bash
+npm run backend:test
+```
+
+## Multi-Member Conversation Authorization
+
+Group conversations have their own authorization model. Membership, invites,
+history visibility, blocking, and fanout are all enforced by the backend at the
+ownership boundary; clients must not assume one-to-one messaging permissions
+extend to groups.
+
+### Membership Transitions
+
+- **Join** — a user may join only via an accepted invite or an explicit
+  self-join policy enabled for the conversation. Direct joins without either
+  are rejected with `403`.
+- **Leave** — any active member may leave. Leaving removes the member from
+  future fanout but preserves their historical access per the history rules
+  below.
+- **Remove** — only the conversation owner or an authorized moderator may
+  remove another member. Removing a non-member is a no-op success; removing
+  yourself must go through the leave path.
+- Every transition is idempotent and records the actor, target, and reason so
+  audit trails stay consistent.
+
+### Invite Authorization
+
+- Only active members with the `invite` capability (owner, moderators, or
+  members when the conversation allows member invites) may create invites.
+- Invites are scoped to a single conversation and a single invitee, expire, and
+  are single-use. Redeeming an expired, revoked, or already-used invite fails
+  with `410`/`409` respectively.
+- Inviting a blocked user, or inviting into a conversation where either party
+  has blocked the other, is rejected with `403`.
+
+### History Visibility
+
+- New members see history from the point of their join by default. Conversations
+  may opt into full-history visibility, in which case the join response includes
+  the backfill cursor.
+- Removed or departed members lose access to new messages immediately and keep
+  read access only to the history window they were entitled to while active.
+- History reads are authorized per message window; requests outside the
+  member's window are rejected with `403` rather than silently truncated.
+
+### Blocking
+
+- If any active member has blocked another, the blocked pair cannot exchange
+  messages within the conversation and cannot be added to the same conversation.
+- Blocking does not remove existing membership but suppresses fanout between the
+  blocked pair; the rest of the conversation continues to receive messages.
+
+### Fanout Limits
+
+- Fanout is bounded by a configurable per-conversation member cap
+  (`CONVERSATION_MAX_MEMBERS`, default `100`). Invites and joins that would
+  exceed the cap are rejected with `422`.
+- Fanout is delivered per active, non-blocked member; delivery failures are
+  retried and surfaced, never silently dropped.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path plus the rejection
+cases above (unauthorized invite, expired/used invite, blocked invitee,
+over-cap join, out-of-window history read) and the regression risk of a
+one-to-one permission being reused for a group. Run them with:
+
+```bash
+npm run backend:test && npm run frontend:test
+```
+
 ## Accessibility Contributor Test Harness
 
 The accessibility harness gives every contributor a consistent, low-friction
@@ -216,65 +326,4 @@ For a fresh Postgres database — for example, a new Docker container — run al
 pending migrations in order:
 
 ```bash
-npm run backend:migration:run
-```
-
-This is the standard path for CI, staging, and production deployments.
-
-### Repair a local synchronized database
-
-If your local database was bootstrapped with TypeORM `synchronize: true` (the
-old default for dev), the schema may be missing columns or indexes that
-migrations add. **Use the repair command instead of blowing away your database:**
-
-```bash
-npm run backend:schema:repair
-```
-
-This script is idempotent and data-safe. It adds any missing
-`anonymous_confessions` columns and indexes and backfills `search_vector` for
-existing rows. It must only be used locally — never in staging or production.
-
-### Verify schema readiness
-
-After either path, confirm the readiness probe returns 200:
-
-```
-GET http://localhost:5000/api/health/ready
-```
-
-If the schema check is still failing, the response body includes `missingColumns`,
-`missingIndexes`, and a `hint` with the exact command to run.
-
-## Pull Request Checklist
-
-Your pull request should include:
-
-- A short summary of what changed.
-- The validation commands you ran and their results.
-- Screenshots for visible UI changes.
-- Any known limitations or follow-up work.
-- A closing keyword that links the issue.
-
-Use this format in the pull request body so GitHub can connect the work to the
-issue:
-
-```md
-Closes #1118
-```
-
-Replace `1118` with the actual issue number you are solving. Do not omit the
-closing keyword when the PR resolves an issue.
-
-## Review Handoff
-
-When the PR is ready, use the ready-for-review template:
-
-- [Wave 5 ready-for-review template](WAVE_5_READY_FOR_REVIEW_TEMPLATE.md)
-
-If your PR includes logs or screenshots, follow the redaction rules:
-
-- [Attaching logs to issues and PRs](LOG_ATTACHING_GUIDE.md)
-
-Never include production secrets, private keys, real user data, or KYC/payment
-information in repository artifacts.
+npm run

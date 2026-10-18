@@ -4,13 +4,32 @@ import {
 } from '../audit-log/audit-log.service';
 import { RequestUser } from '../auth/interfaces/jwt-payload.interface';
 
-export type StellarInvocationOutcome = 'success' | 'failed' | 'denied';
+export type StellarInvocationOutcome =
+  | 'success'
+  | 'failed'
+  | 'denied'
+  | 'partial';
+
+export type StellarCompensatingAction =
+  | 'none'
+  | 'compensated'
+  | 'compensation_failed'
+  | 'reconciliation_required'
+  | 'skipped';
 
 interface StellarAuditRequest {
   headers: Record<string, string | string[] | undefined>;
   ip?: string;
   user?: RequestUser;
   requestId?: string;
+}
+
+export interface StellarAuthorizationScopeReview {
+  intent?: string | null;
+  expectedOperation?: string | null;
+  actualOperation?: string | null;
+  authorizationFootprintMatches?: boolean | null;
+  unexpectedAuthorizationRequirements?: readonly string[] | null;
 }
 
 interface BuildStellarInvocationAuditMetadataOptions {
@@ -27,6 +46,7 @@ interface BuildStellarInvocationAuditMetadataOptions {
   expectedSourceAccount?: string | null;
   authorizedScope?: string | null;
   requiredScopes?: readonly string[] | null;
+  scopeReview?: StellarAuthorizationScopeReview | null;
 }
 
 function createAdminActor(user?: RequestUser): AuditActor | undefined {
@@ -110,6 +130,41 @@ export function buildStellarInvocationAuditMetadata(
 
   if (options.requiredScopes && options.requiredScopes.length > 0) {
     metadata.requiredScopes = [...options.requiredScopes];
+  }
+
+  if (options.scopeReview) {
+    const review = options.scopeReview;
+    const scopeReviewMetadata: Record<string, unknown> = {};
+
+    if (review.intent) {
+      scopeReviewMetadata.intent = review.intent;
+    }
+
+    if (review.expectedOperation) {
+      scopeReviewMetadata.expectedOperation = review.expectedOperation;
+    }
+
+    if (review.actualOperation) {
+      scopeReviewMetadata.actualOperation = review.actualOperation;
+    }
+
+    if (typeof review.authorizationFootprintMatches === 'boolean') {
+      scopeReviewMetadata.authorizationFootprintMatches =
+        review.authorizationFootprintMatches;
+    }
+
+    if (
+      review.unexpectedAuthorizationRequirements &&
+      review.unexpectedAuthorizationRequirements.length > 0
+    ) {
+      scopeReviewMetadata.unexpectedAuthorizationRequirements = [
+        ...review.unexpectedAuthorizationRequirements,
+      ];
+    }
+
+    if (Object.keys(scopeReviewMetadata).length > 0) {
+      metadata.scopeReview = scopeReviewMetadata;
+    }
   }
 
   return metadata;
