@@ -178,3 +178,141 @@ export function normalizeQuery(
 ): string[] {
   return normalizeForSearch(input, options).tokens;
 }
+
+/**
+ * Sensitive content categories that users may opt in/out of for display.
+ * These are display preferences only; moderation enforcement is independent
+ * and always applies regardless of a user's safety filter settings.
+ */
+export type SensitiveContentCategory =
+  | 'violence'
+  | 'gore'
+  | 'nudity'
+  | 'sexual'
+  | 'profanity'
+  | 'drugs'
+  | 'self_harm';
+
+export const SENSITIVE_CONTENT_CATEGORIES: readonly SensitiveContentCategory[] = [
+  'violence',
+  'gore',
+  'nudity',
+  'sexual',
+  'profanity',
+  'drugs',
+  'self_harm',
+];
+
+/**
+ * Per-category display preference. `opt_in` means the user explicitly wants
+ * to see the category; `opt_out` means the user wants it hidden. Absent
+ * categories fall back to the caller-provided default.
+ */
+export type SafetyFilterPreference = 'opt_in' | 'opt_out';
+
+export interface SafetyFilterSettings {
+  /** Explicit per-category preferences; unknown keys are ignored. */
+  preferences?: Partial<Record<SensitiveContentCategory, SafetyFilterPreference>>;
+  /**
+   * Default applied to categories without an explicit preference.
+   * Defaults to `opt_out` (hide) so unconfigured users get the safer view.
+   */
+  defaultPreference?: SafetyFilterPreference;
+}
+
+export interface SafetyFilterDecision {
+  /** Categories the user has opted out of (should be hidden). */
+  hidden: SensitiveContentCategory[];
+  /** Categories the user has opted into (may be shown). */
+  visible: SensitiveContentCategory[];
+  /** True when the settings were malformed and a conservative default was used. */
+  usedFallback: boolean;
+}
+
+function isSensitiveCategory(value: unknown): value is SensitiveContentCategory {
+  return (
+    typeof value === 'string' &&
+    (SENSITIVE_CONTENT_CATEGORIES as readonly string[]).includes(value)
+  );
+}
+
+function isPreference(value: unknown): value is SafetyFilterPreference {
+  return value === 'opt_in' || value === 'opt_out';
+}
+
+/**
+ * Resolve a user's safety filter settings into explicit hidden/visible sets.
+ * Never throws: malformed settings degrade to the conservative default
+ * (all categories hidden) with `usedFallback: true`.
+ */
+export function resolveSafetyFilters(
+  settings: SafetyFilterSettings | null | undefined,
+): SafetyFilterDecision {
+  const defaultPreference: SafetyFilterPreference =
+    settings && isPreference(settings.defaultPreference)
+      ? settings.defaultPreference
+      : 'opt_out';
+
+  const hidden: SensitiveContentCategory[] = [];
+  const visible: SensitiveContentCategory[] = [];
+  let usedFallback = false;
+
+  let preferences: Partial<Record<SensitiveContentCategory, SafetyFilterPreference>> = {};
+  if (settings && settings.preferences && typeof settings.preferences === 'object') {
+    preferences = settings.preferences;
+  } else if (settings && settings.preferences != null) {
+    // Malformed preferences object: fall back to defaults.
+    usedFallback = true;
+  }
+
+  for (const category of SENSITIVE_CONTENT_CATEGORIES) {
+    const raw = (preferences as Record<string, unknown>)[category];
+    let preference: SafetyFilterPreference;
+    if (raw === undefined) {
+      preference = defaultPreference;
+    } else if (isPreference(raw)) {
+      preference = raw;
+    } else {
+      // Unknown preference value: treat as opt_out (safer) and flag fallback.
+      preference = 'opt_out';
+      usedFallback = true;
+    }
+    if (preference === 'opt_out') hidden.push(category);
+    else visible.push(category);
+  }
+
+  return { hidden, visible, usedFallback };
+}
+
+/**
+ * Determine whether a single item should be displayed given the user's
+ * resolved safety filters. Items with no sensitive categories are always
+ * shown. Moderation status is intentionally NOT consulted here: moderation
+ * enforcement is independent of display preference and must be applied by
+ * the moderation boundary regardless of these filters.
+ */
+export function isVisibleUnderSafetyFilters(
+  categories: readonly string[] | null | undefined,
+  decision: SafetyFilterDecision,
+): boolean {
+  if (!categories || categories.length === 0) return true;
+  const hidden = new Set<string>(decision.hidden);
+  for (const category of categories) {
+    if (isSensitiveCategory(category) && hidden.has(category)) return false;
+  }
+  return true;
+}
+
+/**
+ * Apply safety filters to a list of items. Used by both feed and search so
+ * display preferences are applied consistently. Items are filtered by their
+ * declared sensitive categories only; moderation is enforced separately.
+ */
+export function applySafetyFilters<T>(
+  items: readonly T[],
+  decision: SafetyFilterDecision,
+  getCategories: (item: T) => readonly string[] | null | undefined,
+): T[] {
+  if (!Array.isArray(items)) return [];
+  return items.filter((item) => isVisibleUnderSafetyFilters(getCategories(item), decision));
+}

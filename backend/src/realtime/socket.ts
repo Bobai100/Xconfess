@@ -18,6 +18,43 @@ const TYPING_TTL_MS = 10_000;
 const presenceExpiry = new Map<string, NodeJS.Timeout>();
 const typingExpiry = new Map<string, NodeJS.Timeout>();
 
+// User-controlled safety filters for sensitive content categories. These are
+// display preferences only: they never affect moderation enforcement, which is
+// applied independently at the owning boundary. Each category is explicitly
+// opt-in (hidden by default) or opt-out (shown by default).
+const SENSITIVE_CATEGORIES = ['violence', 'nudity', 'profanity', 'self-harm'] as const;
+type SensitiveCategory = (typeof SENSITIVE_CATEGORIES)[number];
+type SafetyFilterMode = 'opt-in' | 'opt-out';
+
+const SAFETY_FILTER_MODES: Record<SensitiveCategory, SafetyFilterMode> = {
+  violence: 'opt-out',
+  nudity: 'opt-out',
+  profanity: 'opt-out',
+  'self-harm': 'opt-in',
+};
+
+// Per-user explicit preferences. Absent entries fall back to the category mode.
+const safetyFilters = new Map<string, Partial<Record<SensitiveCategory, boolean>>>();
+
+function isSensitiveCategory(value: unknown): value is SensitiveCategory {
+  return typeof value === 'string' && (SENSITIVE_CATEGORIES as readonly string[]).includes(value);
+}
+
+function resolveSafetyFilters(userId: string): Record<SensitiveCategory, boolean> {
+  const prefs = safetyFilters.get(userId) ?? {};
+  const resolved = {} as Record<SensitiveCategory, boolean>;
+  for (const category of SENSITIVE_CATEGORIES) {
+    const explicit = prefs[category];
+    if (typeof explicit === 'boolean') {
+      resolved[category] = explicit;
+    } else {
+      // opt-in categories are hidden unless explicitly enabled; opt-out shown.
+      resolved[category] = SAFETY_FILTER_MODES[category] === 'opt-out';
+    }
+  }
+  return resolved;
+}
+
 function clearTimers(userId: string): void {
   const p = presenceExpiry.get(userId);
   if (p) clearTimeout(p);
@@ -114,6 +151,32 @@ export function attachRealtime(server: HttpServer): Server {
       typingExpiry.delete(userId);
       io.emit('typing:update', { userId, isTyping: false });
     });
+
+    // User-controlled safety filters. The authenticated user may only change
+    // their own preferences; the resolved set is echoed back so feed and search
+    // consumers apply the same display rules consistently.
+    socket.on('safety:filters:get', () => {
+      socket.emit('safety:filters:update', resolveSafetyFilters(userId));
+    });
+
+    socket.on(
+      'safety:filters:set',
+      (payload: { category?: unknown; enabled?: unknown } | undefined) => {
+        const category = payload?.category;
+        const enabled = payload?.enabled;
+        if (!isSensitiveCategory(category) || typeof enabled !== 'boolean') {
+          socket.emit('safety:filters:error', {
+            code: 'invalid_filter',
+            message: 'Unknown category or non-boolean enabled value',
+          });
+          return;
+        }
+        const prefs = safetyFilters.get(userId) ?? {};
+        prefs[category] = enabled;
+        safetyFilters.set(userId, prefs);
+        socket.emit('safety:filters:update', resolveSafetyFilters(userId));
+      },
+    );
 
     // Reconnect cleanup: remove stale presence/typing state on disconnect.
     socket.on('disconnect', () => {

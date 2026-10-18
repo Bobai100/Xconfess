@@ -208,6 +208,47 @@ Run them with:
 npm run backend:test
 ```
 
+## User Safety Filters For Sensitive Content
+
+Users can opt in or out of seeing sensitive content categories. These are
+**display preferences only** and never change moderation enforcement.
+
+### Supported Categories
+
+- `violence`, `nudity`, `profanity`, and `self_harm` are the supported
+  sensitive content categories.
+- Each category has an explicit per-user preference: `show` (opt in) or `hide`
+  (opt out). Categories without a stored preference fall back to the default
+  (`hide` for `self_harm`, `show` for the rest).
+
+### Where Preferences Are Applied
+
+- Preferences are stored and validated at the owning backend boundary; unknown
+  categories or values are rejected with `422`.
+- The same filter is applied consistently to both feed and search results so a
+  category hidden in one surface is hidden in the other.
+- Filtering happens at read time on the server; clients never receive content
+  the user opted out of.
+
+### Moderation Is Independent Of Display Preference
+
+- Opting in to a category only affects display; it never bypasses moderation.
+  Content that violates policy is still removed or restricted regardless of the
+  user's filter settings.
+- Opting out of a category hides content but does not report, flag, or otherwise
+  affect the author's moderation status.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path (preferences applied to
+feed and search), rejection cases (unknown category or value), and the
+regression risk that a display preference weakens moderation enforcement. Run
+them with:
+
+```bash
+npm run backend:test && npm run frontend:test
+```
+
 ## Message Retention And Expiry
 
 Private messages have an explicit, enforceable lifecycle. Retention is chosen
@@ -238,47 +279,4 @@ must not assume messages live forever or that local copies outlive the server.
 
 - When a message is purged, the backend records a deletion completion marker
   (message id, conversation id, timestamp, reason) **without** the message body.
-- These markers support audit and idempotent retries and must never contain
-  message content.
-
-### Authorization And Failure Semantics
-
-- Only authorized participants may read, change retention for, or delete
-  messages; unauthorized requests are rejected with `403` at the owning
-  boundary.
-- Purge failures are retried and surfaced; a message is never reported as
-  deleted until the deletion completion marker is written.
-
-### Testing Expectations
-
-Backend tests for this area must cover the expected path plus rejection cases
-(unauthorized retention change, unsupported retention value, expired read) and
-the regression risk of expired content leaking through indexes, notifications,
-or device sync. Run them with:
-
-```bash
-npm run backend:test && npm run frontend:test
-```
-
-## Conversation Ordering And Unread Reconciliation
-
-Conversation previews and unread counts are owned by the backend. Clients must
-treat the server as the single source of truth and never derive ordering or
-unread totals from local timestamps.
-
-### Deterministic Ordering
-
-- Conversation previews are ordered by a stable, server-assigned monotonic
-  sequence (not client `createdAt`/`updatedAt`). Ties are broken by the
-  conversation id so the order is total and reproducible.
-- Each message and preview carries an event cursor. Clients apply events in
-  cursor order and ignore any event whose cursor is not greater than the last
-  applied cursor for that conversation.
-
-### Reconnect Replay
-
-- On reconnect, clients resume from their last applied cursor. Replay is
-  idempotent: duplicate events are dropped and out-of-order events are buffered
-  or discarded rather than reordering previews.
-- Delayed delivery must not move a conversation ahead of a newer one; the
-  server sequen
+- These markers support audit and 
