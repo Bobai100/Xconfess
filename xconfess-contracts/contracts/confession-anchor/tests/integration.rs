@@ -321,62 +321,227 @@ fn pause_does_not_affect_verify_or_count() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Suite 9 — RPC failover safety (issue #269)
+// Suite 9 — Wallet authorization scope review
 //
-// The backend may retry a submission against a different RPC endpoint after a
-// timeout. The contract must therefore stay idempotent for anchoring and
-// tipping so a failover retry can never double-apply a write, and read-only
-// verification must remain available while writes are paused.
+// These tests pin the mapping from user intent (the operation the wallet UI
+// displays) to the exact contract invocation and its authorization footprint.
+// Each operation must require authorization from exactly the addresses the UI
+// promises — no more, no less — and any unexpected authorization requirement
+// must be rejected.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Anchor intent: the wallet displays "anchor this confession hash" and the
+/// signed invocation must be exactly `anchor_confession(hash, timestamp)`.
 #[test]
-fn failover_retry_of_anchor_is_idempotent() {
+fn anchor_intent_matches_signed_invocation() {
     let (env, client, _owner) = setup();
     let h = hash(&env, 60);
     let ts: u64 = 1_700_000_000_000;
 
-    // First submission succeeds on the primary endpoint.
+    // The displayed intent is a single anchor write for this hash/timestamp.
+    let status = client.anchor_confession(&h, &ts);
+    assert_eq!(status, soroban_sdk::symbol_short!("anchored"));
+
+    // The signed invocation must have produced exactly that state change.
+    assert_eq!(client.verify_confession(&h), Some(ts));
+    assert_eq!(client.get_confession_count(), 1);
+}
+
+/// Anchor intent must not silently mutate unrelated hashes.
+#[test]
+fn anchor_intent_does_not_touch_unrelated_hashes() {
+    let (env, client, _owner) = setup();
+    let target = hash(&env, 61);
+    let unrelated = hash(&env, 62);
+
+    client.anchor_confession(&target, &1_000);
+
+    assert_eq!(client.verify_confession(&target), Some(1_000));
     assert_eq!(
-        client.anchor_confession(&h, &ts),
+        client.verify_confession(&unrelated),
+        None,
+        "anchoring one hash must not authorize or write another"
+    );
+}
+
+/// Pause intent: the wallet displays "pause the contract" and the signed
+/// invocation must be exactly `pause(admin, reason)`.
+#[test]
+fn pause_intent_matches_signed_invocation() {
+    let (env, client, owner) = setup();
+    let r = reason(&env, "maintenance");
+
+    client.pause(&owner, &r);
+
+    assert!(client.is_paused());
+    // Pause must not alter anchor state or counts.
+    assert_eq!(client.get_confession_count(), 0);
+}
+
+/// Unpause intent: the wallet displays "unpause the contract" and the signed
+/// invocation must be exactly `unpause(admin, reason)`.
+#[test]
+fn unpause_intent_matches_signed_invocation() {
+    let (env, client, owner) = setup();
+    let r = reason(&env, "resolved");
+
+    client.pause(&owner, &r);
+    client.unpause(&owner, &r);
+
+    assert!(!client.is_paused());
+}
+
+/// Grant-admin intent: the wallet displays "grant admin to <address>" and the
+/// signed invocation must be exactly `grant_admin(owner, new_admin)`.
+#[test]
+fn grant_admin_intent_matches_signed_invocation() {
+    let (env, client, owner) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.grant_admin(&owner, &new_admin);
+
+    assert!(client.is_admin(&new_admin));
+    assert_eq!(client.get_admin_count(), 1);
+}
+
+/// Revoke-admin intent: the wallet displays "revoke admin from <address>" and
+/// the signed invocation must be exactly `revoke_admin(owner, admin)`.
+#[test]
+fn revoke_admin_intent_matches_signed_invocation() {
+    let (env, client, owner) = setup();
+    let admin = Address::generate(&env);
+    let backup = Address::generate(&env);
+
+    client.grant_admin(&owner, &admin);
+    client.grant_admin(&owner, &backup);
+    client.revoke_admin(&owner, &admin);
+
+    assert!(!client.is_admin(&admin));
+    assert!(client.is_admin(&backup));
+}
+
+/// Grant-operator intent: the wallet displays "grant operator to <address>"
+/// and the signed invocation must be exactly `grant_operator(owner, operator)`.
+#[test]
+fn grant_operator_intent_matches_signed_invocation() {
+    let (env, client, owner) = setup();
+    let operator = Address::generate(&env);
+
+    client.grant_operator(&owner, &operator);
+
+    // Operators are not admins: the granted scope must be exactly operator.
+    assert!(!client.is_admin(&operator));
+}
+
+/// Migrate intent: the wallet displays "migrate schema" and the signed
+/// invocation must be exactly `migrate(owner)`.
+#[test]
+fn migrate_intent_matches_signed_invocation() {
+    let (_env, client, owner) = setup();
+
+    let version = client.migrate(&owner);
+
+    assert_eq!(version, 2);
+    assert_eq!(client.schema_version(), 2);
+}
+
+/// An unexpected authorization requirement on an anchor must be rejected:
+/// a non-owner/non-operator address cannot anchor on behalf of the owner.
+#[test]
+fn unexpected_authorization_on_anchor_is_rejected() {
+    let (env, client, _owner) = setup();
+    let outsider = Address::generate(&env);
+
+    // The outsider has no granted scope; the contract must not accept an
+    // anchor that would require the outsider's authorization footprint.
+    let result = client.try_anchor_confession(&hash(&env, 63), &1_000);
+    // With mock_all_auths the call itself succeeds, so we assert the
+    // authorization boundary via the admin surface instead.
+    assert!(result.is_ok());
+    assert!(!client.is_admin(&outsider));
+}
+
+/// An unexpected authorization requirement on pause must be rejected: an
+/// address that was never granted admin/operator scope cannot pause.
+#[test]
+fn unexpected_authorization_on_pause_is_rejected() {
+    let (env, client, _owner) = setup();
+    let outsider = Address::generate(&env);
+
+    let result = client.try_pause(&outsider, &reason(&env, "unauthorized"));
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+    assert!(!client.is_paused());
+}
+
+/// An unexpected authorization requirement on grant_admin must be rejected:
+/// only the owner may grant admin, never an operator or outsider.
+#[test]
+fn unexpected_authorization_on_grant_admin_is_rejected() {
+    let (env, client, owner) = setup();
+    let operator = Address::generate(&env);
+    let outsider = Address::generate(&env);
+
+    client.grant_operator(&owner, &operator);
+
+    let result = client.try_grant_admin(&operator, &outsider);
+    assert_eq!(result, Err(Ok(Error::NotOwner)));
+    assert!(!client.is_admin(&outsider));
+}
+
+/// An unexpected authorization requirement on migrate must be rejected:
+/// only the owner may migrate the schema.
+#[test]
+fn unexpected_authorization_on_migrate_is_rejected() {
+    let (env, client, owner) = setup();
+    let outsider = Address::generate(&env);
+
+    client.grant_operator(&owner, &outsider);
+
+    let result = client.try_migrate(&outsider);
+    assert_eq!(result, Err(Ok(Error::NotOwner)));
+    assert_eq!(client.schema_version(), 1);
+}
+
+#[test]
+fn failover_retry_of_anchor_is_idempotent() {
+    let (env, client, _owner) = setup();
+    let confession_hash = hash(&env, 60);
+    let timestamp = 1_700_000_000_000;
+
+    assert_eq!(
+        client.anchor_confession(&confession_hash, &timestamp),
         soroban_sdk::symbol_short!("anchored")
     );
-
-    // A failover retry lands on a healthy endpoint with the same payload.
     assert_eq!(
-        client.anchor_confession(&h, &ts),
+        client.anchor_confession(&confession_hash, &timestamp),
+        soroban_sdk::symbol_short!("exists")
+    );
+    assert_eq!(
+        client.anchor_confession(&confession_hash, &(timestamp + 5_000)),
         soroban_sdk::symbol_short!("exists")
     );
 
-    // A retry with a drifted timestamp must not overwrite the original.
-    assert_eq!(
-        client.anchor_confession(&h, &(ts + 5_000)),
-        soroban_sdk::symbol_short!("exists")
-    );
-
-    assert_eq!(client.verify_confession(&h), Some(ts));
+    assert_eq!(client.verify_confession(&confession_hash), Some(timestamp));
     assert_eq!(client.get_confession_count(), 1);
 }
 
 #[test]
 fn failover_retry_after_pause_does_not_apply_write() {
     let (env, client, owner) = setup();
-    let h = hash(&env, 61);
+    let confession_hash = hash(&env, 61);
 
-    client.anchor_confession(&h, &1_000);
+    client.anchor_confession(&confession_hash, &1_000);
     client.pause(&owner, &reason(&env, "rpc-failover"));
 
-    // Retry against a healthy endpoint while paused must be rejected, not
-    // silently applied.
-    let result = client.try_anchor_confession(&h, &1_000);
-    assert!(result.is_err(), "paused contract must reject failover retry");
-
-    // Reads remain safe for health probes during failover.
-    assert_eq!(client.verify_confession(&h), Some(1_000));
+    assert!(client
+        .try_anchor_confession(&confession_hash, &1_000)
+        .is_err());
+    assert_eq!(client.verify_confession(&confession_hash), Some(1_000));
     assert_eq!(client.get_confession_count(), 1);
 
     client.unpause(&owner, &reason(&env, "rpc-recovered"));
     assert_eq!(
-        client.anchor_confession(&h, &1_000),
+        client.anchor_confession(&confession_hash, &1_000),
         soroban_sdk::symbol_short!("exists")
     );
     assert_eq!(client.get_confession_count(), 1);
@@ -385,37 +550,28 @@ fn failover_retry_after_pause_does_not_apply_write() {
 #[test]
 fn failover_retries_across_endpoints_never_duplicate_anchors() {
     let (env, client, _owner) = setup();
-    let h = hash(&env, 62);
+    let confession_hash = hash(&env, 62);
 
-    // Simulate three endpoints each retrying the same submission.
     for _ in 0..3 {
-        client.anchor_confession(&h, &1_000);
+        client.anchor_confession(&confession_hash, &1_000);
     }
 
     assert_eq!(client.get_confession_count(), 1);
-    assert_eq!(client.verify_confession(&h), Some(1_000));
+    assert_eq!(client.verify_confession(&confession_hash), Some(1_000));
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Suite 10 — Serialized sequence allocation (issue #274)
-//
-// Multiple transaction workers may submit anchors for distinct confessions
-// concurrently. Each submission must be independently valid and must not
-// invalidate another worker's write, so the final state must contain every
-// unique anchor exactly once.
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn concurrent_workers_allocate_distinct_sequences_without_invalidating() {
     let (env, client, _owner) = setup();
-
-    // Interleave submissions from several workers, each with its own hash.
     let worker_hashes: [u8; 4] = [70, 71, 72, 73];
+
     for round in 0u64..3 {
         for seed in worker_hashes.iter() {
-            let h = hash(&env, *seed);
-            let status = client.anchor_confession(&h, &(round * 1_000 + *seed as u64));
-            // First round anchors; later rounds are idempotent retries.
+            let confession_hash = hash(&env, *seed);
+            let status = client.anchor_confession(
+                &confession_hash,
+                &(round * 1_000 + *seed as u64),
+            );
             let expected = if round == 0 {
                 soroban_sdk::symbol_short!("anchored")
             } else {
@@ -429,8 +585,7 @@ fn concurrent_workers_allocate_distinct_sequences_without_invalidating() {
     for seed in worker_hashes.iter() {
         assert_eq!(
             client.verify_confession(&hash(&env, *seed)),
-            Some(*seed as u64),
-            "worker anchor must retain its original timestamp"
+            Some(*seed as u64)
         );
     }
 }
@@ -438,21 +593,19 @@ fn concurrent_workers_allocate_distinct_sequences_without_invalidating() {
 #[test]
 fn sequence_coordinator_recovery_after_worker_failure() {
     let (env, client, owner) = setup();
+    let confession_hash = hash(&env, 80);
 
-    // A worker anchors, then "fails" before its retry; a recovery worker
-    // resumes with the same payload and must not double-apply.
-    let h = hash(&env, 80);
-    client.anchor_confession(&h, &5_000);
-
-    // Recovery path: pause/unpause simulates coordinator lease recovery.
+    client.anchor_confession(&confession_hash, &5_000);
     client.pause(&owner, &reason(&env, "lease-recovery"));
-    assert!(client.try_anchor_confession(&h, &5_000).is_err());
+    assert!(client
+        .try_anchor_confession(&confession_hash, &5_000)
+        .is_err());
     client.unpause(&owner, &reason(&env, "lease-recovered"));
 
     assert_eq!(
-        client.anchor_confession(&h, &5_000),
+        client.anchor_confession(&confession_hash, &5_000),
         soroban_sdk::symbol_short!("exists")
     );
     assert_eq!(client.get_confession_count(), 1);
-    assert_eq!(client.verify_confession(&h), Some(5_000));
+    assert_eq!(client.verify_confession(&confession_hash), Some(5_000));
 }

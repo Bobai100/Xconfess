@@ -62,6 +62,12 @@ export interface SearchFiltersProps {
   pushHistory?: boolean;
   /** Optional className passthrough. */
   className?: string;
+  /**
+   * Optional number of results matching the current filters. When provided it
+   * is announced through the polite live region alongside the active filter
+   * count so screen-reader users hear the effect of each change.
+   */
+  resultCount?: number;
 }
 
 const SORT_PARAM = 'sort';
@@ -239,8 +245,20 @@ export default function SearchFilters({
   onChange,
   pushHistory = false,
   className,
+  resultCount,
 }: SearchFiltersProps) {
   const resolvedDefaultSort = defaultSort ?? sortOptions[0]?.key ?? '';
+
+  // Unique prefix so multiple instances on one page never collide on ids.
+  const idPrefix = useRef(
+    `search-filters-${Math.random().toString(36).slice(2, 9)}`,
+  ).current;
+  const queryId = `${idPrefix}-query`;
+  const sortId = `${idPrefix}-sort`;
+  const directionId = `${idPrefix}-direction`;
+  const resetId = `${idPrefix}-reset`;
+  const statusId = `${idPrefix}-status`;
+  const filterId = (key: string) => `${idPrefix}-filter-${key}`;
 
   const [state, setState] = useState<ViewState>(() =>
     parseViewState(
@@ -340,6 +358,10 @@ export default function SearchFilters({
     [state, applyState],
   );
 
+  // Announcement text for the polite live region. Kept in state (not derived)
+  // so repeated identical resets still produce a fresh announcement.
+  const [announcement, setAnnouncement] = useState('');
+
   const reset = useCallback(() => {
     const next: ViewState = {
       filters: filters.reduce<Record<string, string>>((acc, filter) => {
@@ -354,6 +376,7 @@ export default function SearchFilters({
       personalized: true,
     };
     applyState(next, 'push');
+    setAnnouncement('Filters reset.');
   }, [filters, resolvedDefaultSort, defaultDirection, applyState]);
 
   const activeFilterCount = useMemo(
@@ -365,17 +388,42 @@ export default function SearchFilters({
     [filters, state.filters],
   );
 
+  const hasActiveState =
+    activeFilterCount > 0 ||
+    state.query !== '' ||
+    state.sort !== resolvedDefaultSort ||
+    state.direction !== defaultDirection ||
+    !state.personalized;
+
+  // Build the status sentence announced to assistive tech. Result count is
+  // only included when the caller supplies it.
+  const statusText = useMemo(() => {
+    const parts: string[] = [];
+    parts.push(
+      activeFilterCount === 0
+        ? 'No active filters'
+        : `${activeFilterCount} active filter${activeFilterCount === 1 ? '' : 's'}`,
+    );
+    if (typeof resultCount === 'number') {
+      parts.push(
+        `${resultCount} result${resultCount === 1 ? '' : 's'}`,
+      );
+    }
+    return parts.join(', ');
+  }, [activeFilterCount, resultCount]);
+
   return (
     <div className={className} role="search" aria-label="Search filters">
       <div className="search-filters__query">
-        <label htmlFor="search-filters-query" className="search-filters__label">
+        <label htmlFor={queryId} className="search-filters__label">
           Search
         </label>
         <input
-          id="search-filters-query"
+          id={queryId}
           type="search"
           value={state.query}
           placeholder="Search…"
+          aria-describedby={statusId}
           onChange={(event) => updateQuery(event.target.value)}
         />
       </div>
@@ -384,14 +432,16 @@ export default function SearchFilters({
         {filters.map((filter) => {
           if (isSensitiveKey(filter.key)) return null;
           const value = state.filters[filter.key] ?? '';
+          const controlId = filterId(filter.key);
           return (
             <div key={filter.key} className="search-filters__filter">
-              <label htmlFor={`search-filters-${filter.key}`} className="search-filters__label">
+              <label htmlFor={controlId} className="search-filters__label">
                 {filter.label}
               </label>
               <select
-                id={`search-filters-${filter.key}`}
+                id={controlId}
                 value={value}
+                aria-describedby={statusId}
                 onChange={(event) => updateFilter(filter.key, event.target.value)}
               >
                 <option value="">All</option>
@@ -407,12 +457,13 @@ export default function SearchFilters({
       </div>
 
       <div className="search-filters__sort">
-        <label htmlFor="search-filters-sort" className="search-filters__label">
+        <label htmlFor={sortId} className="search-filters__label">
           Sort by
         </label>
         <select
-          id="search-filters-sort"
+          id={sortId}
           value={state.sort}
+          aria-describedby={statusId}
           onChange={(event) => updateSort(event.target.value)}
         >
           {sortOptions.map((option) => (
@@ -421,13 +472,18 @@ export default function SearchFilters({
             </option>
           ))}
         </select>
-        <button
-          type="button"
-          aria-label={state.direction === 'asc' ? 'Sort descending' : 'Sort ascending'}
-          onClick={() => updateDirection(state.direction === 'asc' ? 'desc' : 'asc')}
+        <label htmlFor={directionId} className="search-filters__label search-filters__label--visually-hidden">
+          Sort direction
+        </label>
+        <select
+          id={directionId}
+          value={state.direction}
+          aria-describedby={statusId}
+          onChange={(event) => updateDirection(event.target.value as SortDirection)}
         >
-          {state.direction === 'asc' ? '↑' : '↓'}
-        </button>
+          <option value="asc">Ascending</option>
+          <option value="desc">Descending</option>
+        </select>
       </div>
 
       <div className="search-filters__personalization">
@@ -448,13 +504,27 @@ export default function SearchFilters({
       </div>
 
       <button
+        id={resetId}
         type="button"
         className="search-filters__reset"
         onClick={reset}
-        disabled={activeFilterCount === 0 && !state.query && state.personalized}
+        disabled={!hasActiveState}
+        aria-label="Reset filters"
+        aria-describedby={statusId}
       >
         Reset{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
       </button>
+
+      <p
+        id={statusId}
+        className="search-filters__status"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {statusText}
+        {announcement ? ` ${announcement}` : ''}
+      </p>
     </div>
   );
 }

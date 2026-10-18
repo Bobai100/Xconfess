@@ -205,14 +205,120 @@ fn settlement_id_is_monotonically_increasing_across_senders() {
     assert_eq!(client.get_tip_balance(&recipient), 350);
 }
 
-// ── #274 serialized sequence allocation regression tests ──────────────────────
+// ── #271 fee-bump / replacement semantics ────────────────────────────────────
+
+#[test]
+fn replacement_tip_for_same_logical_operation_does_not_double_count() {
+    // A fee-bumped replacement is a *new* invocation of send_tip for the same
+    // logical tip. The contract boundary must not double-count balances: each
+    // invocation settles exactly its own amount, and the ledger total equals
+    // the sum of the settled invocations (no phantom credit from the original
+    // hash that never landed on-chain).
+    let (env, client, token_id) = setup();
+    let token = TestTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    token.mint(&sender, &1_000);
+
+    // Original attempt settles.
+    let original_id = client.send_tip(&sender, &recipient, &100);
+    // Replacement (fee-bumped) settles the same logical tip.
+    let replacement_id = client.send_tip(&sender, &recipient, &100);
+
+    assert_eq!(original_id, 1);
+    assert_eq!(replacement_id, 2);
+    // Exactly two settlements of 100 each — never 300 or 400.
+    assert_eq!(client.get_tip_balance(&recipient), 200);
+    assert_eq!(token.balance(&recipient), 200);
+    assert_eq!(token.balance(&sender), 800);
+}
+
+#[test]
+fn replacement_with_different_amount_settles_only_replacement_amount() {
+    // When a replacement changes the amount, only the replacement amount is
+    // credited; the superseded original must not contribute to the ledger.
+    let (env, client, token_id) = setup();
+    let token = TestTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    token.mint(&sender, &1_000);
+
+    // Original attempt is rejected before any state change (invalid amount).
+    assert_eq!(
+        client.try_send_tip(&sender, &recipient, &0),
+        Err(Ok(Error::InvalidTipAmount))
+    );
+    // Replacement settles the corrected amount.
+    let id = client.send_tip(&sender, &recipient, &150);
+
+    assert_eq!(id, 1);
+    assert_eq!(client.get_tip_balance(&recipient), 150);
+    assert_eq!(token.balance(&recipient), 150);
+    assert_eq!(token.balance(&sender), 850);
+}
+
+// ── #281 partial multi-contract / failed invocation semantics ────────────────
+
+#[test]
+fn failed_invocation_leaves_balances_and_ledger_unchanged() {
+    // A rejected invocation must not mutate token balances, the recipient
+    // ledger, or the settlement counter — the partial state is rolled back.
+    let (env, client, token_id) = setup();
+    let token = TestTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    token.mint(&sender, &1_000);
+
+    let first_id = client.send_tip(&sender, &recipient, &100);
+    assert_eq!(first_id, 1);
+
+    // Failed invocation (over the ceiling) after a successful external call.
+    assert_eq!(
+        client.try_send_tip(&sender, &recipient, &(AnonymousTipping::MAX_TIP_AMOUNT + 1)),
+        Err(Ok(Error::InvalidTipAmount))
+    );
+
+    // State is exactly as it was after the first settlement.
+    assert_eq!(client.get_tip_balance(&recipient), 100);
+    assert_eq!(token.balance(&recipient), 100);
+    assert_eq!(token.balance(&sender), 900);
+
+    // The next successful settlement continues the counter without gaps.
+    let next_id = client.send_tip(&sender, &recipient, &50);
+    assert_eq!(next_id, 2);
+    assert_eq!(client.get_tip_balance(&recipient), 150);
+}
+
+#[test]
+fn failed_invocation_with_insufficient_balance_leaves_state_unchanged() {
+    // The token transfer is the external call; if it fails, no ledger entry
+    // may be persisted and the settlement counter must not advance.
+    let (env, client, token_id) = setup();
+    let token = TestTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    token.mint(&sender, &50);
+
+    // Attempt to tip more than the sender holds.
+    let result = client.try_send_tip(&sender, &recipient, &100);
+    assert!(result.is_err());
+
+    assert_eq!(client.get_tip_balance(&recipient), 0);
+    assert_eq!(token.balance(&recipient), 0);
+    assert_eq!(token.balance(&sender), 50);
+
+    // A subsequent valid tip is the first settlement.
+    let id = client.send_tip(&sender, &recipient, &50);
+    assert_eq!(id, 1);
+    assert_eq!(client.get_tip_balance(&recipient), 50);
+}
 
 #[test]
 fn interleaved_submissions_from_same_sender_allocate_distinct_sequences() {
-    // Two workers building transactions for the same sender must not observe
-    // the same settlement sequence. Interleaving the calls (A, B, A, B) models
-    // concurrent submitters and asserts every allocation is unique and
-    // strictly increasing in submission order.
     let (env, client, token_id) = setup();
     let token = TestTokenClient::new(&env, &token_id);
     let sender = Address::generate(&env);
@@ -226,18 +332,7 @@ fn interleaved_submissions_from_same_sender_allocate_distinct_sequences() {
     let id3 = client.send_tip(&sender, &recipient_a, &300);
     let id4 = client.send_tip(&sender, &recipient_b, &400);
 
-    assert_eq!(id1, 1);
-    assert_eq!(id2, 2);
-    assert_eq!(id3, 3);
-    assert_eq!(id4, 4);
-
-    // No sequence was reused across the interleaved submissions.
-    let mut seen = std::vec::Vec::new();
-    for id in [id1, id2, id3, id4] {
-        assert!(!seen.contains(&id), "sequence {id} was allocated twice");
-        seen.push(id);
-    }
-
+    assert_eq!([id1, id2, id3, id4], [1, 2, 3, 4]);
     assert_eq!(client.get_tip_balance(&recipient_a), 400);
     assert_eq!(client.get_tip_balance(&recipient_b), 600);
     assert_eq!(token.balance(&sender), 0);
@@ -245,26 +340,17 @@ fn interleaved_submissions_from_same_sender_allocate_distinct_sequences() {
 
 #[test]
 fn rejected_submission_does_not_consume_a_sequence() {
-    // A submission that fails validation must not advance the settlement
-    // counter, otherwise concurrent workers would see gaps and retries could
-    // collide with a sequence already handed to another worker.
     let (env, client, token_id) = setup();
     let token = TestTokenClient::new(&env, &token_id);
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
 
     token.mint(&sender, &500);
-
     assert_eq!(
         client.try_send_tip(&sender, &recipient, &0),
         Err(Ok(Error::InvalidTipAmount))
     );
-    assert_eq!(
-        client.try_send_tip(&sender, &recipient, &(AnonymousTipping::MAX_TIP_AMOUNT + 1)),
-        Err(Ok(Error::InvalidTipAmount))
-    );
 
-    // The first successful submission still receives sequence 1.
     let id = client.send_tip(&sender, &recipient, &100);
     assert_eq!(id, 1);
     assert_eq!(client.get_tip_balance(&recipient), 100);
@@ -272,18 +358,13 @@ fn rejected_submission_does_not_consume_a_sequence() {
 
 #[test]
 fn failed_transfer_does_not_consume_a_sequence() {
-    // Insufficient balance makes the token transfer fail; the settlement
-    // counter must roll back with the rest of the invocation so a retry from
-    // another worker can reuse the sequence without collision.
     let (env, client, token_id) = setup();
     let token = TestTokenClient::new(&env, &token_id);
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
 
     token.mint(&sender, &50);
-
-    let failed = client.try_send_tip(&sender, &recipient, &100);
-    assert!(failed.is_err(), "transfer should fail on insufficient balance");
+    assert!(client.try_send_tip(&sender, &recipient, &100).is_err());
     assert_eq!(client.get_tip_balance(&recipient), 0);
 
     token.mint(&sender, &100);
@@ -294,27 +375,26 @@ fn failed_transfer_does_not_consume_a_sequence() {
 
 #[test]
 fn sequences_remain_unique_across_multiple_senders_and_recipients() {
-    // Multiple workers, each owning a different sender, must still receive
-    // globally unique sequences from the shared coordinator.
     let (env, client, token_id) = setup();
     let token = TestTokenClient::new(&env, &token_id);
-    let sender_a = Address::generate(&env);
-    let sender_b = Address::generate(&env);
-    let sender_c = Address::generate(&env);
+    let senders = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
     let recipient = Address::generate(&env);
 
-    token.mint(&sender_a, &1_000);
-    token.mint(&sender_b, &1_000);
-    token.mint(&sender_c, &1_000);
+    for sender in &senders {
+        token.mint(sender, &1_000);
+    }
 
-    let id1 = client.send_tip(&sender_a, &recipient, &10);
-    let id2 = client.send_tip(&sender_b, &recipient, &20);
-    let id3 = client.send_tip(&sender_c, &recipient, &30);
-    let id4 = client.send_tip(&sender_a, &recipient, &40);
+    let ids = [
+        client.send_tip(&senders[0], &recipient, &10),
+        client.send_tip(&senders[1], &recipient, &20),
+        client.send_tip(&senders[2], &recipient, &30),
+        client.send_tip(&senders[0], &recipient, &40),
+    ];
 
-    assert_eq!(id1, 1);
-    assert_eq!(id2, 2);
-    assert_eq!(id3, 3);
-    assert_eq!(id4, 4);
+    assert_eq!(ids, [1, 2, 3, 4]);
     assert_eq!(client.get_tip_balance(&recipient), 100);
 }

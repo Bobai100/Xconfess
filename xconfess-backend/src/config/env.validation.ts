@@ -189,6 +189,59 @@ export const envValidationSchema = Joi.object({
   // â”€â”€ Tipping SLA â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   TIP_VERIFICATION_STALE_THRESHOLD_MINUTES: Joi.number().min(1).default(30),
 
+  // â”€â”€ Stellar finality / confirmation tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Number of ledgers a transaction must be buried under before it is
+  // considered final. Stellar closes a ledger roughly every 5 seconds.
+  STELLAR_CONFIRMATION_DEPTH: Joi.number().integer().min(1).max(100).default(1),
+  // How often the finality tracker polls the RPC/Horizon for new ledgers.
+  STELLAR_FINALITY_POLL_INTERVAL_MS: Joi.number()
+    .integer()
+    .min(1000)
+    .max(600000)
+    .default(5000),
+  // Observations older than this are treated as stale and never promoted to
+  // a verified final state.
+  STELLAR_FINALITY_MAX_AGE_MS: Joi.number()
+    .integer()
+    .min(60000)
+    .max(86400000)
+    .default(3600000),
+
+  // â”€â”€ Stellar multi-contract reconciliation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  STELLAR_RECONCILIATION_ENABLED: Joi.string()
+    .valid('true', 'false')
+    .default('true'),
+  // Interval between reconciliation sweeps for partially completed flows.
+  STELLAR_RECONCILIATION_INTERVAL_MS: Joi.number()
+    .integer()
+    .min(10000)
+    .max(3600000)
+    .default(60000),
+  // Maximum number of partial operations reconciled per sweep.
+  STELLAR_RECONCILIATION_BATCH_SIZE: Joi.number()
+    .integer()
+    .min(1)
+    .max(1000)
+    .default(50),
+  // A partial operation older than this is escalated instead of retried.
+  STELLAR_RECONCILIATION_MAX_AGE_MS: Joi.number()
+    .integer()
+    .min(60000)
+    .max(604800000)
+    .default(86400000),
+  // Bounded retry budget for compensating calls.
+  STELLAR_RECONCILIATION_MAX_ATTEMPTS: Joi.number()
+    .integer()
+    .min(1)
+    .max(20)
+    .default(5),
+  // Base backoff between compensation attempts (exponential).
+  STELLAR_RECONCILIATION_RETRY_BACKOFF_MS: Joi.number()
+    .integer()
+    .min(100)
+    .max(300000)
+    .default(2000),
+
   // â”€â”€ Email (primary) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   MAIL_HOST: Joi.string().default('smtp.ethereal.email'),
   MAIL_PORT: Joi.number().port().default(587),
@@ -269,4 +322,44 @@ export const envValidationSchema = Joi.object({
 
   // â”€â”€ Redis queue health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   REDIS_QUEUE_LATENCY_THRESHOLD_MS: Joi.number().default(250),
+
+  // â”€â”€ Transaction latency / failure budgets (per network + operation class) â”€â”€
+  TX_BUDGET_ENABLED: Joi.string().valid('true', 'false').default('true'),
+  TX_BUDGET_WINDOW_SECONDS: Joi.number().min(10).max(86400).default(300),
+  TX_BUDGET_MIN_SAMPLES: Joi.number().min(1).default(5),
+  TX_BUDGET_ALERT_AFTER_BREACHES: Joi.number().min(1).default(2),
+  // Submission latency (ms) budgets, keyed by network.
+  TX_BUDGET_TESTNET_SUBMIT_P95_MS: Joi.number().min(1).default(4000),
+  TX_BUDGET_TESTNET_INCLUSION_P95_MS: Joi.number().min(1).default(15000),
+  TX_BUDGET_TESTNET_CONFIRMATION_P95_MS: Joi.number().min(1).default(30000),
+  TX_BUDGET_MAINNET_SUBMIT_P95_MS: Joi.number().min(1).default(2500),
+  TX_BUDGET_MAINNET_INCLUSION_P95_MS: Joi.number().min(1).default(10000),
+  TX_BUDGET_MAINNET_CONFIRMATION_P95_MS: Joi.number().min(1).default(20000),
+  // Failure-rate budgets (percent) keyed by network.
+  TX_BUDGET_TESTNET_MAX_FAILURE_RATE_PERCENT: Joi.number()
+    .min(0)
+    .max(100)
+    .default(10),
+  TX_BUDGET_MAINNET_MAX_FAILURE_RATE_PERCENT: Joi.number()
+    .min(0)
+    .max(100)
+    .default(5),
+
+  // â”€â”€ Deployment configuration drift detection (Render vs Vercel) â”€â”€â”€â”€â”€â”€â”€
+  CONFIG_DRIFT_CHECK_ENABLED: Joi.string().valid('true', 'false').default('true'),
+  CONFIG_DRIFT_CONTRACT_PATH: Joi.string().optional(),
+  CONFIG_DRIFT_RENDER_ENV_PATH: Joi.string().optional(),
+  CONFIG_DRIFT_VERCEL_ENV_PATH: Joi.string().optional(),
+  CONFIG_DRIFT_FAIL_READINESS: Joi.string().valid('true', 'false').default('true'),
+  CONFIG_DRIFT_ALLOWED_ORIGIN_MISMATCH: Joi.string()
+    .valid('true', 'false')
+    .default('false'),
+
+  // â”€â”€ Synthetic transaction checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  SYNTHETIC_TX_CHECKS_ENABLED: Joi.string().valid('true', 'false').default('false'),
+  SYNTHETIC_TX_CHECK_INTERVAL_MS: Joi.number().min(1000).default(60000),
+  SYNTHETIC_TX_CHECK_TIMEOUT_MS: Joi.number().min(1000).default(45000),
+  SYNTHETIC_TX_CHECK_NETWORKS: Joi.string()
+    .pattern(/^(testnet|mainnet)(,(testnet|mainnet))*$/)
+    .default('testnet'),
 }).options({ allowUnknown: true, abortEarly: false });

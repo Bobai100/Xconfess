@@ -8,6 +8,11 @@ import {
   AccountSequenceCoordinator,
   AccountSequenceLease,
 } from './account-sequence-coordinator.service';
+import {
+  TransactionLatencyService,
+  TransactionOperationClass,
+  TransactionPhase,
+} from './transaction-latency.service';
 
 @Injectable()
 export class TransactionBuilderService {
@@ -16,6 +21,7 @@ export class TransactionBuilderService {
   constructor(
     private stellarConfig: StellarConfigService,
     private sequenceCoordinator: AccountSequenceCoordinator,
+    private transactionLatency: TransactionLatencyService,
   ) {}
 
   /**
@@ -27,17 +33,33 @@ export class TransactionBuilderService {
     operations: any[],
     options?: ITransactionOptions,
   ): Promise<any> {
-    // Serialize sequence allocation for this account across workers. The lease
-    // is held for the whole build (loadAccount -> build) so concurrent
-    // submitters cannot observe and reuse the same sequence number.
+    const operationClass = TransactionLatencyService.classifyOperations(
+      operations,
+    );
+    const startedAt = Date.now();
     const lease = await this.sequenceCoordinator.acquire(sourcePublicKey);
     try {
-      return await this.buildTransactionWithLease(
+      const transaction = await this.buildTransactionWithLease(
         sourcePublicKey,
         operations,
         options,
         lease,
       );
+      this.transactionLatency.record(
+        TransactionPhase.BUILD,
+        operationClass,
+        Date.now() - startedAt,
+        true,
+      );
+      return transaction;
+    } catch (error) {
+      this.transactionLatency.record(
+        TransactionPhase.BUILD,
+        operationClass,
+        Date.now() - startedAt,
+        false,
+      );
+      throw error;
     } finally {
       await this.sequenceCoordinator.release(lease);
     }
@@ -174,7 +196,10 @@ export class TransactionBuilderService {
   /**
    * Submit transaction to network with bounded retries for transient failures
    */
-  async submitTransaction(transaction: any): Promise<any> {
+  async submitTransaction(
+    transaction: any,
+    operationClass: TransactionOperationClass = TransactionOperationClass.OTHER,
+  ): Promise<any> {
     // Hold the account sequence lease across submission so a retry or a
     // concurrent worker cannot interleave a competing sequence.
     const sourceAccountId = this.getSourceAccountId(transaction);
@@ -182,8 +207,33 @@ export class TransactionBuilderService {
       ? await this.sequenceCoordinator.acquire(sourceAccountId)
       : undefined;
 
+    const maxRetries = this.stellarConfig.getConfig().rpcMaxRetries;
+    const baseDelay = this.stellarConfig.getConfig().rpcRetryBaseDelayMs;
+    const maxDelay = this.stellarConfig.getConfig().rpcRetryMaxDelayMs;
+    const startedAt = Date.now();
+
     try {
-      return await this.submitTransactionWithLease(transaction);
+      const result = await this.submitTransactionInternal(
+        transaction,
+        maxRetries,
+        baseDelay,
+        maxDelay,
+      );
+      this.transactionLatency.record(
+        TransactionPhase.SUBMISSION,
+        operationClass,
+        Date.now() - startedAt,
+        true,
+      );
+      return result;
+    } catch (error) {
+      this.transactionLatency.record(
+        TransactionPhase.SUBMISSION,
+        operationClass,
+        Date.now() - startedAt,
+        false,
+      );
+      throw error;
     } finally {
       if (lease) {
         await this.sequenceCoordinator.release(lease);
@@ -203,11 +253,12 @@ export class TransactionBuilderService {
     }
   }
 
-  private async submitTransactionWithLease(transaction: any): Promise<any> {
-    const maxRetries = this.stellarConfig.getConfig().rpcMaxRetries;
-    const baseDelay = this.stellarConfig.getConfig().rpcRetryBaseDelayMs;
-    const maxDelay = this.stellarConfig.getConfig().rpcRetryMaxDelayMs;
-
+  private async submitTransactionInternal(
+    transaction: any,
+    maxRetries: number,
+    baseDelay: number,
+    maxDelay: number,
+  ): Promise<any> {
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
@@ -278,5 +329,35 @@ export class TransactionBuilderService {
 
     const message = lastError instanceof Error ? lastError.message : String(lastError);
     throw new Error(`Transaction submission failed after ${maxRetries + 1} attempts: ${message}`);
+  }
+
+  /**
+   * Record inclusion/confirmation latency observed by callers once the
+   * transaction is observed on-chain. Bounded labels only.
+   */
+  recordInclusionLatency(
+    operationClass: TransactionOperationClass,
+    latencyMs: number,
+    success: boolean,
+  ): void {
+    this.transactionLatency.record(
+      TransactionPhase.INCLUSION,
+      operationClass,
+      latencyMs,
+      success,
+    );
+  }
+
+  recordConfirmationLatency(
+    operationClass: TransactionOperationClass,
+    latencyMs: number,
+    success: boolean,
+  ): void {
+    this.transactionLatency.record(
+      TransactionPhase.CONFIRMATION,
+      operationClass,
+      latencyMs,
+      success,
+    );
   }
 }
