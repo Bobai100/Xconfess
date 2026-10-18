@@ -97,6 +97,30 @@ function resolveField<T extends Record<string, UrlStateValue>>(
   return config.defaultValue;
 }
 
+/**
+ * Validate a typed value against the schema field before it is written to the
+ * URL. Values that fail serialization (or that serialize to an empty string)
+ * are rejected so malformed/private state never reaches a shareable link.
+ */
+function validateField<T extends Record<string, UrlStateValue>>(
+  schema: UrlStateSchema<T>,
+  field: keyof T,
+  value: T[keyof T],
+): T[keyof T] {
+  const config = schema[field];
+  const serialize = config.serialize ?? (defaultSerialize as (v: T[keyof T]) => string | undefined);
+  const parse = config.parse ?? (defaultParse as (raw: string) => T[keyof T] | undefined);
+  try {
+    const encoded = serialize(value);
+    if (encoded === undefined) return config.defaultValue;
+    // Round-trip through parse to guarantee the value is representable.
+    const reparsed = parse(encoded);
+    return reparsed === undefined ? config.defaultValue : reparsed;
+  } catch {
+    return config.defaultValue;
+  }
+}
+
 function buildSearch<T extends Record<string, UrlStateValue>>(
   schema: UrlStateSchema<T>,
   state: T,
@@ -157,7 +181,13 @@ export function useUrlState<T extends Record<string, UrlStateValue>>(
   const update = useCallback(
     (patch: Partial<T>, opts: UseUrlStateOptions = {}) => {
       setState((prev) => {
-        const next = { ...prev, ...patch };
+        const merged = { ...prev, ...patch };
+        // Normalize every field through the schema so invalid values fall back
+        // to defaults and unknown/private keys are never serialized.
+        const next = {} as T;
+        for (const field of Object.keys(schemaRef.current) as (keyof T)[]) {
+          next[field] = validateField(schemaRef.current, field, merged[field]);
+        }
         if (isBrowser) {
           const search = buildSearch(schemaRef.current, next);
           const url = `${window.location.pathname}${search}${window.location.hash}`;

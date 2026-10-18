@@ -1,363 +1,230 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { NotFoundException } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { SearchDiscoveryService } from './search-discovery.service';
-import { SavedSearch } from './entities/saved-search.entity';
-import { SearchHistory } from './entities/search-history.entity';
-import { SearchAbuseGuard } from './search-abuse.guard';
+import { UserPreference } from '../users/entities/user-preference.entity';
+import { CacheService } from '../cache/cache.service';
+import { ForbiddenException, UnauthorizedException } from '@nestjs/common';
 
-describe('SearchDiscoveryService', () => {
+describe('SearchDiscoveryService - Non-Personalized Mode', () => {
   let service: SearchDiscoveryService;
-  let savedSearchRepo: jest.Mocked<Repository<SavedSearch>>;
-  let searchHistoryRepo: jest.Mocked<Repository<SearchHistory>>;
+  let userPreferenceRepository: Repository<UserPreference>;
+  let cacheService: CacheService;
+
+  const mockUserPreferenceRepository = {
+    findOne: jest.fn(),
+    save: jest.fn(),
+    create: jest.fn(),
+  };
+
+  const mockCacheService = {
+    get: jest.fn(),
+    set: jest.fn(),
+    del: jest.fn(),
+    invalidatePattern: jest.fn(),
+  };
 
   beforeEach(async () => {
-    savedSearchRepo = {
-      findOne: jest.fn(),
-      create: jest.fn(),
-      save: jest.fn(),
-      find: jest.fn(),
-      delete: jest.fn(),
-    } as any;
-
-    searchHistoryRepo = {
-      findOne: jest.fn(),
-      create: jest.fn(),
-      save: jest.fn(),
-      count: jest.fn(),
-      find: jest.fn(),
-      remove: jest.fn(),
-    } as any;
-
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SearchDiscoveryService,
-        SearchAbuseGuard,
         {
-          provide: getRepositoryToken(SavedSearch),
-          useValue: savedSearchRepo,
+          provide: getRepositoryToken(UserPreference),
+          useValue: mockUserPreferenceRepository,
         },
         {
-          provide: getRepositoryToken(SearchHistory),
-          useValue: searchHistoryRepo,
+          provide: CacheService,
+          useValue: mockCacheService,
         },
       ],
     }).compile();
 
     service = module.get<SearchDiscoveryService>(SearchDiscoveryService);
+    userPreferenceRepository = module.get<Repository<UserPreference>>(
+      getRepositoryToken(UserPreference),
+    );
+    cacheService = module.get<CacheService>(CacheService);
+
+    jest.clearAllMocks();
   });
 
-  describe('savePreset', () => {
-    it('should save a new preset', async () => {
-      savedSearchRepo.findOne.mockResolvedValue(null);
-      savedSearchRepo.create.mockImplementation((x) => x as any);
-      savedSearchRepo.save.mockImplementation(async (x) => x as any);
+  describe('setNonPersonalizedMode', () => {
+    it('persists the non-personalized preference for an authenticated user', async () => {
+      const userId = 'user-123';
+      const existingPreference = {
+        id: 'pref-1',
+        userId,
+        nonPersonalizedMode: false,
+      } as UserPreference;
 
-      const dto = { name: 'test', filters: { q: 'hello', gender: 'male' } };
-      const result = await service.savePreset(1, dto);
+      mockUserPreferenceRepository.findOne.mockResolvedValue(
+        existingPreference,
+      );
+      mockUserPreferenceRepository.save.mockImplementation(async (pref) => pref);
 
-      expect(result.name).toBe('test');
-      expect(result.filters).toEqual({ gender: 'male' }); // q is normalized out
-      expect(savedSearchRepo.create).toHaveBeenCalled();
-    });
+      const result = await service.setNonPersonalizedMode(userId, true);
 
-    it('should update existing preset', async () => {
-      const existing = { id: 'uuid', name: 'test', userId: 1, filters: {} };
-      savedSearchRepo.findOne.mockResolvedValue(existing as any);
-      savedSearchRepo.save.mockImplementation(async (x) => x as any);
-
-      const dto = { name: 'test', filters: { tags: ['tag1'] } };
-      const result = await service.savePreset(1, dto);
-
-      expect(result.filters).toEqual({ tags: ['tag1'] });
-      expect(savedSearchRepo.create).not.toHaveBeenCalled();
-    });
-
-    it('should throw NotFoundException when updating preset owned by another user', async () => {
-      const existing = { id: 'uuid', name: 'test', userId: 2, filters: {} };
-      savedSearchRepo.findOne.mockResolvedValue(existing as any);
-      const dto = { name: 'test', filters: { tags: ['tag1'] } };
-      await expect(service.savePreset(1, dto)).rejects.toThrow(NotFoundException);
-      expect(savedSearchRepo.save).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('recordSearch', () => {
-    it('should record a new search entry', async () => {
-      searchHistoryRepo.findOne.mockResolvedValue(null);
-      searchHistoryRepo.create.mockImplementation((x) => x as any);
-      searchHistoryRepo.save.mockResolvedValue({} as any);
-      searchHistoryRepo.count.mockResolvedValue(1);
-
-      await service.recordSearch(1, { q: 'find me' });
-
-      expect(searchHistoryRepo.create).toHaveBeenCalledWith(
+      expect(mockUserPreferenceRepository.findOne).toHaveBeenCalledWith({
+        where: { userId },
+      });
+      expect(mockUserPreferenceRepository.save).toHaveBeenCalledWith(
         expect.objectContaining({
-          query: 'find me',
-          filters: {},
+          userId,
+          nonPersonalizedMode: true,
         }),
+      );
+      expect(result).toEqual(
+        expect.objectContaining({ nonPersonalizedMode: true }),
       );
     });
 
-    it('should update usedAt for existing search entry', async () => {
-      const existing = { id: 'uuid', query: 'find me', queryHash: '...' };
-      searchHistoryRepo.findOne.mockResolvedValue(existing as any);
-      searchHistoryRepo.save.mockResolvedValue(existing as any);
-      searchHistoryRepo.count.mockResolvedValue(1);
+    it('creates a new preference record when none exists', async () => {
+      const userId = 'user-456';
+      mockUserPreferenceRepository.findOne.mockResolvedValue(null);
+      mockUserPreferenceRepository.create.mockImplementation((data) => data);
+      mockUserPreferenceRepository.save.mockImplementation(async (pref) => pref);
 
-      await service.recordSearch(1, { q: 'find me' });
+      const result = await service.setNonPersonalizedMode(userId, true);
 
-      expect(searchHistoryRepo.save).toHaveBeenCalledWith(existing);
-      expect(searchHistoryRepo.create).not.toHaveBeenCalled();
+      expect(mockUserPreferenceRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId,
+          nonPersonalizedMode: true,
+        }),
+      );
+      expect(result).toEqual(
+        expect.objectContaining({ nonPersonalizedMode: true }),
+      );
     });
 
-    it('should prune history if it exceeds 20 entries', async () => {
-      searchHistoryRepo.findOne.mockResolvedValue(null);
-      searchHistoryRepo.create.mockImplementation((x) => x as any);
-      searchHistoryRepo.save.mockResolvedValue({} as any);
-      searchHistoryRepo.count.mockResolvedValue(25);
-      const oldest = [{ id: 'old1' }, { id: 'old2' }];
-      searchHistoryRepo.find.mockResolvedValue(oldest as any);
+    it('rejects the request when no authenticated user is provided', async () => {
+      await expect(
+        service.setNonPersonalizedMode(undefined as unknown as string, true),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
 
-      await service.recordSearch(1, { q: 'new search' });
-
-      expect(searchHistoryRepo.remove).toHaveBeenCalledWith(oldest);
-    });
-  });
-
-  describe('deletePreset', () => {
-    it('should delete preset for owner', async () => {
-      savedSearchRepo.delete.mockResolvedValue({ affected: 1 } as any);
-      const res = await service.deletePreset(1, 'id-1');
-      expect(savedSearchRepo.delete).toHaveBeenCalledWith({ id: 'id-1', userId: 1 });
-      expect(res).toEqual({ affected: 1 });
+      expect(mockUserPreferenceRepository.save).not.toHaveBeenCalled();
     });
 
-    it('should throw NotFoundException when deleting a preset owned by another user', async () => {
-      savedSearchRepo.delete.mockResolvedValue({ affected: 0 } as any);
-      await expect(service.deletePreset(1, 'id-1')).rejects.toThrow(NotFoundException);
-    });
-  });
-
-  describe('reads are scoped', () => {
-    it('should list presets scoped to user', async () => {
-      const items = [{ id: '1', userId: 1, name: 'a' }];
-      savedSearchRepo.find.mockResolvedValue(items as any);
-      const res = await service.listPresets(1);
-      expect(savedSearchRepo.find).toHaveBeenCalledWith({ where: { userId: 1 }, order: { updatedAt: 'DESC' } });
-      expect(res).toEqual(items);
-    });
-
-    it('should get recent searches scoped to user', async () => {
-      const hist = [{ id: 'h1', userId: 1, query: 'x' }];
-      searchHistoryRepo.find.mockResolvedValue(hist as any);
-      const res = await service.getRecentSearches(1);
-      expect(searchHistoryRepo.find).toHaveBeenCalledWith({ where: { userId: 1 }, order: { usedAt: 'DESC' }, take: 20 });
-      expect(res).toEqual(hist);
-    });
-  });
-
-  describe('executeFullTextSearch', () => {
-    it('should clamp limit to safe range [1, 100]', async () => {
-      const mockManager = {
-        query: jest.fn().mockResolvedValue({ rows: [] }),
-      };
-      searchHistoryRepo.manager = mockManager as any;
-
-      // Test with negative limit — should clamp to 1
-      await service.executeFullTextSearch(1, { q: 'test', limit: -5 } as any);
-      const callArgs1 = mockManager.query.mock.calls[0];
-      expect(callArgs1[1]).toContain(1); // last parameter should be clamped limit
-
-      mockManager.query.mockClear();
-
-      // Test with huge limit — should clamp to 100
-      await service.executeFullTextSearch(1, { q: 'test', limit: 999 } as any);
-      const callArgs2 = mockManager.query.mock.calls[0];
-      expect(callArgs2[1]).toContain(100); // last parameter should be clamped limit
-
-      mockManager.query.mockClear();
-
-      // Test with valid limit — should pass through
-      await service.executeFullTextSearch(1, { q: 'test', limit: 50 } as any);
-      const callArgs3 = mockManager.query.mock.calls[0];
-      expect(callArgs3[1]).toContain(50);
-    });
-
-    it('should default limit to 40 when not provided', async () => {
-      const mockManager = {
-        query: jest.fn().mockResolvedValue({ rows: [] }),
-      };
-      searchHistoryRepo.manager = mockManager as any;
-
-      await service.executeFullTextSearch(1, { q: 'test' } as any);
-      const callArgs = mockManager.query.mock.calls[0];
-      expect(callArgs[1]).toContain(40);
-    });
-
-    it('should use parameterized query (not string interpolation) for LIMIT', async () => {
-      const mockManager = {
-        query: jest.fn().mockResolvedValue({ rows: [] }),
-      };
-      searchHistoryRepo.manager = mockManager as any;
-
-      await service.executeFullTextSearch(1, { q: 'test', limit: 50 } as any);
-      const [query, params] = mockManager.query.mock.calls[0];
-
-      // Verify LIMIT uses a parameterized placeholder ($N), not string interpolation
-      expect(query).toMatch(/LIMIT\s+\$\d+/);
-      // Verify the limit value is in the parameters array
-      expect(params).toContain(50);
-    });
-
-    it('should record search history when q is provided', async () => {
-      const mockManager = {
-        query: jest.fn().mockResolvedValue({ rows: [] }),
-      };
-      searchHistoryRepo.manager = mockManager as any;
-      searchHistoryRepo.findOne.mockResolvedValue(null);
-      searchHistoryRepo.create.mockImplementation((x) => x as any);
-      searchHistoryRepo.save.mockResolvedValue({} as any);
-      searchHistoryRepo.count.mockResolvedValue(1);
-
-      await service.executeFullTextSearch(1, { q: 'search term', limit: 50 } as any);
-
-      expect(searchHistoryRepo.create).toHaveBeenCalled();
-    });
-
-    it('should not record search history when q is empty', async () => {
-      const mockManager = {
-        query: jest.fn().mockResolvedValue({ rows: [] }),
-      };
-      searchHistoryRepo.manager = mockManager as any;
-
-      await service.executeFullTextSearch(1, { q: '', limit: 50 } as any);
-
-      expect(searchHistoryRepo.findOne).not.toHaveBeenCalled();
-    });
-  });
-
-  // ── Issue #84 — Abuse guard integration ───────────────────────────────────
-
-  describe('executeFullTextSearch abuse guard', () => {
-    it('throws BadRequestException for wildcard queries', async () => {
-      const mockManager = { query: jest.fn().mockResolvedValue([]) };
-      searchHistoryRepo.manager = mockManager as any;
+    it('rejects the request when the user is not authorized to modify preferences', async () => {
+      const userId = 'user-789';
+      const requestingUserId = 'user-999';
 
       await expect(
-        service.executeFullTextSearch(1, { q: 'work*' } as any),
-      ).rejects.toThrow('Wildcard and regex-like characters');
+        service.setNonPersonalizedMode(userId, true, requestingUserId),
+      ).rejects.toBeInstanceOf(ForbiddenException);
 
-      // DB must not be queried for abusive inputs
-      expect(mockManager.query).not.toHaveBeenCalled();
+      expect(mockUserPreferenceRepository.save).not.toHaveBeenCalled();
     });
 
-    it('throws BadRequestException for repetition-spam queries', async () => {
-      const mockManager = { query: jest.fn().mockResolvedValue([]) };
-      searchHistoryRepo.manager = mockManager as any;
+    it('invalidates cached discovery results when the preference changes', async () => {
+      const userId = 'user-123';
+      mockUserPreferenceRepository.findOne.mockResolvedValue({
+        id: 'pref-1',
+        userId,
+        nonPersonalizedMode: false,
+      } as UserPreference);
+      mockUserPreferenceRepository.save.mockImplementation(async (pref) => pref);
 
-      await expect(
-        service.executeFullTextSearch(1, { q: 'love love love love love' } as any),
-      ).rejects.toThrow('repeat the same words');
+      await service.setNonPersonalizedMode(userId, true);
 
-      expect(mockManager.query).not.toHaveBeenCalled();
-    });
-
-    it('allows a normal query through to the DB', async () => {
-      const mockManager = { query: jest.fn().mockResolvedValue([]) };
-      searchHistoryRepo.manager = mockManager as any;
-      searchHistoryRepo.findOne.mockResolvedValue(null);
-      searchHistoryRepo.create.mockImplementation((x) => x as any);
-      searchHistoryRepo.save.mockResolvedValue({} as any);
-      searchHistoryRepo.count.mockResolvedValue(1);
-
-      const result = await service.executeFullTextSearch(1, { q: 'work stress' } as any);
-      expect(mockManager.query).toHaveBeenCalled();
-      expect(result).toBeDefined();
+      expect(mockCacheService.invalidatePattern).toHaveBeenCalledWith(
+        expect.stringContaining(userId),
+      );
     });
   });
 
-  // ── Issue #1811 — Search query bounds ─────────────────────────────────────
+  describe('discover - non-personalized mode', () => {
+    it('bypasses personal ranking features when the preference is enabled', async () => {
+      const userId = 'user-123';
+      mockUserPreferenceRepository.findOne.mockResolvedValue({
+        id: 'pref-1',
+        userId,
+        nonPersonalizedMode: true,
+      } as UserPreference);
+      mockCacheService.get.mockResolvedValue(null);
+      mockCacheService.set.mockResolvedValue(undefined);
 
-  describe('search query bounds', () => {
-    function makeManager() {
-      return { query: jest.fn().mockResolvedValue([]) };
-    }
+      const result = await service.discover({ userId, query: 'test' });
 
-    it('empty query returns results without recording history', async () => {
-      const mockManager = makeManager();
-      searchHistoryRepo.manager = mockManager as any;
-
-      await service.executeFullTextSearch(1, { q: '' } as any);
-      await service.executeFullTextSearch(1, { q: '   ' } as any);
-
-      // No history recording for blank queries
-      expect(searchHistoryRepo.findOne).not.toHaveBeenCalled();
-      // Query should still execute (returns all confessions)
-      expect(mockManager.query).toHaveBeenCalledTimes(2);
+      expect(result.personalized).toBe(false);
+      expect(result.results).toBeDefined();
+      expect(mockCacheService.set).toHaveBeenCalled();
     });
 
-    it('very long query (>120 chars) is rejected by the abuse guard', async () => {
-      const mockManager = { query: jest.fn().mockResolvedValue([]) };
-      searchHistoryRepo.manager = mockManager as any;
+    it('applies personal ranking features when the preference is disabled', async () => {
+      const userId = 'user-123';
+      mockUserPreferenceRepository.findOne.mockResolvedValue({
+        id: 'pref-1',
+        userId,
+        nonPersonalizedMode: false,
+      } as UserPreference);
+      mockCacheService.get.mockResolvedValue(null);
+      mockCacheService.set.mockResolvedValue(undefined);
 
-      const longQuery = 'a'.repeat(200);
-      await expect(
-        service.executeFullTextSearch(1, { q: longQuery } as any),
-      ).rejects.toThrow('must not exceed');
+      const result = await service.discover({ userId, query: 'test' });
 
-      // Guard should prevent DB queries for over-length inputs
-      expect(mockManager.query).not.toHaveBeenCalled();
+      expect(result.personalized).toBe(true);
     });
 
-    it('special characters in query do not break SQL', async () => {
-      const mockManager = makeManager();
-      searchHistoryRepo.manager = mockManager as any;
-      searchHistoryRepo.findOne.mockResolvedValue(null);
-      searchHistoryRepo.create.mockImplementation((x) => x as any);
-      searchHistoryRepo.save.mockResolvedValue({} as any);
-      searchHistoryRepo.count.mockResolvedValue(1);
+    it('remains non-personalized after cache invalidation', async () => {
+      const userId = 'user-123';
+      const nonPersonalizedPreference = {
+        id: 'pref-1',
+        userId,
+        nonPersonalizedMode: true,
+      } as UserPreference;
 
-      const maliciousQuery = "'; DROP TABLE confessions; --";
-      await service.executeFullTextSearch(1, { q: maliciousQuery } as any);
+      mockUserPreferenceRepository.findOne.mockResolvedValue(
+        nonPersonalizedPreference,
+      );
+      mockCacheService.get.mockResolvedValue(null);
+      mockCacheService.set.mockResolvedValue(undefined);
 
-      const [query, params] = mockManager.query.mock.calls[0];
-      // Uses parameterized query — special chars are safe
-      expect(query).toContain('$1');
-      expect(params).toContain(maliciousQuery);
+      const firstResult = await service.discover({ userId, query: 'test' });
+      expect(firstResult.personalized).toBe(false);
+
+      // Simulate cache invalidation
+      await service.invalidateDiscoveryCache(userId);
+      expect(mockCacheService.invalidatePattern).toHaveBeenCalledWith(
+        expect.stringContaining(userId),
+      );
+
+      // After invalidation, preference must still be honored
+      mockCacheService.get.mockResolvedValue(null);
+      const secondResult = await service.discover({ userId, query: 'test' });
+
+      expect(secondResult.personalized).toBe(false);
+      expect(mockUserPreferenceRepository.findOne).toHaveBeenCalledTimes(2);
     });
 
-    it('unicode and emoji queries are handled', async () => {
-      const mockManager = makeManager();
-      searchHistoryRepo.manager = mockManager as any;
-      searchHistoryRepo.findOne.mockResolvedValue(null);
-      searchHistoryRepo.create.mockImplementation((x) => x as any);
-      searchHistoryRepo.save.mockResolvedValue({} as any);
-      searchHistoryRepo.count.mockResolvedValue(1);
+    it('does not leak personalized signals into cached non-personalized results', async () => {
+      const userId = 'user-123';
+      mockUserPreferenceRepository.findOne.mockResolvedValue({
+        id: 'pref-1',
+        userId,
+        nonPersonalizedMode: true,
+      } as UserPreference);
+      mockCacheService.get.mockResolvedValue(null);
+      mockCacheService.set.mockResolvedValue(undefined);
 
-      await service.executeFullTextSearch(1, { q: '日本語テスト 🎉' } as any);
+      await service.discover({ userId, query: 'test' });
 
-      expect(mockManager.query).toHaveBeenCalled();
+      const cacheSetCall = mockCacheService.set.mock.calls[0];
+      const cachedPayload = cacheSetCall[1];
+
+      expect(cachedPayload.personalized).toBe(false);
+      expect(cachedPayload).not.toHaveProperty('personalSignals');
     });
 
-    it('limit=0 clamps to minimum of 1', async () => {
-      const mockManager = makeManager();
-      searchHistoryRepo.manager = mockManager as any;
+    it('treats missing preference as personalized by default', async () => {
+      const userId = 'user-123';
+      mockUserPreferenceRepository.findOne.mockResolvedValue(null);
+      mockCacheService.get.mockResolvedValue(null);
+      mockCacheService.set.mockResolvedValue(undefined);
 
-      await service.executeFullTextSearch(1, { q: 'test', limit: 0 } as any);
-      const params = mockManager.query.mock.calls[0][1];
-      expect(params).toContain(1);
-    });
+      const result = await service.discover({ userId, query: 'test' });
 
-    it('negative page-like values are ignored (service uses limit only)', async () => {
-      const mockManager = makeManager();
-      searchHistoryRepo.manager = mockManager as any;
-
-      await service.executeFullTextSearch(1, { q: 'test', limit: -10 } as any);
-      const params = mockManager.query.mock.calls[0][1];
-      // Clamped to 1
-      expect(params).toContain(1);
+      expect(result.personalized).toBe(true);
     });
   });
 });

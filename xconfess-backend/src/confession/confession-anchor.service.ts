@@ -1,6 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { createHash, randomBytes } from 'crypto';
 import * as StellarSdk from '@stellar/stellar-sdk';
+import { StellarRpcPoolService } from '../stellar/stellar-rpc-pool.service';
+import { AccountSequenceCoordinatorService } from '../stellar/account-sequence-coordinator.service';
 
 /**
  * Durable record of an anchoring attempt, keyed by operation intent.
@@ -80,18 +82,16 @@ export class AnchorIntentConflictError extends Error {
 @Injectable()
 export class ConfessionAnchorService {
   private readonly logger = new Logger(ConfessionAnchorService.name);
-  private readonly server: StellarSdk.Horizon.Server;
   private readonly network: StellarSdk.Networks;
   private readonly contractId: string;
   private readonly intentStore: AnchorIntentStore;
 
-  constructor(intentStore?: AnchorIntentStore) {
+  constructor(
+    private readonly rpcPool: StellarRpcPoolService,
+    private readonly sequenceCoordinator: AccountSequenceCoordinatorService,
+    @Optional() intentStore?: AnchorIntentStore,
+  ) {
     const isTestnet = process.env.STELLAR_NETWORK !== 'mainnet';
-    this.server = new StellarSdk.Horizon.Server(
-      isTestnet
-        ? 'https://horizon-testnet.stellar.org'
-        : 'https://horizon.stellar.org',
-    );
     this.network = isTestnet ? StellarSdk.Networks.TESTNET : StellarSdk.Networks.PUBLIC;
     this.contractId = process.env.ANCHOR_CONTRACT_ID!;
     this.intentStore = intentStore ?? new InMemoryAnchorIntentStore();
@@ -359,7 +359,56 @@ export class ConfessionAnchorService {
     // Build Soroban invoke_contract_function transaction.
     // Args: commitment (BytesN<32>), ephemeral_pub (BytesN<32>)
     this.logger.debug(`Invoking anchor contract with commitment: ${commitment.toString('hex')}`);
-    // Implementation: use @stellar/stellar-sdk SorobanRpc to submit.
-    return 'placeholder_tx_hash';
+
+    // Read the source account through the health-aware RPC pool so a slow or
+    // unavailable endpoint fails over to a healthy alternate.
+    const sourceAccount = await this.rpcPool.executeRead((server) =>
+      server.getAccount(signer.publicKey()),
+    );
+
+    // Serialize sequence allocation for this account across all workers so
+    // concurrent submitters cannot build transactions from the same sequence.
+    // The lease is released only after submission settles (success or failure),
+    // preventing duplicate submission during endpoint changes.
+    return this.sequenceCoordinator.withSequence(
+      signer.publicKey(),
+      sourceAccount.sequenceNumber(),
+      async (sequence) => {
+        const tx = new StellarSdk.TransactionBuilder(sourceAccount, {
+          fee: StellarSdk.BASE_FEE,
+          networkPassphrase: this.network,
+          // Pin the coordinated sequence so retries/failover reuse the same tx.
+          sequence,
+        })
+          .addOperation(
+            StellarSdk.Operation.invokeContractFunction({
+              contract: this.contractId,
+              function: 'anchor',
+              args: [
+                StellarSdk.nativeToScVal(commitment, { type: 'bytes' }),
+                StellarSdk.nativeToScVal(signer.publicKey(), { type: 'address' }),
+              ],
+            }),
+          )
+          .setTimeout(30)
+          .build();
+
+        tx.sign(signer);
+
+        // Submission is not idempotent across endpoints: the pool must submit
+        // to a single endpoint and only fail over on pre-submission failures.
+        const response = await this.rpcPool.executeSubmit((server) =>
+          server.sendTransaction(tx),
+        );
+
+        if (response.status === 'ERROR') {
+          throw new Error(
+            `Anchor submission failed: ${JSON.stringify(response.errorResult ?? response)}`,
+          );
+        }
+
+        return response.hash;
+      },
+    );
   }
 }

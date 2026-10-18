@@ -29,6 +29,18 @@ export interface NormalizedAuthError {
 export function normalizeAuthError(error: any): NormalizedAuthError {
   const status = extractStatus(error);
   const message = extractMessage(error);
+  const normalizedCode = extractErrorCode(error);
+
+  if (normalizedCode === 'SESSION_REVOKED' || normalizedCode === 'SESSION_REVOKED_OR_EXPIRED') {
+    return {
+      type: 'TERMINAL',
+      code: 'SESSION_REVOKED',
+      message: 'Your session was revoked. Please sign in again.',
+      retryable: false,
+      originalStatus: status || 401,
+      originalError: error,
+    };
+  }
 
   // Network errors and timeouts => TRANSIENT
   if (isNetworkError(error)) {
@@ -58,7 +70,7 @@ export function normalizeAuthError(error: any): NormalizedAuthError {
   if (status === 401) {
     return {
       type: 'TERMINAL',
-      code: 'INVALID_SESSION',
+      code: normalizedCode === 'INVALID_SESSION' ? 'INVALID_SESSION' : 'INVALID_SESSION',
       message: 'Your session has expired. Please log in again.',
       retryable: false,
       originalStatus: status,
@@ -146,11 +158,38 @@ function extractMessage(error: any): string {
       return error.error.message;
     }
   }
-  if ('data' in error && typeof error.data === 'object' && 'message' in error.data) {
-    return error.data.message;
+  if ('data' in error && typeof error.data === 'object') {
+    if (typeof error.data.message === 'string') return error.data.message;
+    if (typeof error.data.error === 'string') return error.data.error;
+    if (typeof error.data.error === 'object' && 'message' in error.data.error) {
+      return error.data.error.message;
+    }
   }
 
   return '';
+}
+
+function extractErrorCode(error: any): string | null {
+  if (!error || typeof error !== 'object') return null;
+
+  const candidates = [
+    error.code,
+    error.reasonCode,
+    error.error?.code,
+    error.error?.reasonCode,
+    error.data?.code,
+    error.data?.reasonCode,
+    error.response?.data?.code,
+    error.response?.data?.reasonCode,
+  ];
+
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.length > 0) {
+      return value;
+    }
+  }
+
+  return null;
 }
 
 /**

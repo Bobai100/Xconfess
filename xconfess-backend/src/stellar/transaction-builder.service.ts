@@ -23,6 +23,15 @@ export interface ISubmitOptions {
   /** How long a pending record is considered authoritative before expiry. */
   pendingTtlMs?: number;
 }
+import {
+  AccountSequenceCoordinator,
+  AccountSequenceLease,
+} from './account-sequence-coordinator.service';
+import {
+  TransactionLatencyService,
+  TransactionOperationClass,
+  TransactionPhase,
+} from './transaction-latency.service';
 
 @Injectable()
 export class TransactionBuilderService {
@@ -31,6 +40,8 @@ export class TransactionBuilderService {
   constructor(
     private stellarConfig: StellarConfigService,
     private readonly pendingStore: PendingSubmissionStore,
+    private sequenceCoordinator: AccountSequenceCoordinator,
+    private transactionLatency: TransactionLatencyService,
   ) {}
 
   /**
@@ -41,6 +52,44 @@ export class TransactionBuilderService {
     sourcePublicKey: string,
     operations: any[],
     options?: ITransactionOptions,
+  ): Promise<any> {
+    const operationClass = TransactionLatencyService.classifyOperations(
+      operations,
+    );
+    const startedAt = Date.now();
+    const lease = await this.sequenceCoordinator.acquire(sourcePublicKey);
+    try {
+      const transaction = await this.buildTransactionWithLease(
+        sourcePublicKey,
+        operations,
+        options,
+        lease,
+      );
+      this.transactionLatency.record(
+        TransactionPhase.BUILD,
+        operationClass,
+        Date.now() - startedAt,
+        true,
+      );
+      return transaction;
+    } catch (error) {
+      this.transactionLatency.record(
+        TransactionPhase.BUILD,
+        operationClass,
+        Date.now() - startedAt,
+        false,
+      );
+      throw error;
+    } finally {
+      await this.sequenceCoordinator.release(lease);
+    }
+  }
+
+  private async buildTransactionWithLease(
+    sourcePublicKey: string,
+    operations: any[],
+    options: ITransactionOptions | undefined,
+    lease: AccountSequenceLease,
   ): Promise<any> {
     const maxFee = this.stellarConfig.getConfig().maxFeeBudget;
     const feeBackoffMs = this.stellarConfig.getConfig().feeBackoffMs;
@@ -68,9 +117,15 @@ export class TransactionBuilderService {
       }
 
       try {
-        // Load source account
+        // Load source account. The coordinator pins the sequence we are allowed
+        // to build against so a stale network read cannot reuse a sequence.
         const server = this.stellarConfig.getServer();
         const sourceAccount = await server.loadAccount(sourcePublicKey);
+        const pinnedSequence = this.sequenceCoordinator.nextSequence(
+          lease,
+          sourceAccount.sequenceNumber(),
+        );
+        sourceAccount.sequenceNumber = () => pinnedSequence;
 
         const txBuilder = new StellarSDK.TransactionBuilder(sourceAccount, {
           fee: options?.fee || feeEstimate.toString(),
@@ -172,10 +227,11 @@ export class TransactionBuilderService {
   async submitTransaction(
     transaction: any,
     options: ISubmitOptions = {},
+    operationClass: TransactionOperationClass = TransactionOperationClass.OTHER,
   ): Promise<any> {
     const { intentKey } = options;
     if (!intentKey) {
-      return this.submitWithRetries(transaction);
+      return this.submitWithRetries(transaction, operationClass);
     }
 
     const ttlMs =
@@ -214,7 +270,7 @@ export class TransactionBuilderService {
     await this.pendingStore.put(record);
 
     try {
-      const result = await this.submitWithRetries(transaction);
+      const result = await this.submitWithRetries(transaction, operationClass);
       await this.pendingStore.put({
         ...record,
         status: 'confirmed',
@@ -246,7 +302,7 @@ export class TransactionBuilderService {
     record?: PendingSubmissionRecord,
   ): Promise<any | null> {
     const pending = record ?? (await this.pendingStore.get(intentKey));
-    if (!pending || !pending.txHash) {
+
       return null;
     }
 
@@ -312,11 +368,68 @@ export class TransactionBuilderService {
     );
   }
 
-  private async submitWithRetries(transaction: any): Promise<any> {
-    const maxRetries = this.stellarConfig.getConfig().rpcMaxRetries;
+  private async submitWithRetries(
+    transaction: any,
+    operationClass: TransactionOperationClass = TransactionOperationClass.OTHER,
+  ): Promise<any> {
+    // Hold the account sequence lease across submission so a retry or a
+    // concurrent worker cannot interleave a competing sequence.
+    const sourceAccountId = this.getSourceAccountId(transaction);
+    const lease = sourceAccountId
+      ? await this.sequenceCoordinator.acquire(sourceAccountId)
+      : undefined;
+  }
     const baseDelay = this.stellarConfig.getConfig().rpcRetryBaseDelayMs;
     const maxDelay = this.stellarConfig.getConfig().rpcRetryMaxDelayMs;
+    const startedAt = Date.now();
 
+    try {
+      const result = await this.submitTransactionInternal(
+        transaction,
+        maxRetries,
+        baseDelay,
+        maxDelay,
+      );
+      this.transactionLatency.record(
+        TransactionPhase.SUBMISSION,
+        operationClass,
+        Date.now() - startedAt,
+        true,
+      );
+      return result;
+    } catch (error) {
+      this.transactionLatency.record(
+        TransactionPhase.SUBMISSION,
+        operationClass,
+        Date.now() - startedAt,
+        false,
+      );
+      throw error;
+    } finally {
+      if (lease) {
+        await this.sequenceCoordinator.release(lease);
+      }
+    }
+  }
+
+  private getSourceAccountId(transaction: any): string | undefined {
+    try {
+      const source = transaction?.source;
+      if (!source) {
+        return undefined;
+      }
+      return typeof source === 'string' ? source : source.accountId?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async submitTransactionInternal(
+    transaction: any,
+    maxRetries: number,
+    baseDelay: number,
+    maxDelay: number,
+  ): Promise<any> {
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
@@ -343,6 +456,14 @@ export class TransactionBuilderService {
             txCode === 'tx_malformed' ||
             txCode === 'tx_not_supported'
           ) {
+            if (txCode === 'tx_bad_seq') {
+              // Sequence was consumed or invalidated elsewhere; drop the cached
+              // sequence so the next build re-reads from the network.
+              const accountId = this.getSourceAccountId(transaction);
+              if (accountId) {
+                this.sequenceCoordinator.invalidate(accountId);
+              }
+            }
             throw new Error(`Transaction failed (non-retryable): ${JSON.stringify(resultCodes)}`);
           }
         }
@@ -379,5 +500,35 @@ export class TransactionBuilderService {
 
     const message = lastError instanceof Error ? lastError.message : String(lastError);
     throw new Error(`Transaction submission failed after ${maxRetries + 1} attempts: ${message}`);
+  }
+
+  /**
+   * Record inclusion/confirmation latency observed by callers once the
+   * transaction is observed on-chain. Bounded labels only.
+   */
+  recordInclusionLatency(
+    operationClass: TransactionOperationClass,
+    latencyMs: number,
+    success: boolean,
+  ): void {
+    this.transactionLatency.record(
+      TransactionPhase.INCLUSION,
+      operationClass,
+      latencyMs,
+      success,
+    );
+  }
+
+  recordConfirmationLatency(
+    operationClass: TransactionOperationClass,
+    latencyMs: number,
+    success: boolean,
+  ): void {
+    this.transactionLatency.record(
+      TransactionPhase.CONFIRMATION,
+      operationClass,
+      latencyMs,
+      success,
+    );
   }
 }

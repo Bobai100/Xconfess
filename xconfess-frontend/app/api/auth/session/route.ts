@@ -196,8 +196,13 @@ export async function GET(request: Request) {
         }
 
         if (!result.success) {
-            // If 401, clear the invalid session cookie
-            if (result.normalized?.originalStatus === 401) {
+            const shouldClearSession =
+                result.normalized?.originalStatus === 401 ||
+                result.normalized?.code === "SESSION_REVOKED" ||
+                result.normalized?.code === "INVALID_SESSION" ||
+                result.normalized?.originalError?.reasonCode === "SESSION_REVOKED_OR_EXPIRED";
+
+            if (shouldClearSession) {
                 cookieStore.delete(SESSION_COOKIE_NAME);
             }
             return createErrorResponse(result.normalized!, requestId);

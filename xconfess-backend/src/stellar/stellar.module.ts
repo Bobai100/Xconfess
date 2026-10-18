@@ -18,6 +18,8 @@ import { AnonymousConfession } from '../confession/entities/confession.entity';
 import { Tip } from '../tipping/entities/tip.entity';
 import { SorobanEventCheckpointService } from './soroban-event-checkpoint.service';
 import { SorobanEventRangeVerifierService } from './soroban-event-range-verifier.service';
+import { StellarRpcEndpointPoolService } from './stellar-rpc-endpoint-pool.service';
+import { AccountSequenceCoordinatorService } from './account-sequence-coordinator.service';
 
 @Module({
   imports: [
@@ -42,6 +44,8 @@ import { SorobanEventRangeVerifierService } from './soroban-event-range-verifier
     ReputationReconciliationWorker,
     SorobanEventCheckpointService,
     SorobanEventRangeVerifierService,
+    StellarRpcEndpointPoolService,
+    AccountSequenceCoordinatorService,
   ],
   controllers: [StellarController],
   exports: [
@@ -52,6 +56,8 @@ import { SorobanEventRangeVerifierService } from './soroban-event-range-verifier
     DeploymentMetadataService,
     SorobanEventCheckpointService,
     SorobanEventRangeVerifierService,
+    StellarRpcEndpointPoolService,
+    AccountSequenceCoordinatorService,
   ],
 })
 export class StellarModule {}

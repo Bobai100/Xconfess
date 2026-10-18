@@ -41,6 +41,7 @@ import { GetUser } from '../auth/get-user.decorator';
 import { RequestUser } from '../auth/interfaces/jwt-payload.interface';
 import { StellarDiagnosticsService } from './services/stellar-diagnostics.service';
 import { DiagnosticsBundleService } from './services/diagnostics-bundle.service';
+import { RankingDriftService } from '../ranking/ranking-drift.service';
 import {
   IsString,
   IsEnum,
@@ -135,6 +136,7 @@ export class AdminController {
     private readonly auditLogService: AuditLogService,
     private readonly stellarDiagnosticsService: StellarDiagnosticsService,
     private readonly diagnosticsBundleService: DiagnosticsBundleService,
+    private readonly rankingDriftService: RankingDriftService,
   ) {}
 
   // Reports
@@ -773,5 +775,82 @@ export class AdminController {
       ? Math.min(Math.max(parseInt(windowMinutes, 10) || 30, 1), 1440)
       : 30;
     return this.diagnosticsBundleService.build(window);
+  }
+
+  // Ranking quality drift (Issue #267)
+  @Get('ranking/drift')
+  @ApiOperation({
+    summary: 'Get aggregate ranking quality drift indicators',
+    description:
+      'Returns minimum-cohort aggregate indicators only — no user-level histories ' +
+      'are retained or exposed. Indicators below the minimum cohort size are ' +
+      'suppressed and reported as insufficient data.',
+  })
+  @ApiQuery({
+    name: 'rankingVersion',
+    required: false,
+    type: String,
+    description: 'Ranking version to inspect (defaults to the active version)',
+  })
+  @ApiQuery({
+    name: 'windowHours',
+    required: false,
+    type: Number,
+    description: 'Aggregation window in hours (default: 24)',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Aggregate drift indicators and threshold evaluation.',
+  })
+  @ApiResponse({ status: 403, description: 'Forbidden — admin role required.' })
+  async getRankingDrift(
+    @Query('rankingVersion') rankingVersion?: string,
+    @Query('windowHours') windowHours?: string,
+  ) {
+    const window = windowHours
+      ? Math.min(Math.max(parseInt(windowHours, 10) || 24, 1), 168)
+      : 24;
+    return this.rankingDriftService.getDriftIndicators({
+      rankingVersion,
+      windowHours: window,
+    });
+  }
+
+  @Post('ranking/:version/disable')
+  @UseGuards(StepUpGuard)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Disable a ranking version (kill switch)',
+    description:
+      'Disables the given ranking version via feature flag and records an audit ' +
+      'entry. Requires step-up proof. Disabling an already-disabled version is ' +
+      'idempotent.',
+  })
+  @ApiParam({ name: 'version', description: 'Ranking version identifier' })
+  @ApiBody({
+    schema: {
+      example: {
+        reason: 'Drift threshold breached: CTR drop of 18% over 24h.',
+      },
+    },
+  })
+  @ApiResponse({ status: 200, description: 'Ranking version disabled.' })
+  @ApiResponse({
+    status: 403,
+    description: 'Missing or expired step-up proof.',
+  })
+  @ApiResponse({ status: 404, description: 'Ranking version not found.' })
+  async disableRankingVersion(
+    @Param('version') version: string,
+    @Body() body: { reason?: string },
+    @GetUser('id') adminId: number,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.rankingDriftService.disableRankingVersion({
+      version,
+      adminId,
+      reason: body?.reason || null,
+      req,
+    });
   }
 }
