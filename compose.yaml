@@ -33,7 +33,7 @@ services:
   # docker compose -f compose.yaml --profile app up --build
   # Its health status uses the deployed backend readiness contract.
   backend:
-    image: node:20-alpine
+    image: node:22-alpine
     container_name: xconfess-backend
     profiles: ["app"]
     working_dir: /workspace/xconfess-backend

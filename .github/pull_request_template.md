@@ -1,11 +1,16 @@
 <!--
   Small PR policy: https://github.com/Xconfess/Xconfess/blob/main/docs/SMALL_PR_POLICY.md
-  Keep this PR focused on ONE issue. Fill in every section — mark unused ones N/A.
+  Keep this PR focused on the approved scope. If it resolves multiple issues,
+  list a separate `Closes #number` reference for each issue below.
+  For data-flow changes, complete docs/data-flow-threat-model-checklist.md.
+  Fill in every section — mark unused ones N/A.
 -->
 
 ## Closes
 
 Closes #<!-- issue number -->
+
+<!-- Add one separate Closes #number line for every additional issue. -->
 
 ---
 
