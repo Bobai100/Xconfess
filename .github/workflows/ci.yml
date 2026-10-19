@@ -25,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -33,6 +35,16 @@ jobs:
       - run: npm install --global npm@10.9.3
       - run: npm ci --include=optional --no-audit --no-fund
       - run: npm run audit:ci
+      - name: Enforce dependency license and change policy
+        run: npm run dependency:policy -- --base "${{ github.event.before || 'HEAD^' }}"
+      - name: Retain dependency policy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-policy-report
+          path: dependency-policy-report.json
+          if-no-files-found: warn
+          retention-days: 90
 
   sbom:
     name: Security / SBOM & provenance
@@ -170,6 +182,16 @@ jobs:
       - run: npm run ci:apps
       - name: Check OpenAPI artifact drift
         run: bash scripts/check-openapi-drift.sh
+      - name: Check release compatibility evidence
+        run: npm run check:release-compatibility
+      - name: Retain release compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-compatibility-report
+          path: release-compatibility-report.json
+          if-no-files-found: warn
+          retention-days: 90
 
   backend-test-coverage:
     # Issue #117: Run backend unit tests with risk-domain coverage thresholds.

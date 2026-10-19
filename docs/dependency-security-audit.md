@@ -131,7 +131,14 @@ npm run secret-scan && npm run audit:ci && npm run backend:test
 
 ### Follow-up Work
 
-- Add a policy gate that fails the build when a new transitive dependency is
-  introduced without an explicit approval record.
+- `npm run dependency:policy -- --base <ref>` compares the production dependency
+  graph in `package-lock.json` with the selected base ref. It writes a
+  reviewable JSON report, blocks additions/version/license changes without an
+  exact time-limited approval, and blocks changed packages with unknown or
+  disallowed licenses. Pre-existing license gaps remain visible as non-blocking
+  findings until legal review; approved exceptions belong in
+  `dependency-license-policy.json` and must include a reason, tracking issue,
+  exact package/version/license (and change class for change approvals), and
+  expiry. CI uploads the report as an artifact.
 - Publish the SBOM artifacts to the internal artifact registry for long-term
   retention.

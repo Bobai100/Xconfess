@@ -137,6 +137,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node 22
         uses: actions/setup-node@v4
@@ -154,6 +156,23 @@ jobs:
       # Secret scan before anything else touches secrets
       - name: Secret scan
         run: npm run secret-scan
+
+      - name: Gate dependency license and change policy
+        run: npm run dependency:policy -- --base "${{ github.event.before || format('{0}^', github.sha) }}"
+
+      - name: Gate release compatibility evidence
+        run: npm run check:release-compatibility
+
+      - name: Retain release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-compatibility-${{ github.run_id }}
+          path: |
+            dependency-policy-report.json
+            release-compatibility-report.json
+          if-no-files-found: warn
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
       # Run the full CI suite: lint, typecheck, test, build
       - name: CI — backend

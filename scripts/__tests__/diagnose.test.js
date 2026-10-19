@@ -14,6 +14,7 @@ const test   = require('node:test');
 const fs     = require('fs');
 const os     = require('os');
 const path   = require('path');
+const { createReproductionBundle, scanReproductionBundle } = require('../diagnose');
 
 // ── Pure helper re-implementations ───────────────────────────────────────────
 // We duplicate the small pure functions from diagnose.js to keep tests
@@ -111,4 +112,30 @@ test('envPresence never leaks any secret value into output', () => {
   const serialized = JSON.stringify(result);
   assert.ok(!serialized.includes(secret));
   assert.ok(Object.values(result).every((v) => v === '<set>' || v === '<empty>'));
+});
+
+test('reproduction bundle contains only the approved safe fields', () => {
+  const bundle = createReproductionBundle({
+    runtime: { node: 'v22.1.0', npm: '10.2.0', platform: 'linux', arch: 'x64' },
+    appVersions: { root: '1.0.0', backend: '0.0.1', frontend: '0.1.0' },
+    serviceHealth: { postgres: 'reachable', redis: 'unreachable' },
+    configKeys: { backend: ['DB_HOST', 'JWT_SECRET'], frontend: ['NEXT_PUBLIC_API_URL'] },
+    generatedAt: '2026-10-19T00:00:00.000Z',
+  });
+
+  assert.deepEqual(scanReproductionBundle(bundle), []);
+  assert.equal(JSON.stringify(bundle).includes('DB_HOST='), false);
+});
+
+test('reproduction bundle privacy scan rejects added user content and identifiers', () => {
+  const bundle = createReproductionBundle({
+    runtime: { node: 'v22.1.0', npm: '10.2.0', platform: 'linux', arch: 'x64' },
+    appVersions: { root: '1.0.0', backend: '0.0.1', frontend: '0.1.0' },
+    serviceHealth: { postgres: 'reachable', redis: 'reachable' },
+    configKeys: { backend: [], frontend: [] },
+    generatedAt: '2026-10-19T00:00:00.000Z',
+  });
+  bundle.confession = 'private report text';
+
+  assert.ok(scanReproductionBundle(bundle).includes('unexpected-or-missing-fields'));
 });
