@@ -384,3 +384,6 @@ When adding a new API endpoint, follow the [API endpoint contributor checklist](
 
 <!-- handsoff-issue-253 -->
 - #253: [Advanced] Make private attachment delivery resumable and access-scoped
+
+<!-- handsoff-issue-242 -->
+- #242: [Advanced] Separate reporter identity from evidence access permissions

@@ -194,6 +194,127 @@ must not assume messages live forever or that local copies outlive the server.
 
 ### Supported Retention Choices And Defaults
 
+Moderation reviewers interpret ambiguous policy cases. To keep decisions
+consistent without letting consensus replace policy review, reviewer guidance is
+versioned and reviewers are calibrated against anonymized exercises.
+
+### Versioned Annotation Guidelines
+
+- Guidelines are versioned; every review decision records the guideline version
+  it was made under so past decisions remain reproducible.
+- Publishing a new guideline version is an authorized action (moderator/admin)
+  enforced at the owning backend boundary; unauthorized publishes are rejected
+  with `403`.
+- A decision referencing an unknown or retired guideline version is rejected
+  with `422` rather than silently falling back to the latest version.
+
+### Anonymized Calibration Exercises
+
+- Calibration exercises present anonymized cases (no reporter or author
+  identity) so reviewers judge the policy question, not the person.
+- Exercise responses are stored separately from live moderation decisions and
+  never affect a real case outcome.
+- Only authorized reviewers may fetch exercises or submit responses;
+  unauthorized access is rejected at the boundary.
+
+### Measuring Agreement
+
+- Reviewer agreement (e.g. inter-rater agreement such as Cohen's or Fleiss'
+  kappa) is computed over calibration responses and reported as a signal.
+- Agreement is **not** a substitute for policy review: a high-agreement but
+  policy-incorrect answer is still wrong, and consensus never auto-resolves a
+  live case.
+- Agreement metrics are advisory; final decisions remain with authorized
+  reviewers applying the current guideline version.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path plus rejection cases
+(unauthorized guideline publish, unknown guideline version, unauthorized
+calibration access) and the regression risk that agreement metrics are treated
+as advisory rather than as an automatic decision. Run them with:
+
+```bash
+npm run backend:test
+```
+
+## Safe Policy Replay
+
+Policy migrations need a way to estimate how decisions would change under a new
+policy version **without** touching live user content or notifying anyone. The
+replay command runs over a selected set of moderation cases in isolation.
+
+### Running A Replay
+
+```bash
+npm run backend:replay -- \
+  --policy-version <new-version> \
+  --cases <case-id,case-id,...>
+```
+
+- Replay is an authorized action (moderator/admin) enforced at the owning
+  backend boundary; unauthorized invocations are rejected with `403`.
+- An unknown or retired target policy version is rejected with `422`.
+
+### Isolation Guarantees
+
+- Replay never mutates live user content, never writes production decision
+  records, and never triggers notifications or fanout.
+- Replay reads cases into an isolated evaluation context; results are written
+  only to the diff report, not to the case store.
+
+### Redaction
+
+- Replay inputs and outputs redact identifiers: user ids, author/reporter
+  identity, and raw content are replaced with stable opaque tokens.
+- The diff report contains only redacted tokens, decision labels, and counts —
+  never raw content or personal identifiers.
+
+### Diff Report
+
+- The report compares the recorded decision against the decision the new policy
+  version would produce, per case, and summarizes changed vs unchanged counts.
+- The report is advisory: it cannot apply decisions to production records.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path plus rejection cases
+(unauthorized replay, unknown policy version) and the regression risk that a
+replay mutates live content, writes production decisions, or leaks identifiers.
+Run them with:
+
+```bash
+npm run backend:test
+```
+
+## User Safety Filters For Sensitive Content
+
+Users can opt in or out of seeing sensitive content categories. These are
+**display preferences only** and never change moderation enforcement.
+
+### Supported Categories
+
+- **Join** — a user may join only via an accepted invite or an explicit
+  self-join policy enabled for the conversation. Direct joins without either
+  are rejected with `403`.
+- **Leave** — any active member may leave. Leaving removes the member from
+  future fanout but preserves their historical access per the history rules
+  below.
+- **Remove** — only the conversation owner or an authorized moderator may
+  remove another member. Removing a non-member is a no-op success; removing
+yourself must go through the leave path.
+- Every transition is idempotent and records the actor, target, and reason so
+  audit trails stay consistent.
+
+### Where Preferences Are Applied
+
+- Only active members with the `invite` capability (owner, moderators, or
+  members when the conversation allows member invites) may create invites.
+- Invites are scoped to a single conversation and a single invitee, expire, and
+  
+
+### Supported Retention Choices And Defaults
+
 - `7d`, `30d`, `90d`, `1y`, and `forever` are the supported retention choices.
 - The default is `30d` when a conversation does not specify one.
 - Retention is set by an authorized participant (owner or moderator) and is
@@ -213,122 +334,6 @@ must not assume messages live forever or that local copies outlive the server.
   can distinguish expiry from a missing message.
 
 ### Deletion Completion Records
-
-- When a message is purged, the backend records a deletion completion marker
-  (message id, conversation id, timestamp, reason) **without** the message body.
-- These markers support audit and idempotent retries and must never contain
-  message content.
-
-### Authorization And Failure Semantics
-
-- Only authorized participants may read, change retention for, or delete
-  messages; unauthorized requests are rejected with `403` at the owning
-  boundary.
-- Purge failures are retried and surfaced; a message is never reported as
-  deleted until the deletion completion marker is written.
-
-### Testing Expectations
-
-Backend tests for this area must cover the expected path plus rejection cases
-(unauthorized retention change, unsupported retention value, expired read) and
-the regression risk of expired content leaking through indexes, notifications,
-or device sync. Run them with:
-
-```bash
-npm run backend:test && npm run frontend:test
-```
-
-## Conversation Ordering And Unread Reconciliation
-
-Conversation previews and unread counts are owned by the backend. Clients must
-treat the server as the single source of truth and never derive ordering or
-unread totals from local timestamps.
-
-### Deterministic Ordering
-
-- Conversation previews are ordered by a stable, server-assigned monotonic
-  sequence (not client `createdAt`/`updatedAt`). Ties are broken by the
-  conversation id so the order is total and reproducible.
-- Each message and preview carries an event cursor. Clients apply events in
-  cursor order and ignore any event whose cursor is not greater than the last
-  applied cursor for that conversation.
-
-### Reconnect Replay
-
-- On reconnect, clients resume from their last applied cursor. Replay is
-  idempotent: duplicate events are dropped and out-of-order events are buffered
-  or discarded rather than reordering previews.
-- Delayed delivery must not move a conversation ahead of a newer one; the
-  server sequence, not arrival time, decides position.
-
-### Unread Reconciliation
-
-- Unread counts are reconciled from authoritative server state (the unread
-  endpoint), not incremented optimistically from client events alone.
-- Reconciliation requires an authenticated session; unauthenticated or
-  unauthorized requests are rejected at the owning boundary and the client
-  keeps its last known counts rather than guessing.
-- On failure, clients surface the error and retry reconciliation; they must not
-  silently reset counts to zero.
-
-### Testing Expectations
-
-Backend tests for this area must cover the expected path plus delayed,
-duplicate, and out-of-order delivery, and the rejection/failure cases for
-unauthorized reconciliation. Run them with:
-
-```bash
-npm run backend:test
-```
-
-## Multi-Member Conversation Authorization
-
-Group conversations have their own authorization model. Membership, invites,
-history visibility, blocking, and fanout are all enforced by the backend at the
-ownership boundary; clients must not assume one-to-one messaging permissions
-extend to groups.
-
-### Membership Transitions
-
-- **Join** — a user may join only via an accepted invite or an explicit
-  self-join policy enabled for the conversation. Direct joins without either
-  are rejected with `403`.
-- **Leave** — any active member may leave. Leaving removes the member from
-  future fanout but preserves their historical access per the history rules
-  below.
-- **Remove** — only the conversation owner or an authorized moderator may
-  remove another member. Removing a non-member is a no-op success; removing
-yourself must go through the leave path.
-- Every transition is idempotent and records the actor, target, and reason so
-  audit trails stay consistent.
-
-### Invite Authorization
-
-- Only active members with the `invite` capability (owner, moderators, or
-  members when the conversation allows member invites) may create invites.
-- Invites are scoped to a single conversation and a single invitee, expire, and
-  
-
-- Unknown or unsupported languages use a safe fallback: NFKC normalization,
-  case folding, and whitespace/punctuation tokenization without diacritic
-  folding that could corrupt non-Latin scripts.
-- Malformed input (invalid UTF-8, lone surrogates, control characters) is
-  sanitized before normalization; it never throws and never reaches the index
-  unnormalized.
-
-### Authorization And Failure Semantics
-
-- Search requires an authenticated session; unauthorized requests are rejected
-  with `403` at the search boundary.
-- Normalization failures fall back to the safe fallback path rather than
-  returning an error, and are logged without query content.
-
-### Testing Expectations
-
-Backend tests for this area must cover the expected path plus mixed-script
-input, malformed input, and the fallback for unknown languages, and the
-rejection case for unauthorized search. Fixtures live alongside the search
-tests. Run them with:
 
 ```bash
 npm run backend:test
