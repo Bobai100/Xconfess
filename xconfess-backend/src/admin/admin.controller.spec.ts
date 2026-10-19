@@ -9,6 +9,8 @@ import { ModerationTemplateService } from '../comment/moderation-template.servic
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { StellarDiagnosticsService } from './services/stellar-diagnostics.service';
 import { DiagnosticsBundleService } from './services/diagnostics-bundle.service';
+import { RankingDriftService } from '../ranking/ranking-drift.service';
+import { CrossDomainIntegrityService } from './services/cross-domain-integrity.service';
 
 describe('AdminController', () => {
   let controller: AdminController;
@@ -79,7 +81,24 @@ describe('AdminController', () => {
         },
         {
           provide: DiagnosticsBundleService,
-          useValue: { build: jest.fn().mockResolved({ bundleId: 'test-bundle' }) },
+          useValue: { build: jest.fn().mockResolvedValue({ bundleId: 'test-bundle' }) },
+        },
+        {
+          provide: RankingDriftService,
+          useValue: {
+            getDriftIndicators: jest.fn().mockResolvedValue({}),
+            disableRankingVersion: jest.fn().mockResolvedValue({}),
+          },
+        },
+        {
+          provide: CrossDomainIntegrityService,
+          useValue: {
+            runIntegrityReport: jest.fn().mockResolvedValue({
+              reportId: 'test-integrity-report',
+              summary: { totalChecks: 4, passedChecks: 4, failedChecks: 0, totalViolations: 0 },
+              checks: [],
+            }),
+          },
         },
       ],
     })
@@ -606,4 +625,33 @@ describe('AdminController', () => {
       }
     });
   });
-})
+
+  describe('getIntegrityReport', () => {
+    it('calls crossDomainIntegrityService.runIntegrityReport with parsed options', async () => {
+      const integrityService = (controller as any).crossDomainIntegrityService;
+      const res = await controller.getIntegrityReport(
+        'identity,content',
+        '25',
+        '3000',
+      );
+
+      expect(res).toBeDefined();
+      expect(integrityService.runIntegrityReport).toHaveBeenCalledWith({
+        domains: ['identity', 'content'],
+        limit: 25,
+        timeoutMs: 3000,
+      });
+    });
+
+    it('filters out invalid domains', async () => {
+      const integrityService = (controller as any).crossDomainIntegrityService;
+      await controller.getIntegrityReport('identity,invalid_domain');
+
+      expect(integrityService.runIntegrityReport).toHaveBeenCalledWith({
+        domains: ['identity'],
+        limit: undefined,
+        timeoutMs: undefined,
+      });
+    });
+  });
+});

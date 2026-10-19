@@ -43,6 +43,10 @@ import { StellarDiagnosticsService } from './services/stellar-diagnostics.servic
 import { DiagnosticsBundleService } from './services/diagnostics-bundle.service';
 import { RankingDriftService } from '../ranking/ranking-drift.service';
 import {
+  CrossDomainIntegrityService,
+  IntegrityDomain,
+} from './services/cross-domain-integrity.service';
+import {
   IsString,
   IsEnum,
   IsOptional,
@@ -137,6 +141,7 @@ export class AdminController {
     private readonly stellarDiagnosticsService: StellarDiagnosticsService,
     private readonly diagnosticsBundleService: DiagnosticsBundleService,
     private readonly rankingDriftService: RankingDriftService,
+    private readonly crossDomainIntegrityService: CrossDomainIntegrityService,
   ) {}
 
   // Reports
@@ -851,6 +856,55 @@ export class AdminController {
       adminId,
       reason: body?.reason || null,
       req,
+    });
+  }
+
+  @Get('integrity/report')
+  @ApiOperation({
+    summary: 'Generate cross-domain data integrity report',
+    description:
+      'Performs read-only bounded checks across identity, content, export, and moderation ' +
+      'domains to detect invariant violations, orphan references, and data corruption.',
+  })
+  @ApiQuery({
+    name: 'domains',
+    required: false,
+    description: 'Comma-separated domains to check: identity,content,export,moderation',
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    description: 'Max sample violations per check (1-200, default 50)',
+  })
+  @ApiQuery({
+    name: 'timeoutMs',
+    required: false,
+    description: 'Bounded execution time budget in ms (100-30000, default 5000)',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Integrity report containing stable error codes and repair guidance.',
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Forbidden — admin role required' })
+  async getIntegrityReport(
+    @Query('domains') domains?: string,
+    @Query('limit') limit?: string,
+    @Query('timeoutMs') timeoutMs?: string,
+  ) {
+    const parsedDomains = domains
+      ? (domains
+          .split(',')
+          .map((d) => d.trim().toLowerCase())
+          .filter((d) =>
+            ['identity', 'content', 'export', 'moderation'].includes(d),
+          ) as IntegrityDomain[])
+      : undefined;
+
+    return this.crossDomainIntegrityService.runIntegrityReport({
+      domains: parsedDomains,
+      limit: limit ? parseInt(limit, 10) : undefined,
+      timeoutMs: timeoutMs ? parseInt(timeoutMs, 10) : undefined,
     });
   }
 }

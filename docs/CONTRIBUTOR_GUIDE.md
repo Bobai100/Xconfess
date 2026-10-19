@@ -287,3 +287,41 @@ tests. Run them with:
 ```bash
 npm run backend:test
 ```
+
+## Cross-Domain Data Integrity Verification (#218)
+
+Independent table-level constraints can leave subtle orphan references across boundaries.
+The platform provides a read-only integrity report endpoint at `GET /api/admin/integrity/report` with:
+- **Domains covered**: `identity` (links between users and anonymous identities), `content` (confessions, comments), `export` (export requests, chunks), and `moderation` (reports, evidence).
+- **Stable Error Codes**: Canonical `ERR_INTEGRITY_*` codes for predictable log parsing and alert routing.
+- **Bounded Execution**: Configurable timeout budgets (`timeoutMs`, default 5s, max 30s) and per-check row limits (`limit`, default 50, max 200). If execution exceeds time bounds, the report returns truncated without crashing.
+- **Repair Guidance**: Each violation includes an actionable SQL query or remediation step for operators.
+- **Authorization**: Strictly restricted to administrators via `JwtAuthGuard` and `AdminGuard`.
+
+## Locale-Aware Message Catalogues with Typed Coverage (#219)
+
+User-facing strings are decoupled from presentation components into typed message catalogues under `xconfess-frontend/app/lib/i18n/`.
+- **Catalogue Structure**: Canonical keys are defined in `types.ts` (`REQUIRED_MESSAGE_KEYS`) and implemented in locale files (`locales/en.ts`, `locales/es.ts`).
+- **Typed Coverage**: The TypeScript types enforce that all catalogues provide every required key. `assertCompleteCatalog` verifies runtime completeness and fails checks if any key is missing.
+- **Fallback Behavior**: When a localized string is missing in the user's active locale, the `useTranslation` hook automatically falls back to the default English (`en`) catalogue. If missing in all catalogues, the key itself is returned.
+
+## Localized Formatting for Dates, Numbers, and Relative Time (#220)
+
+Shared formatters live in `xconfess-frontend/app/lib/i18n/formatters.ts` and wrap standard `Intl` APIs:
+- **Relative vs Absolute Time**: `formatRelativeTime` formats recent intervals into relative units (seconds, minutes, hours, days) and automatically transitions to absolute dates (`formatAbsoluteDate`) beyond configurable thresholds.
+- **Daylight Saving Time (DST)**: Relative durations use monotonic UTC millisecond math to avoid hour-boundary distortion during spring-forward or fall-back transitions.
+- **Safe Fallbacks**: Missing, null, undefined, or non-parseable inputs return safe fallback tokens (default `"—"`) rather than throwing runtime exceptions.
+- **Numbers and Pluralization**: `formatNumber` and `formatCount` format counts, compact abbreviations (`1.2K`), and locale-appropriate plural nouns.
+
+## Cross-Tab Draft Conflict Resolution (#221)
+
+When users edit confession drafts across multiple browser tabs:
+- **Revision Tracking**: Drafts maintain monotonic integer `version` numbers across saves.
+- **Stale Write Detection**: `useDrafts` inspects storage state prior to persisting. If another tab has committed a higher version, the local write is rejected and flagged as a `tab_conflict`.
+- **Dual-Version Preservation**: Unsaved local content and the newer conflicting version from storage are both captured in memory without data loss.
+- **Accessible Decision Flow**: `DraftManager` presents an accessible alert (`role="alert"`, `aria-live="assertive"`) offering choices to:
+  1. *Keep my version*: Rebase and persist local content with an incremented revision.
+  2. *Use other tab's version*: Overwrite the local editor with the newer copy.
+  3. *Save as separate draft*: Store the local content as a new draft, preserving both versions.
+  4. *Dismiss*: Dismiss the notice without altering editor state.
+

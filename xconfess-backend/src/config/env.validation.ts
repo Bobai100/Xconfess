@@ -504,4 +504,10 @@ export const envValidationSchema = Joi.object({
   SYNTHETIC_TX_CHECK_NETWORKS: Joi.string()
     .pattern(/^(testnet|mainnet)(,(testnet|mainnet))*$/)
     .default('testnet'),
+
+  // ── Cross-domain integrity checks ──────────────────────────────────────────
+  INTEGRITY_CHECK_DEFAULT_TIMEOUT_MS: Joi.number().min(100).max(30000).default(5000),
+  INTEGRITY_CHECK_MAX_TIMEOUT_MS: Joi.number().min(100).max(60000).default(30000),
+  INTEGRITY_CHECK_DEFAULT_LIMIT: Joi.number().min(1).max(200).default(50),
+  INTEGRITY_CHECK_MAX_LIMIT: Joi.number().min(1).max(1000).default(200),
 }).options({ allowUnknown: true, abortEarly: false });
