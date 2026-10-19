@@ -180,16 +180,23 @@ node scripts/verify-backup-restore.js \
 
 ### Scheduling drills
 
-Add to your CI/CD pipeline or cron:
+The repository schedules a secret-free dry-run rehearsal every Monday at 09:15
+UTC through `.github/workflows/rollback-drills.yml`. Maintainers can also select
+a drill with `workflow_dispatch`. Each run retains the evidence report and any
+generated remediation-gap checklist as a 90-day workflow artifact.
+
+The scheduled job does not inject faults, connect to a deployment, or use
+production secrets. It checks the available procedures and records gaps. A
+maintainer must arrange and authorize any live staging exercise separately.
+
+For another scheduler, use the same dry-run command:
 
 ```yaml
-# .github/workflows/backup-drill.yml (example — adapt to your scheduler)
+# Example — schedule in an isolated runner and retain the report directory.
 - name: Backup restore drill
   run: |
-    node scripts/verify-backup-restore.js \
-      --backup-file=${{ env.STAGING_BACKUP_PATH }} \
-      --target-db=${{ secrets.STAGING_DRILL_DB }} \
-      --dry-run   # remove for full drill
+    npm run rollback:drills:dry-run -- --drill all \
+      --report-dir "$RUNNER_TEMP/rollback-drill-results"
 ```
 
 ### RPO / RTO targets

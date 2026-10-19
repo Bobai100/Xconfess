@@ -1,6 +1,7 @@
 // src/stellar/transaction-builder.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import * as StellarSDK from '@stellar/stellar-sdk';
+import * as crypto from 'crypto';
 import { StellarConfigService } from './stellar-config.service';
 import { ITransactionOptions } from './interfaces/stellar-config.interface';
 import { redactSecretStrings } from '../utils/redact-secrets';
@@ -33,6 +34,40 @@ import {
   TransactionPhase,
 } from './transaction-latency.service';
 
+/**
+ * Envelope binding a simulation result to the exact network, contract and
+ * operation inputs it was produced for, plus the ledger state it observed.
+ * A submission must present a fresh, matching envelope or it is rejected.
+ */
+export interface SimulationResult {
+  networkPassphrase: string;
+  contractId: string;
+  operationHash: string;
+  latestLedgerSequence: number;
+  timestamp: number;
+}
+
+export interface SimulationContext {
+  contractId: string;
+  operations: any[];
+  latestLedgerSequence: number;
+}
+
+export class StaleSimulationError extends Error {
+  constructor(
+    message: string,
+    public readonly reason:
+      | 'network_mismatch'
+      | 'contract_mismatch'
+      | 'operation_mismatch'
+      | 'expired'
+      | 'ledger_advanced',
+  ) {
+    super(message);
+    this.name = 'StaleSimulationError';
+  }
+}
+
 @Injectable()
 export class TransactionBuilderService {
   private readonly logger = new Logger(TransactionBuilderService.name);
@@ -43,6 +78,95 @@ export class TransactionBuilderService {
     private sequenceCoordinator: AccountSequenceCoordinator,
     private transactionLatency: TransactionLatencyService,
   ) {}
+
+  /**
+   * Deterministically hash operation inputs so a simulation envelope can be
+   * bound to the exact operations it was produced for.
+   */
+  computeOperationHash(operations: any[]): string {
+    const serialized = JSON.stringify(operations ?? []);
+    return crypto.createHash('sha256').update(serialized).digest('hex');
+  }
+
+  /**
+   * Capture a simulation envelope for the given contract/operations.
+   * Callers must pass the envelope back to submitTransaction.
+   */
+  createSimulationResult(
+    context: SimulationContext,
+    now: number = Date.now(),
+  ): SimulationResult {
+    return {
+      networkPassphrase: this.stellarConfig.getNetwork(),
+      contractId: context.contractId,
+      operationHash: this.computeOperationHash(context.operations),
+      latestLedgerSequence: context.latestLedgerSequence,
+      timestamp: now,
+    };
+  }
+
+  /**
+   * Validate a simulation envelope against the current invocation and ledger
+   * state. Throws StaleSimulationError when the envelope is stale or does not
+   * match the network, contract or operations being submitted.
+   */
+  async validateSimulationResult(
+    simulation: SimulationResult | undefined,
+    context: SimulationContext,
+    now: number = Date.now(),
+  ): Promise<void> {
+    if (!simulation) {
+      throw new StaleSimulationError(
+        'Missing simulation result; refusing to submit',
+        'expired',
+      );
+    }
+
+    const currentNetwork = this.stellarConfig.getNetwork();
+    if (simulation.networkPassphrase !== currentNetwork) {
+      throw new StaleSimulationError(
+        `Simulation network ${simulation.networkPassphrase} does not match current network ${currentNetwork}`,
+        'network_mismatch',
+      );
+    }
+
+    if (simulation.contractId !== context.contractId) {
+      throw new StaleSimulationError(
+        `Simulation contract ${simulation.contractId} does not match current contract ${context.contractId}`,
+        'contract_mismatch',
+      );
+    }
+
+    const currentHash = this.computeOperationHash(context.operations);
+    if (simulation.operationHash !== currentHash) {
+      throw new StaleSimulationError(
+        'Simulation operation hash does not match current operations',
+        'operation_mismatch',
+      );
+    }
+
+    const freshnessWindowMs = this.stellarConfig.getSimulationFreshnessWindowMs();
+    const age = now - simulation.timestamp;
+    if (!Number.isFinite(age) || age < 0 || age > freshnessWindowMs) {
+      throw new StaleSimulationError(
+        `Simulation is stale: age ${age}ms exceeds freshness window ${freshnessWindowMs}ms`,
+        'expired',
+      );
+    }
+
+    const server = this.stellarConfig.getServer();
+    const latestLedger = await server.getLatestLedger();
+    const currentSequence = (latestLedger as any).sequence as number;
+    if (
+      typeof currentSequence === 'number' &&
+      currentSequence > simulation.latestLedgerSequence
+    ) {
+      throw new StaleSimulationError(
+        `Ledger advanced from ${simulation.latestLedgerSequence} to ${currentSequence} since simulation`,
+        'ledger_advanced',
+      );
+    }
+  }
 
   /**
    * Build a Stellar transaction with operations

@@ -11,6 +11,144 @@ import {
   DeploymentMetadataService,
 } from './services/deployment-metadata.service';
 
+/** Networks a Stellar endpoint, contract ID, or signer can belong to. */
+export type DetectedNetwork = StellarNetwork | 'unknown';
+
+/** Signer metadata validated as part of the network isolation unit. */
+export interface SignerMetadata {
+  /** Public key of the signer (G...). */
+  publicKey?: string;
+  /** Secret key of the signer (S...), if present in the environment. */
+  secretKey?: string;
+  /** Explicit network the signer was provisioned for, if declared. */
+  network?: string;
+}
+
+export interface NetworkIsolationInput {
+  network: StellarNetwork;
+  horizonUrl?: string;
+  sorobanRpcUrl?: string;
+  contractIds?: Partial<IStellarConfig['contractIds']>;
+  signer?: SignerMetadata;
+}
+
+export interface NetworkIsolationResult {
+  network: StellarNetwork;
+  horizonNetwork: DetectedNetwork;
+  sorobanNetwork: DetectedNetwork;
+  contractNetwork: DetectedNetwork;
+  signerNetwork: DetectedNetwork;
+}
+
+const TESTNET_URL_MARKERS = ['testnet', 'horizon-testnet', 'soroban-rpc-testnet'];
+const MAINNET_URL_MARKERS = ['horizon.stellar.org', 'soroban-rpc.stellar.org'];
+
+/**
+ * Derives the network implied by a Horizon or Soroban RPC URL. Returns
+ * `'unknown'` when the URL does not carry a recognizable network marker.
+ */
+export function detectNetworkFromUrl(url?: string): DetectedNetwork {
+  if (!url) {
+    return 'unknown';
+  }
+  const normalized = url.toLowerCase();
+  if (TESTNET_URL_MARKERS.some((marker) => normalized.includes(marker))) {
+    return StellarNetwork.TESTNET;
+  }
+  if (MAINNET_URL_MARKERS.some((marker) => normalized.includes(marker))) {
+    return StellarNetwork.MAINNET;
+  }
+  return 'unknown';
+}
+
+/**
+ * Derives the network implied by a contract ID. Soroban contract IDs are
+ * network-agnostic (C...), so this only reports a network when the ID embeds a
+ * recognizable network marker (e.g. a testnet/mainnet prefix used by tooling).
+ */
+export function detectNetworkFromContractId(
+  contractId?: string,
+): DetectedNetwork {
+  if (!contractId) {
+    return 'unknown';
+  }
+  const normalized = contractId.toLowerCase();
+  if (normalized.includes('testnet')) {
+    return StellarNetwork.TESTNET;
+  }
+  if (normalized.includes('mainnet') || normalized.includes('public')) {
+    return StellarNetwork.MAINNET;
+  }
+  return 'unknown';
+}
+
+/**
+ * Derives the network implied by signer metadata. An explicit `network` field
+ * wins; otherwise a secret key prefixed with `S` is treated as network-agnostic
+ * and reported as `'unknown'`.
+ */
+export function detectNetworkFromSigner(
+  signer?: SignerMetadata,
+): DetectedNetwork {
+  if (!signer) {
+    return 'unknown';
+  }
+  if (signer.network) {
+    const normalized = signer.network.toLowerCase();
+    if (normalized === StellarNetwork.MAINNET || normalized === 'public') {
+      return StellarNetwork.MAINNET;
+    }
+    if (normalized === StellarNetwork.TESTNET) {
+      return StellarNetwork.TESTNET;
+    }
+  }
+  return 'unknown';
+}
+
+/**
+ * Validates network, endpoints, contract IDs, and signer metadata as a single
+ * configuration unit. Throws when any component belongs to a different network
+ * than the configured one, preventing a production signer from pointing at
+ * testnet endpoints or a testnet secret from being used with mainnet contracts.
+ */
+export function validateNetworkIsolation(
+  input: NetworkIsolationInput,
+): NetworkIsolationResult {
+  const { network } = input;
+  const horizonNetwork = detectNetworkFromUrl(input.horizonUrl);
+  const sorobanNetwork = detectNetworkFromUrl(input.sorobanRpcUrl);
+
+  const contractNetworks = Object.values(input.contractIds ?? {})
+    .map((id) => detectNetworkFromContractId(id))
+    .filter((detected): detected is StellarNetwork => detected !== 'unknown');
+  const contractNetwork: DetectedNetwork =
+    contractNetworks.length > 0 ? contractNetworks[0] : 'unknown';
+
+  const signerNetwork = detectNetworkFromSigner(input.signer);
+
+  const conflicts: string[] = [];
+  const check = (label: string, detected: DetectedNetwork) => {
+    if (detected !== 'unknown' && detected !== network) {
+      conflicts.push(`${label} implies "${detected}"`);
+    }
+  };
+
+  check('Horizon URL', horizonNetwork);
+  check('Soroban RPC URL', sorobanNetwork);
+  check('Contract ID', contractNetwork);
+  check('Signer metadata', signerNetwork);
+
+  if (conflicts.length > 0) {
+    throw new Error(
+      `Stellar network isolation violation: configured network is "${network}" but ${conflicts.join(
+        '; ',
+      )}. Refusing to boot with mixed testnet/mainnet configuration.`,
+    );
+  }
+
+  return { network, horizonNetwork, sorobanNetwork, contractNetwork, signerNetwork };
+}
+
 @Injectable()
 export class StellarConfigService implements OnModuleInit {
   private readonly logger = new Logger(StellarConfigService.name);
@@ -130,6 +268,15 @@ export class StellarConfigService implements OnModuleInit {
       rpcRecoveryProbeTimeoutMs,
     };
 
+    // Enforce testnet/mainnet isolation across endpoints, contracts, and signer
+    validateNetworkIsolation({
+      network,
+      horizonUrl: this.config.horizonUrl,
+      sorobanRpcUrl: this.config.sorobanRpcUrl,
+      contractIds: this.config.contractIds,
+      signer: this.getSignerMetadata(),
+    });
+
     // Initialize Horizon server
     this.server = new StellarSDK.Horizon.Server(this.config.horizonUrl);
 
@@ -147,6 +294,14 @@ export class StellarConfigService implements OnModuleInit {
     this.logger.log(
       `RPC health policy: check interval ${rpcHealthCheckIntervalMs}ms, cooldown ${rpcCooldownMs}ms, failure threshold ${rpcFailureThreshold}, recovery probe timeout ${rpcRecoveryProbeTimeoutMs}ms`,
     );
+  }
+
+  private getSignerMetadata(): SignerMetadata {
+    return {
+      publicKey: this.configService.get<string>('STELLAR_SIGNER_PUBLIC_KEY'),
+      secretKey: this.configService.get<string>('STELLAR_SIGNER_SECRET_KEY'),
+      network: this.configService.get<string>('STELLAR_SIGNER_NETWORK'),
+    };
   }
 
   private applyDeploymentMetadataFallback(): void {
@@ -174,6 +329,17 @@ export class StellarConfigService implements OnModuleInit {
     if (featuresEnabled && metadata) {
       this.validateContractIdsAgainstNetwork(metadata, explicitContractIds);
     }
+
+    // Re-validate isolation now that contract IDs may have been resolved from
+    // deployment metadata, so a metadata-sourced ID cannot smuggle in a
+    // cross-network combination.
+    validateNetworkIsolation({
+      network: this.config.network,
+      horizonUrl: this.config.horizonUrl,
+      sorobanRpcUrl: this.config.sorobanRpcUrl,
+      contractIds: this.config.contractIds,
+      signer: this.getSignerMetadata(),
+    });
 
     const missingContractIds = Object.entries(this.config.contractIds)
       .filter(([, value]) => !value)

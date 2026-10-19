@@ -283,6 +283,208 @@ export const CHAOS_EXPERIMENTS: ChaosExperiment[] = [
   },
 
   // -------------------------------------------------------------------------
+  // EXP-06: Redis connection loss during export queue processing
+  // -------------------------------------------------------------------------
+  {
+    id: 'exp-06-redis-export-connection-loss',
+    title: 'Redis connection loss during export queue processing',
+    target: 'redis',
+    hypothesis:
+      'When the Redis connection backing the export queue is severed, the export ' +
+      'worker stops consuming without losing in-flight jobs; export requests are ' +
+      'accepted and persisted as "pending" rather than failing; and once Redis ' +
+      'reconnects the worker resumes and completes the backlogged exports.',
+    preconditions: [
+      'ENABLE_BACKGROUND_JOBS=true in staging',
+      'At least one export worker is active and the export queue is empty',
+      'NODE_ENV !== "production"',
+    ],
+    injectionSteps: [
+      '1. Block TCP to Redis from the app container: `iptables -A OUTPUT -p tcp --dport 6379 -j DROP`',
+      '2. Submit an export request via POST /api/exports and verify it returns 202 with status "pending"',
+      '3. Verify the export worker logs a connection error and pauses (no job loss)',
+      '4. Hold for 60 s, then restore: `iptables -D OUTPUT -p tcp --dport 6379 -j DROP`',
+      '5. Verify the worker reconnects and the pending export transitions to "completed"',
+    ],
+    metrics: [
+      {
+        name: 'export-request-acceptance',
+        expected: 'POST /api/exports returns 202 (not 5xx) while Redis is unreachable',
+        method: 'Check HTTP response status in staging request log',
+      },
+      {
+        name: 'export-job-retention',
+        expected: 'No export jobs lost; pending count unchanged during outage',
+        method: 'SELECT COUNT(*) FROM exports WHERE status = \'pending\' before / after restore',
+      },
+      {
+        name: 'export-recovery-time',
+        expected: 'Pending exports complete within 60 s of Redis restore',
+        method: 'Poll SELECT status FROM exports ORDER BY created_at DESC LIMIT 1',
+      },
+    ],
+    abortCondition:
+      'Export request returns 5xx OR export rows are lost / corrupted',
+    recoverySteps: [
+      'Remove the iptables rule: `iptables -D OUTPUT -p tcp --dport 6379 -j DROP`',
+      'Verify /health/status returns state: "ready"',
+      'Confirm the export worker drains the backlog and marks exports "completed"',
+    ],
+    remediationOnFailure:
+      'Open a follow-up issue: "Export queue loses jobs on Redis connection loss — add durable retry"',
+    durationSecs: 60,
+  },
+
+  // -------------------------------------------------------------------------
+  // EXP-07: Redis recovery and backlog growth for the notification queue
+  // -------------------------------------------------------------------------
+  {
+    id: 'exp-07-redis-notification-backlog',
+    title: 'Notification queue backlog growth and recovery after Redis outage',
+    target: 'queue-worker',
+    hypothesis:
+      'When Redis is unavailable long enough for the notification queue to accumulate ' +
+      'a backlog, the worker drains the backlog after recovery without dropping jobs, ' +
+      'without unbounded memory growth, and without duplicate notifications.',
+    preconditions: [
+      'ENABLE_BACKGROUND_JOBS=true in staging',
+      'At least one notification worker is active',
+      'NODE_ENV !== "production"',
+    ],
+    injectionSteps: [
+      '1. Stop the Redis container: `docker stop <redis-container-id>`',
+      '2. Generate 200 notification triggers (e.g. reactions) while Redis is down',
+      '3. Verify triggers are persisted (DB rows with status "pending") and no worker crash occurs',
+      '4. After 120 s, restart Redis: `docker start <redis-container-id>`',
+      '5. Observe the worker drain the backlog and process all 200 notifications',
+    ],
+    metrics: [
+      {
+        name: 'backlog-retention',
+        expected: 'All 200 triggers persisted; none lost during outage',
+        method: 'SELECT COUNT(*) FROM notification_logs WHERE status = \'pending\'',
+      },
+      {
+        name: 'backlog-drain-time',
+        expected: 'Backlog fully drained within 5 min of Redis restore',
+        method: 'Poll pending count every 15 s after restart',
+      },
+      {
+        name: 'duplicate-delivery',
+        expected: 'Exactly one notification per trigger after drain',
+        method: 'SELECT job_id, COUNT(*) FROM notification_logs GROUP BY job_id HAVING COUNT(*) > 1',
+      },
+    ],
+    abortCondition:
+      'Worker crashes OR backlog is not drained within 10 min of restore OR duplicate sends detected',
+    recoverySteps: [
+      'Restart Redis if still stopped: `docker start <redis-container-id>`',
+      'Verify /health/status returns state: "ready"',
+      'Drain any remaining test jobs and clean up test notification_log rows',
+    ],
+    remediationOnFailure:
+      'Open a follow-up issue: "Notification queue backlog not drained after Redis recovery"',
+    durationSecs: 120,
+  },
+
+  // -------------------------------------------------------------------------
+  // EXP-08: Duplicate delivery in the drafts queue
+  // -------------------------------------------------------------------------
+  {
+    id: 'exp-08-redis-drafts-duplicate',
+    title: 'Duplicate delivery in the drafts autosave queue',
+    target: 'queue-worker',
+    hypothesis:
+      'When the same draft autosave job is delivered twice (at-least-once delivery), ' +
+      'the drafts worker applies the autosave idempotently so the draft is persisted ' +
+      'exactly once per revision and no conflicting versions are created.',
+    preconditions: [
+      'ENABLE_BACKGROUND_JOBS=true in staging',
+      'At least one drafts worker is active',
+      'NODE_ENV !== "production"',
+    ],
+    injectionSteps: [
+      '1. Enqueue the same draft autosave payload twice with identical job IDs:',
+      '   `queue.add("autosave-draft", payload, { jobId: "draft-dedup-001" })`',
+      '   `queue.add("autosave-draft", payload, { jobId: "draft-dedup-001" })` // duplicate',
+      '2. Observe the drafts table — exactly one revision should be written for "draft-dedup-001"',
+      '3. Verify no optimistic-lock conflict or duplicate version row is produced',
+    ],
+    metrics: [
+      {
+        name: 'draft-revision-count',
+        expected: 'Exactly 1 revision persisted per unique job ID',
+        method: 'SELECT COUNT(*) FROM draft_revisions WHERE job_id = \'draft-dedup-001\'',
+      },
+      {
+        name: 'draft-conflict-errors',
+        expected: 'No version-conflict errors logged by the drafts worker',
+        method: 'Grep backend logs for "draft" + "conflict" during the run',
+      },
+    ],
+    abortCondition: 'Worker crashes OR draft data is corrupted / duplicated',
+    recoverySteps: [
+      'Drain any remaining test jobs: `queue.drain()`',
+      'Delete test draft_revisions rows if needed',
+    ],
+    remediationOnFailure:
+      'Open a follow-up issue: "Drafts worker is not idempotent under duplicate delivery"',
+    durationSecs: 30,
+  },
+
+  // -------------------------------------------------------------------------
+  // EXP-09: Redis connection loss and recovery for the tips queue
+  // -------------------------------------------------------------------------
+  {
+    id: 'exp-09-redis-tips-recovery',
+    title: 'Tips queue connection loss, recovery, and duplicate delivery',
+    target: 'queue-worker',
+    hypothesis:
+      'When Redis is unreachable, tip processing is deferred without losing the tip; ' +
+      'after Redis recovers the tips worker processes each tip exactly once; ' +
+      'and a duplicate delivery of the same tip job does not credit the recipient twice.',
+    preconditions: [
+      'ENABLE_BACKGROUND_JOBS=true in staging',
+      'At least one tips worker is active',
+      'NODE_ENV !== "production"',
+    ],
+    injectionSteps: [
+      '1. Stop the Redis container: `docker stop <redis-container-id>`',
+      '2. Submit a tip via POST /api/tips and verify it is persisted with status "pending"',
+      '3. Restart Redis after 60 s: `docker start <redis-container-id>`',
+      '4. Verify the tips worker processes the pending tip exactly once',
+      '5. Re-enqueue the same tip job ID to simulate duplicate delivery and verify no double credit',
+    ],
+    metrics: [
+      {
+        name: 'tip-retention',
+        expected: 'Tip persisted with status "pending" during outage; none lost',
+        method: 'SELECT status FROM tips ORDER BY created_at DESC LIMIT 1',
+      },
+      {
+        name: 'tip-processing-count',
+        expected: 'Exactly 1 credit per tip after recovery and duplicate delivery',
+        method: 'SELECT COUNT(*) FROM tip_credits WHERE tip_id = <test-tip-id>',
+      },
+      {
+        name: 'tips-recovery-time',
+        expected: 'Pending tip processed within 60 s of Redis restore',
+        method: 'Poll SELECT status FROM tips ORDER BY created_at DESC LIMIT 1',
+      },
+    ],
+    abortCondition:
+      'Tip is lost OR recipient is credited more than once OR worker crashes',
+    recoverySteps: [
+      'Restart Redis if still stopped: `docker start <redis-container-id>`',
+      'Verify /health/status returns state: "ready"',
+      'Clean up test tip and tip_credits rows',
+    ],
+    remediationOnFailure:
+      'Open a follow-up issue: "Tips worker double-credits or loses tips on Redis recovery"',
+    durationSecs: 60,
+  },
+
+  // -------------------------------------------------------------------------
   // EXP-05: Stellar RPC timeout during confession anchoring
   // -------------------------------------------------------------------------
   {

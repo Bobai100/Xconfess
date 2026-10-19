@@ -11,6 +11,13 @@ pass before it can be merged.
 3. Create a topic branch off `main`.
 4. Make your change, add tests, and run the checks below.
 
+For changes that add or alter data collection, access, retention, or disclosure,
+complete the [data-flow threat-model review checklist](docs/data-flow-threat-model-checklist.md).
+For local Docker and service failures, follow the
+[troubleshooting decision tree](docs/local-service-troubleshooting.md). Check
+the [supported runtime and service versions](docs/supported-service-versions.md)
+before changing runtime or infrastructure declarations.
+
 ## Quality gates
 
 Every pull request must pass the following gates. CI runs them automatically and

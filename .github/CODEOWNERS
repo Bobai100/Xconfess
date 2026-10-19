@@ -38,6 +38,7 @@ CONTRIBUTING.md                       @yazeed11011
 
 # ── Backend (NestJS) ─────────────────────────────────────────────────────────
 # Primary subsystem: API, auth, moderation, data-export, Stellar integration.
+/backend/                            @yazeed11011
 /xconfess-backend/                    @yazeed11011
 
 # Auth and session — security-sensitive; requires maintainer sign-off
@@ -78,6 +79,7 @@ CONTRIBUTING.md                       @yazeed11011
 /xconfess-backend/src/analytics/      @yazeed11011
 
 # ── Frontend (Next.js App Router) ────────────────────────────────────────────
+/frontend/                            @yazeed11011
 /xconfess-frontend/                   @yazeed11011
 
 # Auth flows and middleware — security-sensitive

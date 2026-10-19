@@ -4,10 +4,19 @@ import { Queue, Worker, Job } from 'bullmq';
 import { ConfigService } from '@nestjs/config';
 import { ConfessionDraftService } from './confession-draft.service';
 
+const PUBLISH_ONE_JOB_OPTIONS = {
+  attempts: 5,
+  backoff: { type: 'exponential' as const, delay: 1000 },
+  removeOnComplete: true,
+  removeOnFail: false,
+};
+
 @Injectable()
 export class ConfessionDraftQueue implements OnModuleDestroy {
   private readonly worker?: Worker;
   private readonly logger = new Logger(ConfessionDraftQueue.name);
+  private readonly pendingPublishIds = new Set<string>();
+  private recovered = false;
 
   constructor(
     private readonly configService: ConfigService,
@@ -33,22 +42,33 @@ export class ConfessionDraftQueue implements OnModuleDestroy {
         if (job.name === 'publish-due') {
           const ids = await this.draftService.enqueueDueDraftIds();
 
-          await Promise.all(
-            ids.map((id) =>
-              this.queue.add(
+          let enqueued = 0;
+
+          for (const id of ids) {
+            if (this.pendingPublishIds.has(id)) {
+              continue;
+            }
+
+            this.pendingPublishIds.add(id);
+
+            try {
+              await this.queue.add(
                 'publish-one',
                 { id },
-                {
-                  attempts: 5,
-                  backoff: { type: 'exponential', delay: 1000 },
-                  removeOnComplete: true,
-                  removeOnFail: false,
-                },
-              ),
-            ),
-          );
+                { ...PUBLISH_ONE_JOB_OPTIONS, jobId: `publish-one:${id}` },
+              );
+              enqueued += 1;
+            } catch (err) {
+              this.pendingPublishIds.delete(id);
+              const trace = err instanceof Error ? err.stack : String(err);
+              this.logger.error(
+                `Failed to enqueue publish-one for draft id=${id}`,
+                trace,
+              );
+            }
+          }
 
-          return { enqueued: ids.length };
+          return { enqueued };
         }
 
         if (job.name === 'publish-one') {
@@ -58,7 +78,12 @@ export class ConfessionDraftQueue implements OnModuleDestroy {
             return;
           }
 
-          await this.draftService.publishScheduledDraftById(id);
+          try {
+            await this.draftService.publishScheduledDraftById(id);
+          } finally {
+            this.pendingPublishIds.delete(id);
+          }
+
           return;
         }
       },
@@ -73,36 +98,56 @@ export class ConfessionDraftQueue implements OnModuleDestroy {
     this.worker.on('failed', (job, err) => {
       const trace = err instanceof Error ? err.stack : String(err);
 
+      const id = job?.data?.id as string | undefined;
+      if (id) {
+        this.pendingPublishIds.delete(id);
+      }
+
       this.logger.error(
         `ConfessionDraftQueue job failed: name=${job?.name} id=${job?.id} data=${JSON.stringify(job?.data ?? {})}`,
         trace,
       );
     });
 
-    (async () => {
-      try {
-        await this.queue.add(
-          'publish-due',
-          {},
-          {
-            repeat: { pattern: '* * * * *' },
-            removeOnComplete: true,
-            removeOnFail: false,
-          },
-        );
-      } catch (err) {
-        const trace = err instanceof Error ? err.stack : String(err);
-
-        this.logger.error(
-          'Failed to schedule publish-due recurring job',
-          trace,
+    this.worker.on('ready', () => {
+      if (this.recovered) {
+        this.logger.log(
+          'ConfessionDraftQueue worker reconnected to Redis; resuming backlog drain',
         );
       }
-    })();
+      this.recovered = true;
+    });
+
+    this.worker.on('stalled', (jobId) => {
+      this.logger.warn(
+        `ConfessionDraftQueue job stalled id=${jobId}; awaiting recovery`,
+      );
+    });
+
+    void this.scheduleRecurringJob();
+  }
+
+  private async scheduleRecurringJob(): Promise<void> {
+    try {
+      await this.queue.add(
+        'publish-due',
+        {},
+        {
+          repeat: { pattern: '* * * * *' },
+          removeOnComplete: true,
+          removeOnFail: false,
+        },
+      );
+    } catch (err) {
+      const trace = err instanceof Error ? err.stack : String(err);
+
+      this.logger.error('Failed to schedule publish-due recurring job', trace);
+    }
   }
 
   async onModuleDestroy() {
     await this.worker?.close();
     await this.queue.close();
+    this.pendingPublishIds.clear();
   }
 }

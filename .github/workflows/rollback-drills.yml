@@ -1,0 +1,46 @@
+name: Scheduled Rollback Drills
+
+on:
+  schedule:
+    - cron: '15 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      drill:
+        description: Drill set to rehearse
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - app
+          - schema
+          - contract
+          - storage
+          - frontend
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-rollback-drills
+  cancel-in-progress: false
+
+jobs:
+  drill:
+    name: Safe rollback procedure rehearsal
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run dry-run drills
+        run: >-
+          npm run rollback:drills:dry-run --
+          --drill "${{ github.event.inputs.drill || 'all' }}"
+          --report-dir "$RUNNER_TEMP/rollback-drill-results"
+      - name: Retain evidence and remediation gaps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-drill-${{ github.run_id }}
+          path: ${{ runner.temp }}/rollback-drill-results/
+          if-no-files-found: warn
+          retention-days: 90

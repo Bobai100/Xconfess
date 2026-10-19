@@ -5,6 +5,20 @@ import { getOrCreateRequestId } from '@/app/lib/utils/requestId';
 
 export interface ProxyRequestOptions extends RequestInit {
   timeout?: number;
+  /**
+   * Forward the caller's cookies to the backend and surface Set-Cookie headers
+   * back to the caller. Defaults to true so browser proxy routes keep the
+   * session cookie working end-to-end.
+   */
+  forwardCredentials?: boolean;
+}
+
+export interface ProxyResult<T = unknown> {
+  data: T;
+  status: number;
+  headers: Headers;
+  /** Set-Cookie values returned by the backend, ready to re-emit. */
+  setCookies: string[];
 }
 
 const DEFAULT_TIMEOUT = 30000;
@@ -20,6 +34,31 @@ const FRONTEND_HOST_ENV_KEYS = [
 export interface BackendRoute {
   url: string;
   requestId: string;
+}
+
+/**
+ * Secret-free description of the resolved backend route for diagnostics.
+ * Never includes query strings, credentials, or auth headers.
+ */
+export interface BackendRouteDiagnostics {
+  origin: string;
+  host: string;
+  endpoint: string;
+  requestId: string;
+}
+
+export function describeBackendRoute(
+  route: BackendRoute,
+  endpoint: string,
+): BackendRouteDiagnostics {
+  const parsed = new URL(route.url);
+  const normalizedEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  return {
+    origin: parsed.origin,
+    host: parsed.host.toLowerCase(),
+    endpoint: normalizedEndpoint,
+    requestId: route.requestId,
+  };
 }
 
 export function resolveBackendRoute(
@@ -117,7 +156,23 @@ export async function proxyRequest<T = unknown>(
   targetUrl: string,
   options: ProxyRequestOptions = {}
 ): Promise<T> {
-  const { timeout = DEFAULT_TIMEOUT, ...fetchOptions } = options;
+  const result = await proxyRequestWithResponse<T>(targetUrl, options);
+  return result.data;
+}
+
+/**
+ * Like {@link proxyRequest} but returns the status, headers, and Set-Cookie
+ * values alongside the parsed body so route handlers can re-emit cookies.
+ */
+export async function proxyRequestWithResponse<T = unknown>(
+  targetUrl: string,
+  options: ProxyRequestOptions = {}
+): Promise<ProxyResult<T>> {
+  const {
+    timeout = DEFAULT_TIMEOUT,
+    forwardCredentials = true,
+    ...fetchOptions
+  } = options;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -125,6 +180,9 @@ export async function proxyRequest<T = unknown>(
   try {
     const response = await fetch(targetUrl, {
       ...fetchOptions,
+      credentials: forwardCredentials
+        ? (fetchOptions.credentials ?? 'include')
+        : fetchOptions.credentials,
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
@@ -134,16 +192,30 @@ export async function proxyRequest<T = unknown>(
 
     clearTimeout(timeoutId);
 
+    const setCookies =
+      typeof response.headers.getSetCookie === 'function'
+        ? response.headers.getSetCookie()
+        : [];
+
     if (!response.ok) {
-      const errorBody = await response.json().catch(() => ({ message: 'Request failed' }));
-      throw new Error(errorBody.message || `HTTP ${response.status}`);
+      const errorBody = await response
+        .json()
+        .catch(() => ({ message: 'Request failed' }));
+      throw Object.assign(
+        new Error(errorBody.message || `HTTP ${response.status}`),
+        { status: response.status, setCookies },
+      );
     }
 
-    if (response.status === 204) {
-      return {} as T;
-    }
+    const data =
+      response.status === 204 ? ({} as T) : await response.json();
 
-    return response.json();
+    return {
+      data,
+      status: response.status,
+      headers: response.headers,
+      setCookies,
+    };
   } catch (error) {
     clearTimeout(timeoutId);
     if (error instanceof Error && error.name === 'AbortError') {
@@ -160,5 +232,15 @@ export function createProxyHandler(baseUrl: string) {
   ): Promise<T> {
     const url = endpoint.startsWith('/') ? `${baseUrl}${endpoint}` : `${baseUrl}/${endpoint}`;
     return proxyRequest<T>(url, options);
+  };
+}
+
+export function createProxyHandlerWithResponse(baseUrl: string) {
+  return async function proxy<T>(
+    endpoint: string,
+    options: ProxyRequestOptions = {}
+  ): Promise<ProxyResult<T>> {
+    const url = endpoint.startsWith('/') ? `${baseUrl}${endpoint}` : `${baseUrl}/${endpoint}`;
+    return proxyRequestWithResponse<T>(url, options);
   };
 }

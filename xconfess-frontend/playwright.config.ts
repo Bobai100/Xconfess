@@ -3,6 +3,11 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: './tests/e2e',
   timeout: 30000,
+  reporter: [
+    ['list'],
+    ['html', { outputFolder: 'playwright-report', open: 'never' }],
+    ['json', { outputFile: 'test-results/playwright-results.json' }],
+  ],
   use: {
     headless: process.env.CI === 'true',
     baseURL: process.env.BASE_URL ?? 'http://localhost:3000',
@@ -10,6 +15,24 @@ export default defineConfig({
     trace: 'retain-on-failure',
   },
   projects: [
+    {
+      name: 'critical-chromium',
+      testMatch: /public-pages-smoke\.spec\.ts/,
+      retries: process.env.CI === 'true' ? 1 : 0,
+      use: { browserName: 'chromium' },
+    },
+    {
+      name: 'critical-firefox',
+      testMatch: /public-pages-smoke\.spec\.ts/,
+      retries: process.env.CI === 'true' ? 1 : 0,
+      use: { browserName: 'firefox' },
+    },
+    {
+      name: 'critical-webkit',
+      testMatch: /public-pages-smoke\.spec\.ts/,
+      retries: process.env.CI === 'true' ? 1 : 0,
+      use: { browserName: 'webkit' },
+    },
     {
       name: 'smoke',
       testMatch: /(public-pages-smoke|core-flows-smoke|deployment-routes-smoke|admin-responsive-smoke|register-dashboard-smoke)\.spec\.ts/,

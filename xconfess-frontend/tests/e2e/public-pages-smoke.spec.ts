@@ -91,4 +91,58 @@ test.describe("Public pages smoke", () => {
     // SSR may include demo copy even when the client AuthGuard hides the dashboard shell.
     await expect(page.locator("body")).toContainText(/confession/i);
   });
+
+  test("session cookies survive navigation to a public route", async ({
+    page,
+    context,
+  }) => {
+    const sessionCookieHeaders: string[] = [];
+    page.on("request", (request) => {
+      if (request.url().includes("/api/auth/session")) {
+        sessionCookieHeaders.push(request.headers().cookie ?? "");
+      }
+    });
+    await context.addCookies([
+      {
+        name: "xconfess_session",
+        value: "browser-session",
+        url: "http://localhost:3000",
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
+
+    await page.goto("/login");
+    await expect
+      .poll(() => sessionCookieHeaders.some((header) =>
+        header.includes("xconfess_session=browser-session"),
+      ))
+      .toBe(true);
+
+    await page.goto("/");
+    await expect(page.getByRole("button", { name: "Write confession" })).toBeVisible();
+    expect(await context.cookies()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "xconfess_session", value: "browser-session" }),
+      ]),
+    );
+  });
+
+  test("theme preference persists across refresh and navigation", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem("theme-version", "premium-dark-v1");
+      localStorage.setItem("theme", "light");
+    });
+
+    await page.goto("/");
+    await expect(page.locator("html")).toHaveClass(/light/);
+    await page.goto("/login");
+    await expect(page.locator("html")).toHaveClass(/light/);
+    await page.reload();
+
+    await expect(page.locator("html")).toHaveClass(/light/);
+    expect(await page.evaluate(() => localStorage.getItem("theme"))).toBe("light");
+  });
 });
