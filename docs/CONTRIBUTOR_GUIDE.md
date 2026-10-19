@@ -113,6 +113,79 @@ If a full check cannot run locally because a dependency, Docker service, or
 platform tool is unavailable, document the failed command and the exact blocker
 in the pull request body.
 
+## Advanced Search Query Grammar
+
+Advanced search is parsed and enforced by the backend at the owning boundary
+(`backend/src/search`). The parser accepts only the documented grammar below;
+anything outside it is rejected with a stable validation error rather than
+being silently interpreted or forwarded to the database.
+
+### Allowlisted Fields
+
+Only these fields may appear on the left of an operator:
+
+- `author` — message author handle
+- `conversation` — conversation id
+- `tag` — message tag
+- `before` / `after` — ISO-8601 date bounds
+- `has` — attachment presence (`has:attachment`)
+
+Any other field name is rejected with `SEARCH_UNKNOWN_FIELD`.
+
+### Allowlisted Operators
+
+- `field:value` — equality match
+- `field:"quoted value"` — equality match with spaces
+- `-field:value` — negation
+- Bare terms (no operator) are treated as full-text terms
+
+Operators outside this set (for example `field>value`, `field~value`, or
+wildcards like `field:*`) are rejected with `SEARCH_UNSUPPORTED_OPERATOR`.
+
+### Complexity Limits
+
+The parser caps query complexity so a single request cannot trigger an
+expensive scan. Exceeding any limit is rejected with `SEARCH_QUERY_TOO_COMPLEX`:
+
+- Maximum of 32 tokens per query
+- Maximum of 16 clauses (field matches plus bare terms)
+- Maximum nesting depth of 2 (one level of parentheses)
+- Maximum of 256 characters per quoted value
+
+### Validation Error Codes
+
+Malformed or disallowed expressions return a stable error code and message so
+clients can render consistent feedback:
+
+| Code | Meaning |
+| --- | --- |
+| `SEARCH_EMPTY_QUERY` | Query is empty or whitespace only |
+| `SEARCH_UNKNOWN_FIELD` | Field is not in the allowlist |
+| `SEARCH_UNSUPPORTED_OPERATOR` | Operator is not in the allowlist |
+| `SEARCH_UNBALANCED_QUOTES` | Quoted value is not terminated |
+| `SEARCH_UNBALANCED_PARENS` | Parentheses are unbalanced |
+| `SEARCH_QUERY_TOO_COMPLEX` | A complexity limit was exceeded |
+
+### Failure Semantics
+
+- Invalid queries are rejected before any database access; they never reach
+the query builder.
+- Rejections return `400 Bad Request` with the error code above and a
+  human-readable message; they are not retried automatically.
+- Authorization is checked before parsing, so unauthorized callers receive
+  `403` regardless of query validity.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path plus adversarial
+inputs (unknown fields, unsupported operators, unbalanced quotes/parens, and
+queries that exceed the complexity caps) and the regression risk of a
+malformed query reaching the database. Run them with:
+
+```bash
+npm run backend:test
+```
+
 ## Message Retention And Expiry
 
 Private messages have an explicit, enforceable lifecycle. Retention is chosen
@@ -225,7 +298,7 @@ extend to groups.
   below.
 - **Remove** — only the conversation owner or an authorized moderator may
   remove another member. Removing a non-member is a no-op success; removing
-  yourself must go through the leave path.
+yourself must go through the leave path.
 - Every transition is idempotent and records the actor, target, and reason so
   audit trails stay consistent.
 
@@ -234,34 +307,7 @@ extend to groups.
 - Only active members with the `invite` capability (owner, moderators, or
   members when the conversation allows member invites) may create invites.
 - Invites are scoped to a single conversation and a single invitee, expire, and
-  are single-use.
-
-## Multilingual Search Normalization
-
-Search queries and indexed text are normalized and tokenized by the backend at
-the search boundary so that equivalent input matches regardless of Unicode form,
-diacritics, or language-specific token boundaries. Clients must send raw query
-text and must not pre-normalize it.
-
-### Normalization Rules
-
-- Text is normalized to Unicode NFKC before tokenization, so composed and
-  decomposed forms (e.g. `é` vs `e` + combining accent) match.
-- Diacritics are folded for Latin-script languages so `café` matches `cafe`.
-- Case is folded using locale-aware lowercasing for the detected language.
-- The same normalization is applied to both the query and the indexed text; a
-  mismatch between the two is a bug.
-
-### Tokenization Per Language
-
-- Supported languages (`en`, `fr`, `es`, `de`, `pt`, `ar`, `zh`, `ja`) each
-  define their own token boundaries. CJK languages tokenize per character or
-  bigram rather than on whitespace; Arabic and Latin languages split on
-  whitespace and punctuation.
-- The language is taken from an explicit request hint when present, otherwise
-  detected from the query, otherwise falls back to the default language.
-
-### Fallback For Unknown Languages
+  
 
 - Unknown or unsupported languages use a safe fallback: NFKC normalization,
   case folding, and whitespace/punctuation tokenization without diacritic
