@@ -111,11 +111,24 @@ Ownership is considered **stale** if:
 - The listed owner has not merged a PR in the relevant subsystem for 60+ days.
 - The subsystem has grown substantially and no secondary owner is named.
 
+Run `npm run deploy:preflight` before requesting review. Its repository
+governance audit compares tracked files in the security-sensitive source areas
+with explicit CODEOWNERS patterns; the default catch-all owner does not count
+as area-specific coverage. A new high-risk area must be added to the audit's
+area list as well as assigned in CODEOWNERS. GitHub's CODEOWNERS validation
+should also be clear of syntax errors, and every listed account or team must
+have repository write access for automatic reviewer assignment to work.
+
 To update ownership:
-1. Open a PR that edits `.github/CODEOWNERS` and this document.
-2. Get sign-off from the current owner (or a maintainer if the owner is
-   unreachable).
-3. Announce the change in the PR description so contributors can re-subscribe.
+1. Open a PR that edits `.github/CODEOWNERS` and this document, and state which
+   active source areas or owner responsibilities change.
+2. Get sign-off from the current owner of each affected area and a repository
+   maintainer. If an owner is unreachable, a maintainer records the reason and
+   approves the transition.
+3. Confirm the new user or team has repository write access, run the governance
+   audit, and check GitHub's CODEOWNERS syntax feedback.
+4. Announce the approved change in the PR description so contributors can
+   re-subscribe.
 
 The `npm run diagnose` output includes a `git log` summary per subsystem that
 can help identify inactive areas.
