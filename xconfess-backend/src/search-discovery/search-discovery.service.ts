@@ -270,13 +270,22 @@ export class SearchDiscoveryService {
     const manager = this.searchHistoryRepo.manager;
     const safeLimit = Math.min(Math.max(limit, 1), 50);
 
-    // If user has opted out of personalization, serve diverse trending content only
-    if (preferences.personalizationOptOut) {
+    // Personalization is only active when the user has not opted out AND the
+    // feature flag is enabled. The decision is evaluated on every request
+    // (after any cache lookup) so a stale personalized cache can never leak
+    // personal signals once the preference or flag changes.
+    const personalizationEnabled =
+      this.isPersonalizationFeatureEnabled() && !preferences.personalizationOptOut;
+
+    if (!personalizationEnabled) {
+      // Non-personalized discovery mode: bypass ALL personal ranking signals
+      // (search history, interests, per-user scoring) and serve a deterministic
+      // baseline ordering that is identical for every user.
       const publicRows: any[] = await manager.query(
         `SELECT id, title, category, reaction_count as "reactionCount", gender, created_at as "createdAt"
          FROM anonymous_confessions
          WHERE is_deleted = false
-         ORDER BY reaction_count DESC, created_at DESC
+         ORDER BY reaction_count DESC, created_at DESC, id ASC
          LIMIT $1`,
         [safeLimit * 2],
       );
@@ -313,6 +322,16 @@ export class SearchDiscoveryService {
       preferences.diversityThreshold,
       preferences.excludedCategories || [],
     );
+  }
+
+  /**
+   * Reads the personalization feature flag. When disabled, every user is
+   * served the non-personalized baseline regardless of stored preference.
+   */
+  private isPersonalizationFeatureEnabled(): boolean {
+    const raw = process.env.PERSONALIZATION_ENABLED;
+    if (raw === undefined || raw === '') return true;
+    return !['false', '0', 'off', 'no'].includes(raw.trim().toLowerCase());
   }
 
   private applyPersonalizedRanking(

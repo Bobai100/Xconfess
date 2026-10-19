@@ -149,6 +149,78 @@ body {
 }
 
 /* ==========================================================================
+   Visually hidden
+   Content that is exposed to assistive technology but not painted. Used for
+   screen-reader-only live-region text and supplementary control labels.
+   ========================================================================== */
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+/* ==========================================================================
+   Search filters
+   Filter controls and the reset button get an explicit, high-contrast focus
+   ring. The ring is paired with an offset so it is not conveyed by color
+   alone and stays visible against adjacent surfaces.
+   ========================================================================== */
+.filter-control:focus-visible,
+.filter-reset:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+  border-radius: 0.25rem;
+}
+
+.filter-reset {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem 0.75rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-status-info);
+  background: var(--color-status-info-bg);
+  border: 1px solid var(--color-status-info);
+  border-radius: 0.25rem;
+  cursor: pointer;
+}
+
+.filter-reset:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* ==========================================================================
+   Filter result count (aria-live region)
+   ========================================================================== */
+.filter-results {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.5rem;
+  margin: 0.5rem 0;
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+}
+
+.filter-results__count {
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.filter-results--empty {
+  color: var(--color-status-warning);
+}
+
+/* ==========================================================================
    Forced colors (Windows High Contrast)
    Rely on system colors so controls stay legible; drop decorative fills and
    shadows that forced-colors would otherwise flatten unpredictably.
@@ -169,6 +241,24 @@ body {
   :focus-visible {
     outline: 2px solid Highlight;
     outline-offset: 2px;
+  }
+
+  .filter-control:focus-visible,
+  .filter-reset:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  .filter-reset {
+    color: ButtonText;
+    background: ButtonFace;
+    border-color: ButtonText;
+  }
+
+  .filter-results,
+  .filter-results__count,
+  .filter-results--empty {
+    color: CanvasText;
   }
 
   .spinner {

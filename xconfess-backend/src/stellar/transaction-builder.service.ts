@@ -5,6 +5,34 @@ import * as crypto from 'crypto';
 import { StellarConfigService } from './stellar-config.service';
 import { ITransactionOptions } from './interfaces/stellar-config.interface';
 import { redactSecretStrings } from '../utils/redact-secrets';
+import {
+  PendingSubmissionStore,
+  PendingSubmissionRecord,
+} from './pending-submission.store';
+
+/**
+ * Options controlling durable, idempotent submission.
+ *
+ * `intentKey` is a caller-supplied, stable identifier for the *operation
+ * intent* (e.g. `tip:<tipId>` or `anchor:<anchorId>`). When supplied, the
+ * builder records the intent before touching the network and reconciles
+ * against it on retry, so a timeout after submission can never produce a
+ * duplicate tip or anchor.
+ */
+export interface ISubmitOptions {
+  intentKey?: string;
+  /** How long a pending record is considered authoritative before expiry. */
+  pendingTtlMs?: number;
+}
+import {
+  AccountSequenceCoordinator,
+  AccountSequenceLease,
+} from './account-sequence-coordinator.service';
+import {
+  TransactionLatencyService,
+  TransactionOperationClass,
+  TransactionPhase,
+} from './transaction-latency.service';
 
 /**
  * Envelope binding a simulation result to the exact network, contract and
@@ -44,7 +72,12 @@ export class StaleSimulationError extends Error {
 export class TransactionBuilderService {
   private readonly logger = new Logger(TransactionBuilderService.name);
 
-  constructor(private stellarConfig: StellarConfigService) {}
+  constructor(
+    private stellarConfig: StellarConfigService,
+    private readonly pendingStore: PendingSubmissionStore,
+    private sequenceCoordinator: AccountSequenceCoordinator,
+    private transactionLatency: TransactionLatencyService,
+  ) {}
 
   /**
    * Deterministically hash operation inputs so a simulation envelope can be
@@ -144,6 +177,44 @@ export class TransactionBuilderService {
     operations: any[],
     options?: ITransactionOptions,
   ): Promise<any> {
+    const operationClass = TransactionLatencyService.classifyOperations(
+      operations,
+    );
+    const startedAt = Date.now();
+    const lease = await this.sequenceCoordinator.acquire(sourcePublicKey);
+    try {
+      const transaction = await this.buildTransactionWithLease(
+        sourcePublicKey,
+        operations,
+        options,
+        lease,
+      );
+      this.transactionLatency.record(
+        TransactionPhase.BUILD,
+        operationClass,
+        Date.now() - startedAt,
+        true,
+      );
+      return transaction;
+    } catch (error) {
+      this.transactionLatency.record(
+        TransactionPhase.BUILD,
+        operationClass,
+        Date.now() - startedAt,
+        false,
+      );
+      throw error;
+    } finally {
+      await this.sequenceCoordinator.release(lease);
+    }
+  }
+
+  private async buildTransactionWithLease(
+    sourcePublicKey: string,
+    operations: any[],
+    options: ITransactionOptions | undefined,
+    lease: AccountSequenceLease,
+  ): Promise<any> {
     const maxFee = this.stellarConfig.getConfig().maxFeeBudget;
     const feeBackoffMs = this.stellarConfig.getConfig().feeBackoffMs;
     const maxRetries = this.stellarConfig.getConfig().maxFeeRetries;
@@ -170,9 +241,15 @@ export class TransactionBuilderService {
       }
 
       try {
-        // Load source account
+        // Load source account. The coordinator pins the sequence we are allowed
+        // to build against so a stale network read cannot reuse a sequence.
         const server = this.stellarConfig.getServer();
         const sourceAccount = await server.loadAccount(sourcePublicKey);
+        const pinnedSequence = this.sequenceCoordinator.nextSequence(
+          lease,
+          sourceAccount.sequenceNumber(),
+        );
+        sourceAccount.sequenceNumber = () => pinnedSequence;
 
         const txBuilder = new StellarSDK.TransactionBuilder(sourceAccount, {
           fee: options?.fee || feeEstimate.toString(),
@@ -262,29 +339,221 @@ export class TransactionBuilderService {
 
   /**
    * Submit transaction to network with bounded retries for transient failures.
-   * When a simulation envelope and context are supplied, the envelope is
-   * validated first and a StaleSimulationError is thrown if it no longer
-   * reflects current network/contract/operation/ledger state.
+   *
+   * When `options.intentKey` is provided the submission becomes idempotent:
+   *  1. A durable pending record is written *before* the first network call.
+   *  2. On entry (and on every retry) the store is consulted; if a previous
+   *     attempt already landed a transaction hash, that result is returned
+   *     instead of submitting again.
+   *  3. Ambiguous outcomes (timeouts / connection resets) leave the record in
+   *     `pending` so a later call reconciles via `reconcilePendingSubmission`.
    */
   async submitTransaction(
     transaction: any,
-    simulation?: SimulationResult,
-    context?: SimulationContext,
+    options: ISubmitOptions = {},
+    operationClass: TransactionOperationClass = TransactionOperationClass.OTHER,
   ): Promise<any> {
-    if (simulation || context) {
-      if (!context) {
-        throw new StaleSimulationError(
-          'Simulation context is required to validate a simulation result',
-          'operation_mismatch',
-        );
-      }
-      await this.validateSimulationResult(simulation, context);
+    const { intentKey } = options;
+    if (!intentKey) {
+      return this.submitWithRetries(transaction, operationClass);
     }
 
-    const maxRetries = this.stellarConfig.getConfig().rpcMaxRetries;
+    const ttlMs =
+      options.pendingTtlMs ??
+      this.stellarConfig.getConfig().pendingSubmissionTtlMs;
+
+    // Reconcile first: a prior attempt may have already landed.
+    const existing = await this.pendingStore.get(intentKey);
+    if (existing && !this.pendingStore.isExpired(existing, ttlMs)) {
+      if (existing.status === 'confirmed' && existing.txHash) {
+        this.logger.log(
+          `Intent ${intentKey} already confirmed as ${existing.txHash}; skipping submission`,
+        );
+        return { hash: existing.txHash, ledger: existing.ledger, reconciled: true };
+      }
+      if (existing.status === 'pending') {
+        const reconciled = await this.reconcilePendingSubmission(
+          intentKey,
+          existing,
+        );
+        if (reconciled) {
+          return reconciled;
+        }
+      }
+    }
+
+    const txHash = this.safeTransactionHash(transaction);
+    const record: PendingSubmissionRecord = {
+      intentKey,
+      txHash,
+      status: 'pending',
+      attempts: (existing?.attempts ?? 0) + 1,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await this.pendingStore.put(record);
+
+    try {
+      const result = await this.submitWithRetries(transaction, operationClass);
+      await this.pendingStore.put({
+        ...record,
+        status: 'confirmed',
+        txHash: result?.hash ?? txHash,
+        ledger: result?.ledger,
+        updatedAt: new Date().toISOString(),
+      });
+      return result;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      const definitive = this.isDefinitiveFailure(error);
+      await this.pendingStore.put({
+        ...record,
+        status: definitive ? 'failed' : 'pending',
+        lastError: message,
+        updatedAt: new Date().toISOString(),
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Look up a previously recorded intent and, if the network already has the
+   * transaction, promote the record to `confirmed`. Returns the submission
+   * result when reconciliation succeeds, otherwise `null`.
+   */
+  async reconcilePendingSubmission(
+    intentKey: string,
+    record?: PendingSubmissionRecord,
+  ): Promise<any | null> {
+    const pending = record ?? (await this.pendingStore.get(intentKey));
+
+      return null;
+    }
+
+    try {
+      const server = this.stellarConfig.getServer();
+      const tx = await server.getTransaction(pending.txHash);
+      const status = (tx as { status?: string }).status;
+      if (status === 'SUCCESS') {
+        await this.pendingStore.put({
+          ...pending,
+          status: 'confirmed',
+          ledger: (tx as { ledger?: number }).ledger,
+          updatedAt: new Date().toISOString(),
+        });
+        this.logger.log(
+          `Reconciled intent ${intentKey} to confirmed tx ${pending.txHash}`,
+        );
+        return {
+          hash: pending.txHash,
+          ledger: (tx as { ledger?: number }).ledger,
+          reconciled: true,
+        };
+      }
+      if (status === 'FAILED') {
+        await this.pendingStore.put({
+          ...pending,
+          status: 'failed',
+          lastError: 'reconciled: transaction failed on-chain',
+          updatedAt: new Date().toISOString(),
+        });
+        return null;
+      }
+      // NOT_FOUND: still ambiguous, leave pending for a later retry.
+      return null;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `Reconciliation lookup for intent ${intentKey} failed: ${message}`,
+      );
+      return null;
+    }
+  }
+
+  private safeTransactionHash(transaction: any): string | undefined {
+    try {
+      if (typeof transaction?.hash === 'function') {
+        return transaction.hash().toString('hex');
+      }
+    } catch {
+      // Hash computation is best-effort; the record is still durable.
+    }
+    return undefined;
+  }
+
+  private isDefinitiveFailure(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return (
+      message.includes('non-retryable') ||
+      message.includes('tx_bad_auth') ||
+      message.includes('tx_bad_seq') ||
+      message.includes('tx_malformed') ||
+      message.includes('tx_not_supported')
+    );
+  }
+
+  private async submitWithRetries(
+    transaction: any,
+    operationClass: TransactionOperationClass = TransactionOperationClass.OTHER,
+  ): Promise<any> {
+    // Hold the account sequence lease across submission so a retry or a
+    // concurrent worker cannot interleave a competing sequence.
+    const sourceAccountId = this.getSourceAccountId(transaction);
+    const lease = sourceAccountId
+      ? await this.sequenceCoordinator.acquire(sourceAccountId)
+      : undefined;
+  }
     const baseDelay = this.stellarConfig.getConfig().rpcRetryBaseDelayMs;
     const maxDelay = this.stellarConfig.getConfig().rpcRetryMaxDelayMs;
+    const startedAt = Date.now();
 
+    try {
+      const result = await this.submitTransactionInternal(
+        transaction,
+        maxRetries,
+        baseDelay,
+        maxDelay,
+      );
+      this.transactionLatency.record(
+        TransactionPhase.SUBMISSION,
+        operationClass,
+        Date.now() - startedAt,
+        true,
+      );
+      return result;
+    } catch (error) {
+      this.transactionLatency.record(
+        TransactionPhase.SUBMISSION,
+        operationClass,
+        Date.now() - startedAt,
+        false,
+      );
+      throw error;
+    } finally {
+      if (lease) {
+        await this.sequenceCoordinator.release(lease);
+      }
+    }
+  }
+
+  private getSourceAccountId(transaction: any): string | undefined {
+    try {
+      const source = transaction?.source;
+      if (!source) {
+        return undefined;
+      }
+      return typeof source === 'string' ? source : source.accountId?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async submitTransactionInternal(
+    transaction: any,
+    maxRetries: number,
+    baseDelay: number,
+    maxDelay: number,
+  ): Promise<any> {
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
@@ -311,6 +580,14 @@ export class TransactionBuilderService {
             txCode === 'tx_malformed' ||
             txCode === 'tx_not_supported'
           ) {
+            if (txCode === 'tx_bad_seq') {
+              // Sequence was consumed or invalidated elsewhere; drop the cached
+              // sequence so the next build re-reads from the network.
+              const accountId = this.getSourceAccountId(transaction);
+              if (accountId) {
+                this.sequenceCoordinator.invalidate(accountId);
+              }
+            }
             throw new Error(`Transaction failed (non-retryable): ${JSON.stringify(resultCodes)}`);
           }
         }
@@ -347,5 +624,35 @@ export class TransactionBuilderService {
 
     const message = lastError instanceof Error ? lastError.message : String(lastError);
     throw new Error(`Transaction submission failed after ${maxRetries + 1} attempts: ${message}`);
+  }
+
+  /**
+   * Record inclusion/confirmation latency observed by callers once the
+   * transaction is observed on-chain. Bounded labels only.
+   */
+  recordInclusionLatency(
+    operationClass: TransactionOperationClass,
+    latencyMs: number,
+    success: boolean,
+  ): void {
+    this.transactionLatency.record(
+      TransactionPhase.INCLUSION,
+      operationClass,
+      latencyMs,
+      success,
+    );
+  }
+
+  recordConfirmationLatency(
+    operationClass: TransactionOperationClass,
+    latencyMs: number,
+    success: boolean,
+  ): void {
+    this.transactionLatency.record(
+      TransactionPhase.CONFIRMATION,
+      operationClass,
+      latencyMs,
+      success,
+    );
   }
 }

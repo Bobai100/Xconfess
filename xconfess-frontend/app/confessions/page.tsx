@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Header from "@/app/components/layout/Header";
 import { ConfessionFeed } from "@/app/components/confession/ConfessionFeed";
+import { PersonalizationToggle } from "@/app/components/confession/PersonalizationToggle";
 
 export const metadata: Metadata = {
   title: "Confessions | Xconfess",
@@ -22,6 +23,7 @@ export default function ConfessionsPage() {
               Browse recent, popular, and most-discussed anonymous confessions.
             </p>
           </div>
+          <PersonalizationToggle />
           <ConfessionFeed />
         </section>
       </main>

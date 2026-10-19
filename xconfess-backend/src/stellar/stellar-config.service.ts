@@ -160,6 +160,11 @@ export class StellarConfigService implements OnModuleInit {
     rpcMaxRetries: number;
     rpcRetryBaseDelayMs: number;
     rpcRetryMaxDelayMs: number;
+    rpcEndpoints: string[];
+    rpcHealthCheckIntervalMs: number;
+    rpcCooldownMs: number;
+    rpcFailureThreshold: number;
+    rpcRecoveryProbeTimeoutMs: number;
   };
   private server: StellarSDK.Horizon.Server;
 
@@ -219,6 +224,21 @@ export class StellarConfigService implements OnModuleInit {
       this.configService.get('STELLAR_RPC_RETRY_MAX_DELAY_MS') ?? 10000,
     );
 
+    // Load RPC endpoint pool and health/cooldown policy
+    const rpcEndpoints = this.getSorobanRpcEndpoints(network);
+    const rpcHealthCheckIntervalMs = Number(
+      this.configService.get('STELLAR_RPC_HEALTH_CHECK_INTERVAL_MS') ?? 30000,
+    );
+    const rpcCooldownMs = Number(
+      this.configService.get('STELLAR_RPC_COOLDOWN_MS') ?? 60000,
+    );
+    const rpcFailureThreshold = Number(
+      this.configService.get('STELLAR_RPC_FAILURE_THRESHOLD') ?? 2,
+    );
+    const rpcRecoveryProbeTimeoutMs = Number(
+      this.configService.get('STELLAR_RPC_RECOVERY_PROBE_TIMEOUT_MS') ?? 5000,
+    );
+
     // Build config
     this.config = {
       network,
@@ -241,6 +261,11 @@ export class StellarConfigService implements OnModuleInit {
       rpcMaxRetries,
       rpcRetryBaseDelayMs,
       rpcRetryMaxDelayMs,
+      rpcEndpoints,
+      rpcHealthCheckIntervalMs,
+      rpcCooldownMs,
+      rpcFailureThreshold,
+      rpcRecoveryProbeTimeoutMs,
     };
 
     // Enforce testnet/mainnet isolation across endpoints, contracts, and signer
@@ -262,6 +287,12 @@ export class StellarConfigService implements OnModuleInit {
     );
     this.logger.log(
       `RPC timeout: ${rpcTimeoutMs}ms, RPC retries: ${rpcMaxRetries}, Retry backoff: ${rpcRetryBaseDelayMs}-${rpcRetryMaxDelayMs}ms`,
+    );
+    this.logger.log(
+      `RPC endpoints (${rpcEndpoints.length}): ${rpcEndpoints.join(', ')}`,
+    );
+    this.logger.log(
+      `RPC health policy: check interval ${rpcHealthCheckIntervalMs}ms, cooldown ${rpcCooldownMs}ms, failure threshold ${rpcFailureThreshold}, recovery probe timeout ${rpcRecoveryProbeTimeoutMs}ms`,
     );
   }
 
@@ -358,7 +389,41 @@ export class StellarConfigService implements OnModuleInit {
   }
 
   getConfig() {
-    return { ...this.config };
+    return { ...this.config, rpcEndpoints: [...this.config.rpcEndpoints] };
+  }
+
+  /**
+   * Ordered list of configured Soroban RPC endpoints (primary first). Consumers
+   * performing failover should treat this as the candidate pool.
+   */
+  getSorobanRpcEndpointsList(): string[] {
+    return [...this.config.rpcEndpoints];
+  }
+
+  /**
+   * Health/cooldown policy for the RPC endpoint pool. Exposed so the failover
+   * client can apply consistent thresholds across read and submit paths.
+   */
+  getRpcHealthPolicy(): {
+    timeoutMs: number;
+    healthCheckIntervalMs: number;
+    cooldownMs: number;
+    failureThreshold: number;
+    recoveryProbeTimeoutMs: number;
+    maxRetries: number;
+    retryBaseDelayMs: number;
+    retryMaxDelayMs: number;
+  } {
+    return {
+      timeoutMs: this.config.rpcTimeoutMs,
+      healthCheckIntervalMs: this.config.rpcHealthCheckIntervalMs,
+      cooldownMs: this.config.rpcCooldownMs,
+      failureThreshold: this.config.rpcFailureThreshold,
+      recoveryProbeTimeoutMs: this.config.rpcRecoveryProbeTimeoutMs,
+      maxRetries: this.config.rpcMaxRetries,
+      retryBaseDelayMs: this.config.rpcRetryBaseDelayMs,
+      retryMaxDelayMs: this.config.rpcRetryMaxDelayMs,
+    };
   }
 
   getServer(): StellarSDK.Horizon.Server {
@@ -387,6 +452,39 @@ export class StellarConfigService implements OnModuleInit {
     return network === StellarNetwork.MAINNET
       ? 'https://soroban-rpc.stellar.org'
       : 'https://soroban-rpc-testnet.stellar.org';
+  }
+
+  /**
+   * Resolve the ordered RPC endpoint pool. `STELLAR_SOROBAN_RPC_URLS` accepts a
+   * comma-separated list of endpoints (primary first); `STELLAR_SOROBAN_RPC_URL`
+   * remains supported as a single-endpoint override. Falls back to the network
+   * default when neither is configured.
+   */
+  private getSorobanRpcEndpoints(network: StellarNetwork): string[] {
+    const listValue = this.configService.get<string>(
+      'STELLAR_SOROBAN_RPC_URLS',
+    );
+    const singleValue = this.configService.get<string>(
+      'STELLAR_SOROBAN_RPC_URL',
+    );
+
+    const raw = listValue?.trim()
+      ? listValue.split(',')
+      : singleValue?.trim()
+        ? [singleValue]
+        : [];
+
+    const endpoints = raw
+      .map((url) => url.trim())
+      .filter((url) => url.length > 0);
+
+    const deduped = Array.from(new Set(endpoints));
+
+    if (deduped.length === 0) {
+      return [this.getSorobanRpcUrl(network)];
+    }
+
+    return deduped;
   }
 
   isMainnet(): boolean {

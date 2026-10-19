@@ -8,11 +8,14 @@ import {
   Req,
   UseGuards,
   Query,
+  UnauthorizedException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { OwnershipGuard } from '../common/guards/ownership.guard';
 import { Ownership } from '../common/decorators/ownership.decorator';
 import { UserService } from './user.service';
+import { UpdatePersonalizationDto } from './dto/update-personalization.dto';
 
 @Controller('users')
 @UseGuards(JwtAuthGuard)
@@ -75,6 +78,39 @@ export class UserController {
     const p = page ? parseInt(page, 10) : 1;
     const l = limit ? parseInt(limit, 10) : 10;
     return this.userService.getUserConfessionsList(parseInt(userId, 10), p, l);
+  }
+
+  /**
+   * PATCH /users/me/personalization
+   * Explicitly toggles the non-personalized discovery mode for the
+   * authenticated user. Persists the preference and invalidates any cached
+   * personalized results so hidden signals stop affecting discovery.
+   *
+   * Failure semantics:
+   *  - 401 when the request is unauthenticated (JwtAuthGuard).
+   *  - 403 when the caller is not the account owner.
+   */
+  @Patch('me/personalization')
+  @UseGuards(JwtAuthGuard)
+  async updatePersonalization(
+    @Body() dto: UpdatePersonalizationDto,
+    @Req() req: any,
+  ) {
+    const authedUserId = req.user?.id ?? req.user?.sub;
+    if (authedUserId === undefined || authedUserId === null) {
+      throw new UnauthorizedException('Authentication required');
+    }
+
+    if (dto.userId !== undefined && String(dto.userId) !== String(authedUserId)) {
+      throw new ForbiddenException(
+        'You may only change your own personalization preference',
+      );
+    }
+
+    return this.userService.updatePersonalizationPreference(
+      Number(authedUserId),
+      dto.nonPersonalized,
+    );
   }
 
   /**

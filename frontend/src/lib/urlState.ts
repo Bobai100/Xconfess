@@ -206,3 +206,99 @@ export function readUrlStateField<T>(
   const value = state[field];
   return (value as T) ?? fallback;
 }
+
+export type UrlStateValidationResult<T> = {
+  /** Normalized state: valid values kept, invalid/missing values defaulted. */
+  state: T;
+  /** Keys whose provided value was rejected and replaced by the default. */
+  invalidKeys: string[];
+  /** Keys present in the input that are not part of the schema. */
+  unknownKeys: string[];
+  /** True when at least one key was rejected or unknown. */
+  changed: boolean;
+};
+
+/**
+ * Validate a full filter/sort state object against a schema.
+ *
+ * Each field is round-tripped through the schema's `serialize`/`parse` pair so
+ * that only values the schema can faithfully encode survive. Values that fail
+ * to serialize, fail to parse back, or are not representable fall back to the
+ * provided default and are reported in `invalidKeys`. Keys not present in the
+ * schema are reported in `unknownKeys` so callers can surface them without
+ * leaking arbitrary state into shareable URLs.
+ *
+ * Never throws: malformed input resolves to defaults.
+ */
+export function validateUrlState<T extends Record<string, UrlStateValue>>(
+  input: unknown,
+  schema: UrlStateSchema<T>,
+  defaults: T,
+): UrlStateValidationResult<T> {
+  const source = isPlainObject(input) ? input : {};
+  const state: Record<string, UrlStateValue> = { ...defaults };
+  const invalidKeys: string[] = [];
+
+  for (const field of Object.keys(schema) as Array<keyof T>) {
+    const config = schema[field];
+    const key = String(field);
+    const value = source[key];
+
+    if (value === undefined) continue;
+
+    const serialize = config.serialize ?? defaultSerialize;
+    let encoded: string | undefined;
+    try {
+      encoded = serialize(value as T[keyof T]);
+    } catch {
+      encoded = undefined;
+    }
+
+    if (encoded === undefined || encoded === '') {
+      invalidKeys.push(key);
+      continue;
+    }
+
+    const parse = config.parse ?? (DEFAULT_PARSE as (raw: string) => T[keyof T]);
+    let parsed: T[keyof T] | undefined;
+    try {
+      parsed = parse(encoded);
+    } catch {
+      parsed = undefined;
+    }
+
+    if (parsed === undefined) {
+      invalidKeys.push(key);
+      continue;
+    }
+
+    state[key] = parsed as UrlStateValue;
+  }
+
+  const unknownKeys = Object.keys(source).filter(
+    (key) => !(key in schema),
+  );
+
+  return {
+    state: state as T,
+    invalidKeys,
+    unknownKeys,
+    changed: invalidKeys.length > 0 || unknownKeys.length > 0,
+  };
+}
+
+/**
+ * Serialize a validated state object, omitting defaults and private fields so
+ * shareable URLs stay clean and never leak sensitive values. Accepts the
+ * result of `validateUrlState` directly for a single validated path.
+ */
+export function serializeValidatedUrlState<T extends Record<string, UrlStateValue>>(
+  validated: UrlStateValidationResult<T> | T,
+  schema: UrlStateSchema<T>,
+  defaults?: Partial<T>,
+): string {
+  const state = isPlainObject(validated) && 'state' in validated
+    ? (validated as UrlStateValidationResult<T>).state
+    : (validated as T);
+  return serializeUrlState(state, schema, defaults);
+}

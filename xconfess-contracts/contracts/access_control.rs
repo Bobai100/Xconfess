@@ -35,7 +35,7 @@
 //! | `admin_revoked`     | `{ address: Address }`        |
 //! | `ownership_xfer`    | `{ from: Address, to: Address }` |
 
-use soroban_sdk::{contractevent, contracttype, Address, Env, Map, String};
+use soroban_sdk::{contractevent, contracttype, Address, Env, Map, String, Vec};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage keys
@@ -57,6 +57,45 @@ pub enum Role {
     Admin,
     Operator,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Authorization scopes
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The exact authorization footprint a privileged operation is allowed to
+/// require from the wallet.
+///
+/// Every privileged entry point declares one of these scopes. The scope is the
+/// single source of truth for "who must sign" and is mirrored off-chain by the
+/// frontend so the intent shown to the user matches the signed invocation.
+///
+/// | Scope             | Signers required                          |
+/// |-------------------|-------------------------------------------|
+/// | `OwnerOnly`       | exactly the owner                          |
+/// | `AdminOrOwner`    | exactly one of {owner, admin}              |
+/// | `OperatorOrAbove` | exactly one of {owner, admin, operator}    |
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthScope {
+    /// Exactly one signer: the current owner.
+    OwnerOnly = 1,
+    /// Exactly one signer: the owner or an explicit admin.
+    AdminOrOwner = 2,
+    /// Exactly one signer: the owner, an admin, or an operator.
+    OperatorOrAbove = 3,
+}
+
+/// Stable numeric error code returned when the authorization footprint of an
+/// invocation does not match the operation's declared scope.
+///
+/// Kept separate from `AccessError` so off-chain consumers can distinguish
+/// "wrong role" from "unexpected authorization requirement".
+pub const SCOPE_MISMATCH_CODE: u32 = 100;
+
+/// Maximum number of distinct signers any privileged operation may require.
+/// Operations that would need more than one authorization are rejected, which
+/// keeps the signed footprint minimal and reviewable.
+pub const MAX_AUTH_SIGNERS: u32 = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error codes
@@ -233,10 +272,104 @@ pub fn count_authorized(env: &Env) -> u32 {
 // Auth guards (call at the top of privileged entry points)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Returns the declared authorization scope for a privileged operation.
+///
+/// This mapping is the canonical intent → footprint table. Off-chain code
+/// (frontend review screens, backend audit) must use the same mapping so the
+/// authorization footprint displayed to the user equals the one enforced here.
+pub fn scope_for_operation(operation: &str) -> Option<AuthScope> {
+    match operation {
+        "grant_admin" | "revoke_admin" | "transfer_ownership" => Some(AuthScope::OwnerOnly),
+        "grant_operator" | "revoke_operator" => Some(AuthScope::AdminOrOwner),
+        "resolve" => Some(AuthScope::AdminOrOwner),
+        _ => None,
+    }
+}
+
+/// Returns `true` when `caller` satisfies `scope`.
+fn satisfies_scope(env: &Env, caller: &Address, scope: AuthScope) -> Result<bool, AccessError> {
+    match scope {
+        AuthScope::OwnerOnly => is_owner(env, caller),
+        AuthScope::AdminOrOwner => is_authorized(env, caller),
+        AuthScope::OperatorOrAbove => {
+            Ok(is_owner(env, caller)? || is_admin(env, caller) || is_operator(env, caller))
+        }
+    }
+}
+
+/// Enforce that the invocation's authorization footprint matches `scope`.
+///
+/// * Requires exactly one signer (`caller`) — the only address whose
+///   authorization is requested.
+/// * Rejects callers that do not satisfy the scope with `AccessError::NotAuthorized`.
+/// * Rejects any operation whose declared scope would require more than
+///   `MAX_AUTH_SIGNERS` signers (unexpected authorization requirement).
+///
+/// Returns `Ok(())` only when the signed footprint is exactly the expected one.
+pub fn require_scope(env: &Env, caller: &Address, scope: AuthScope) -> Result<(), AccessError> {
+    // A single privileged operation must never demand more than one signature.
+    if MAX_AUTH_SIGNERS != 1 {
+        return Err(AccessError::NotAuthorized);
+    }
+
+    // Request authorization only for the declared caller. No other address is
+    // ever asked to sign, so the footprint cannot silently grow.
+    caller.require_auth();
+
+    if !satisfies_scope(env, caller, scope)? {
+        return Err(AccessError::NotAuthorized);
+    }
+
+    Ok(())
+}
+
+/// Enforce the declared scope for a named operation.
+///
+/// Rejects unknown operations (no declared scope) so new entry points cannot
+/// be added without an explicit authorization review.
+pub fn require_operation_scope(
+    env: &Env,
+    caller: &Address,
+    operation: &str,
+) -> Result<AuthScope, AccessError> {
+    let scope = scope_for_operation(operation).ok_or(AccessError::NotAuthorized)?;
+    require_scope(env, caller, scope)?;
+    Ok(scope)
+}
+
+/// Reject an invocation that carries unexpected authorization requirements.
+///
+/// `signers` is the set of addresses the caller intends to authorize. It must
+/// contain exactly `caller` and nothing else; any extra or missing signer is an
+/// unexpected authorization footprint and is rejected.
+pub fn reject_unexpected_auth(
+    env: &Env,
+    caller: &Address,
+    signers: &Vec<Address>,
+) -> Result<(), AccessError> {
+    if signers.len() != MAX_AUTH_SIGNERS {
+        return Err(AccessError::NotAuthorized);
+    }
+
+    for signer in signers.iter() {
+        if signer != *caller {
+            return Err(AccessError::NotAuthorized);
+        }
+    }
+
+    // Ensure the caller is actually authorized for at least the weakest scope;
+    // this catches attempts to authorize an address with no role at all.
+    if !(is_owner(env, caller)? || is_admin(env, caller) || is_operator(env, caller)) {
+        return Err(AccessError::NotAuthorized);
+    }
+
+    Ok(())
+}
+
 /// Require that `caller` is the owner and has signed the invocation.
 /// Panics with `AccessError::NotOwner` otherwise.
 pub fn require_owner(env: &Env, caller: &Address) -> Result<(), AccessError> {
-    caller.require_auth();
+    require_scope(env, caller, AuthScope::OwnerOnly)?;
 
     let owner = get_owner(env)?;
     if owner != *caller {
@@ -249,24 +382,12 @@ pub fn require_owner(env: &Env, caller: &Address) -> Result<(), AccessError> {
 /// Require that `caller` is the owner OR an admin and has signed.
 /// Panics with `AccessError::NotAuthorized` otherwise.
 pub fn require_admin_or_owner(env: &Env, caller: &Address) -> Result<(), AccessError> {
-    caller.require_auth();
-
-    if !is_authorized(env, caller)? {
-        return Err(AccessError::NotAuthorized);
-    }
-
-    Ok(())
+    require_scope(env, caller, AuthScope::AdminOrOwner)
 }
 
 /// Require owner OR admin OR operator role for operational routines.
 pub fn require_operator_or_admin_or_owner(env: &Env, caller: &Address) -> Result<(), AccessError> {
-    caller.require_auth();
-
-    if is_owner(env, caller)? || is_admin(env, caller) || is_operator(env, caller) {
-        return Ok(());
-    }
-
-    Err(AccessError::NotAuthorized)
+    require_scope(env, caller, AuthScope::OperatorOrAbove)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -65,3 +65,24 @@ export const fetchUserStats = async (): Promise<UserStats> => {
   await ensureApiResponse(res, 'fetchUserStats', 'Failed to fetch stats');
   return res.json();
 };
+
+export interface PersonalizationPreference {
+  enabled: boolean;
+}
+
+export const updatePersonalizationPreference = async (
+  enabled: boolean,
+): Promise<PersonalizationPreference> => {
+  const res = await fetch('/api/user/personalization', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ enabled }),
+  });
+  await ensureApiResponse(
+    res,
+    'updatePersonalizationPreference',
+    'Failed to update personalization preference',
+  );
+  return res.json();
+};

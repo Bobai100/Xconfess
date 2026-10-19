@@ -312,12 +312,119 @@ Before deploying to production:
 - [ ] All tests pass (`cargo test`)
 - [ ] Code reviewed for security
 - [ ] Testnet deployment successful
+- [ ] Storage migration rehearsal passed (fixtures, migration, rollback)
+- [ ] Pre-release compatibility report reviewed with no blocking conditions
 - [ ] Contract functions tested via CLI
 - [ ] Contract IDs saved to `deployments/`
 - [ ] Documentation updated
 - [ ] Network is correct (testnet vs mainnet)
 - [ ] Account has sufficient balance
 - [ ] Backup of secret keys created
+
+## 🔁 Storage Migration Rehearsal (Upgrades)
+
+Before upgrading a deployed contract instance, rehearse the storage migration
+against representative prior-version state. The rehearsal proves that existing
+on-chain storage can be transformed safely and that rollback constraints are
+understood **before** any upgrade transaction is submitted.
+
+### Prior-Version State Fixtures
+
+Representative fixtures for prior storage layouts live under
+`xconfess-contracts/tests/fixtures/storage/`. Each fixture captures the
+persisted keys, value encodings, and storage version of a previously released
+contract so the rehearsal runs against realistic state rather than empty
+storage.
+
+- Fixtures are versioned by the storage version they represent (for example
+  `v1/`, `v2/`).
+- A fixture must be added whenever a release changes a persisted key, value
+  type, or storage version. Missing fixtures are a blocking condition for the
+  release (see the compatibility report below).
+- Fixtures are loaded by the migration rehearsal tests; they are never used by
+  production code paths.
+
+### Operator Sequence
+
+Run the following sequence from the repository root. Do not skip steps and do
+not reorder them.
+
+1. **Build the release artifacts.**
+   ```bash
+   ./scripts/contracts-release.sh build
+   ```
+2. **Run the migration rehearsal tests** (expected path, rejection cases, and
+   rollback constraints):
+   ```bash
+   npm run contract:test
+   ```
+3. **Generate the pre-release compatibility report** and review it:
+   ```bash
+   npm run check:abi-drift
+   ```
+4. **Rehearse the migration on testnet** using the deployed instance from
+   `deployments/testnet.json`:
+   - Snapshot the current instance state (contract data entries) before the
+     upgrade so it can be restored.
+   - Apply the upgrade using the canonical deploy flow with the new WASM.
+   - Invoke the migration entry point with the authorized admin source key.
+   - Verify post-migration reads return the expected values for every fixture
+     key.
+5. **Rehearse rollback** by restoring the pre-upgrade snapshot and confirming
+   the previous WASM still reads the restored state.
+6. **Record the rehearsal outcome** in the release notes and attach the
+   compatibility report.
+
+### Authorization and Failure Semantics
+
+- Migration entry points are admin-gated. The rehearsal must be executed with
+  the admin source key; calls from any other key must fail with an
+  authorization error. This rejection case is covered by automated tests.
+- Migration is idempotent: re-running it against already-migrated state must
+  succeed without duplicating or corrupting entries.
+- If a fixture cannot be decoded by the new code, the migration must fail
+  explicitly rather than silently skipping entries. A silent skip is a
+  blocking defect.
+- Rollback is only guaranteed while the previous WASM remains available and
+  the storage version has not been advanced past the point of no return. Once
+  the migration commits a new storage version, rollback requires a
+  compensating migration; document this constraint in the release notes.
+
+## 📋 Pre-Release Compatibility Report
+
+`npm run check:abi-drift` produces a pre-release compatibility report that
+combines ABI changes, storage version, migration requirements, and deployment
+manifest differences. Review it as part of release gating.
+
+### Report Contents
+
+- **ABI diff** — added, removed, or changed exported functions and types.
+- **Storage version** — the storage version declared by the new build versus
+  the version recorded in the deployment manifest.
+- **Migration requirements** — whether a migration entry point is required and
+  whether a matching prior-version fixture exists.
+- **Deployment manifest differences** — contract IDs, WASM hashes, and crate
+  versions compared against `deployments/<network>.json`.
+
+### Blocking Conditions
+
+The report blocks a release when any of the following is true:
+
+- A persisted key or value type changed without a corresponding migration entry
+  point.
+- The storage version advanced without a prior-version fixture for the
+  rehearsal.
+- An exported function was removed or its signature changed without a
+  documented breaking-change note.
+- The deployment manifest hash does not match the freshly built WASM artifact.
+
+### Release Gating
+
+A release may proceed only when the compatibility report shows no blocking
+conditions and the migration rehearsal (including rollback) has passed on
+testnet. Attach the report to the release PR and reference the rehearsal
+outcome. If any blocking condition is present, fix it and regenerate the report
+before requesting review.
 
 ## 🔐 Production Deployment
 

@@ -6,10 +6,22 @@ const path = require('path');
 
 const SCORECARD_SCHEMA_VERSION = 1;
 const DEFAULT_REPORT_DIR = 'readiness-results';
+const DEFAULT_DRIFT_CONTRACT_PATH = path.join(
+  __dirname,
+  '..',
+  'config',
+  'deployment-drift-contract.json',
+);
+
+const DEPLOYMENT_TARGETS = ['render', 'vercel'];
 
 function parseOptions(argv = process.argv.slice(2)) {
   const args = new Set(argv);
   const reportDirArg = argv.find((arg) => arg.startsWith('--report-dir='));
+
+  const driftContractArg = argv.find((arg) =>
+    arg.startsWith('--drift-contract='),
+  );
 
   return {
     mode: args.has('--production') ? 'production' : 'local',
@@ -19,6 +31,195 @@ function parseOptions(argv = process.argv.slice(2)) {
     reportDir: reportDirArg
       ? reportDirArg.slice('--report-dir='.length)
       : DEFAULT_REPORT_DIR,
+    driftContractPath: driftContractArg
+      ? driftContractArg.slice('--drift-contract='.length)
+      : DEFAULT_DRIFT_CONTRACT_PATH,
+  };
+}
+
+function loadDriftContract(contractPath = DEFAULT_DRIFT_CONTRACT_PATH) {
+  const resolved = path.resolve(process.cwd(), contractPath);
+  const raw = fs.readFileSync(resolved, 'utf8');
+  const contract = JSON.parse(raw);
+
+  if (!contract || typeof contract !== 'object') {
+    throw new Error(`Deployment drift contract at ${resolved} must be an object`);
+  }
+
+  if (!Array.isArray(contract.keys) || contract.keys.length === 0) {
+    throw new Error(
+      `Deployment drift contract at ${resolved} must declare a non-empty "keys" array`,
+    );
+  }
+
+  const seen = new Set();
+  for (const entry of contract.keys) {
+    if (!entry || typeof entry.key !== 'string' || entry.key.length === 0) {
+      throw new Error(
+        `Deployment drift contract at ${resolved} has an entry without a "key"`,
+      );
+    }
+    if (seen.has(entry.key)) {
+      throw new Error(
+        `Deployment drift contract at ${resolved} declares duplicate key "${entry.key}"`,
+      );
+    }
+    seen.add(entry.key);
+
+    if (entry.secret === true) {
+      throw new Error(
+        `Deployment drift contract key "${entry.key}" is marked secret; only safe non-secret values may be compared`,
+      );
+    }
+
+    if (!Array.isArray(entry.targets) || entry.targets.length === 0) {
+      throw new Error(
+        `Deployment drift contract key "${entry.key}" must declare at least one target`,
+      );
+    }
+
+    for (const target of entry.targets) {
+      if (!DEPLOYMENT_TARGETS.includes(target)) {
+        throw new Error(
+          `Deployment drift contract key "${entry.key}" references unknown target "${target}"`,
+        );
+      }
+    }
+  }
+
+  return { path: resolved, keys: contract.keys };
+}
+
+function readTargetValue(entry, target, env) {
+  const envName = `${target.toUpperCase()}_${entry.key}`;
+  const value = env[envName];
+
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return { envName, present: false, value: undefined };
+  }
+
+  return { envName, present: true, value: String(value).trim() };
+}
+
+function normalizeComparableValue(value) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const trimmed = String(value).trim();
+
+  // Origins are compared without a trailing slash so that
+  // "https://api.example.com" and "https://api.example.com/" match.
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed.replace(/\/+$/, '').toLowerCase();
+  }
+
+  return trimmed.toLowerCase();
+}
+
+function buildRemediation(entry, target, envName) {
+  const hint = entry.remediation ? ` ${entry.remediation}` : '';
+  return `Set ${envName} on ${target} so it matches the other deployment target.${hint}`;
+}
+
+function compareDeploymentDrift(contract, env = process.env) {
+  const findings = [];
+
+  for (const entry of contract.keys) {
+    const values = new Map();
+
+    for (const target of entry.targets) {
+      const read = readTargetValue(entry, target, env);
+      values.set(target, read);
+
+      if (!read.present) {
+        findings.push({
+          key: entry.key,
+          category: entry.category || 'general',
+          status: 'missing',
+          target,
+          envName: read.envName,
+          expected: undefined,
+          actual: undefined,
+          remediation: buildRemediation(entry, target, read.envName),
+        });
+      }
+    }
+
+    const present = [...values.entries()].filter(([, read]) => read.present);
+    if (present.length < 2) {
+      continue;
+    }
+
+    const baseline = normalizeComparableValue(present[0][1].value);
+    for (const [target, read] of present.slice(1)) {
+      const actual = normalizeComparableValue(read.value);
+      if (actual !== baseline) {
+        findings.push({
+          key: entry.key,
+          category: entry.category || 'general',
+          status: 'drift',
+          target,
+          envName: read.envName,
+          expected: present[0][1].value,
+          actual: read.value,
+          remediation: buildRemediation(entry, target, read.envName),
+        });
+      }
+    }
+  }
+
+  return {
+    status: findings.length === 0 ? 'passed' : 'failed',
+    findings,
+  };
+}
+
+function renderDriftReport(drift) {
+  if (drift.status === 'passed') {
+    return 'Deployment configuration drift: none detected.';
+  }
+
+  const lines = ['Deployment configuration drift detected:'];
+  for (const finding of drift.findings) {
+    const detail =
+      finding.status === 'missing'
+        ? `${finding.envName} is not set`
+        : `${finding.envName}="${finding.actual}" does not match expected "${finding.expected}"`;
+    lines.push(`- [${finding.category}] ${finding.key}: ${detail}`);
+    lines.push(`  Remediation: ${finding.remediation}`);
+  }
+
+  return lines.join('\n');
+}
+
+function runDeploymentDriftCheck(options = {}) {
+  const contractPath = options.contractPath || DEFAULT_DRIFT_CONTRACT_PATH;
+  const env = options.env || process.env;
+
+  console.log('\n==> deployment configuration drift');
+
+  let contract;
+  try {
+    contract = loadDriftContract(contractPath);
+  } catch (error) {
+    console.error(`Deployment drift contract error: ${error.message}`);
+    return {
+      name: 'deployment configuration drift',
+      status: 'failed',
+      code: 1,
+      drift: { status: 'failed', findings: [] },
+    };
+  }
+
+  const drift = compareDeploymentDrift(contract, env);
+  console.log(renderDriftReport(drift));
+
+  return {
+    name: 'deployment configuration drift',
+    status: drift.status === 'passed' ? 'passed' : 'failed',
+    code: drift.status === 'passed' ? 0 : 1,
+    drift,
   };
 }
 
@@ -161,6 +362,14 @@ function main() {
   const checks = buildChecks(options);
   const started = Date.now();
   const results = checks.map(runCheck);
+
+  if (options.mode === 'production') {
+    results.push(
+      runDeploymentDriftCheck({
+        contractPath: options.driftContractPath,
+      }),
+    );
+  }
   const durationMs = Math.max(1, Date.now() - started);
   const scorecard = createScorecard({
     mode: options.mode,
@@ -198,8 +407,12 @@ if (require.main === module) {
 
 module.exports = {
   buildChecks,
+  compareDeploymentDrift,
   createScorecard,
+  loadDriftContract,
   parseOptions,
+  renderDriftReport,
   renderMarkdownReport,
+  runDeploymentDriftCheck,
   writeScorecardReports,
 };

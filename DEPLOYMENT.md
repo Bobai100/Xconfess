@@ -206,3 +206,153 @@ npm run ci
 The full gate includes frontend type-checking, frontend tests, backend tests, and Rust contract tests. Contract tests need enough free disk space for the MSVC linker on Windows.
 
 `npm run deploy:preflight` checks Render config drift, migration timestamp duplicates, and required production env vars. It now also runs automatically as a required GitHub Actions check (`Deploy Preflight`) on every pull request against `main`, using dummy production-shaped env values — no live secrets are needed for the check to run.
+
+## Contract Release Compatibility Report
+
+Before promoting any contract release, generate the pre-release compatibility report:
+
+```powershell
+npm run check:abi-drift
+npm run contract:test
+```
+
+The report combines ABI diffs, the on-chain storage version, migration requirements, and deployment manifest differences. Interpret it as follows:
+
+- **Blocking conditions** (any of these stops the release): ABI drift without a matching version bump, a storage version change with no registered migration, a manifest diff for a contract ID that is not part of the release, or a failed migration rehearsal.
+- **Non-blocking warnings**: additive ABI entries, documentation-only manifest changes, and storage version bumps that ship with a rehearsal fixture.
+- Attach the generated report to the release PR. A release without an attached report is not approved.
+
+## Contract Storage Migration Rehearsal
+
+Upgrades must be rehearsed against representative prior-version state fixtures before release:
+
+```powershell
+npm run contract:test
+npm run contract:build:release
+```
+
+Operator sequence:
+
+1. Run the rehearsal suite against the prior-version fixtures. It applies the migration to a snapshot of deployed state and asserts the post-migration layout.
+2. Confirm the rollback constraints documented by the rehearsal (which fields are forward-only and cannot be reverted).
+3. Only after a green rehearsal, build the release artifact and proceed with deployment.
+4. If a rehearsal fails, do not deploy. Fix the migration or add a fixture that reproduces the failure.
+
+## Indexed Event Range Verification
+
+The event verifier is read-only and compares indexed ranges against ledger data:
+
+```powershell
+npm run contract:test:integration
+```
+
+- It reports gaps grouped by checkpoint so operators can see exactly which ranges were missed or misclassified.
+- Bounded reprocessing is opt-in and requires an explicit range. Never reprocess unbounded ranges in production.
+- Reprocessing is idempotent: re-indexing an already-indexed range must not duplicate events. If it does, stop and escalate before continuing.
+
+## Ambiguous Transaction Submission Recovery
+
+When a submission times out, the caller must not blindly retry. The backend records a durable pending state keyed by operation intent:
+
+1. On timeout, look up the pending record by operation intent before retrying.
+2. If the record shows the operation landed, treat the submission as successful and do not resubmit.
+3. If the record is still pending, retry with the same operation intent so the reconciliation lookup converges instead of duplicating tipping or anchoring.
+4. If reconciliation cannot resolve the intent, escalate; do not issue a fresh intent.
+
+```powershell
+npm run backend:test
+npm run contract:test:integration
+```
+## Transaction Latency and Failure Budgets
+
+Transaction workflows are instrumented at the backend boundary with bounded labels so application latency can be separated from network-provider latency:
+
+- `network`: one of `stellar-testnet`, `stellar-mainnet`, `stellar-futurenet`, `stellar-custom` (never a raw URL or passphrase).
+- `operation`: one of `submit`, `include`, `confirm`, `anchor`, `tip`, `badge`.
+- `outcome`: one of `success`, `timeout`, `provider_error`, `rejected`.
+
+Each submission records three latency samples: submission (request accepted by the provider), inclusion (transaction observed in a ledger), and confirmation (final success/failure). Budgets are configured per network and operation class:
+
+```env
+TX_LATENCY_BUDGET_SUBMIT_MS=5000
+TX_LATENCY_BUDGET_INCLUDE_MS=30000
+TX_LATENCY_BUDGET_CONFIRM_MS=60000
+TX_FAILURE_BUDGET_PERCENT=5
+TX_BUDGET_WINDOW_SECONDS=300
+```
+
+When a budget is exceeded, the backend emits a structured warning (`tx_budget_exceeded`) with the bounded labels and the observed value. Budgets are advisory by default; set `TX_BUDGET_ENFORCE=true` to reject new submissions for a network/operation class once its failure budget is exhausted within the window. Rejections return `503` with `code: "TX_BUDGET_EXHAUSTED"` and are counted under `outcome=rejected`.
+
+Operational notes:
+
+- Budgets are evaluated over a rolling window and reset on process restart; they are not a substitute for provider-side alerting.
+- Never add unbounded labels (transaction hashes, account IDs, raw URLs) to these metrics.
+- Tune budgets per network; mainnet confirmation budgets are typically higher than testnet.
+
+## Wallet Authorization Scopes
+
+Wallet-connected actions map a user intent to exactly one contract operation and an explicit authorization footprint. The frontend declares the intent before signing; the backend and contract integration tests verify the signed invocation matches it.
+
+| Intent | Contract operation | Authorization footprint |
+| --- | --- | --- |
+| `create_confession` | `anchor_confession` | `invoke` on the confession anchor contract only |
+| `send_tip` | `transfer_tip` | `invoke` on the tipping contract; token transfer limited to the tip amount |
+| `mint_badge` | `mint_badge` | `invoke` on the reputation badges contract only |
+
+Rules enforced at the boundary:
+
+- The requested footprint must be a subset of the declared intent's allowed footprint. Unexpected authorization requirements (extra contracts, admin functions, unbounded token approvals) are rejected before the wallet prompt is shown.
+- The displayed intent (operation, contract, amount) must match the signed invocation; mismatches fail closed with `code: "AUTH_SCOPE_MISMATCH"`.
+- Authorization failures are surfaced to the user without retrying automatically.
+
+Contributors adding a new wallet action must add the intent to the scope map, document it in this table, and cover both the expected path and the rejection path in `npm run frontend:test` and `npm run contract:test:integration`.
+
+## Deployment Configuration Drift Contract
+
+Render (backend) and Vercel (frontend) must agree on a checked, non-secret configuration contract. `npm run production:readiness` compares the safe values below across both targets and fails readiness on drift:
+
+- API origins: `BACKEND_URL` (Render) must equal the origin of `NEXT_PUBLIC_API_URL` and `BACKEND_API_URL` (Vercel).
+- WebSocket origin: `NEXT_PUBLIC_WS_URL` must use `wss://` and share the backend host.
+- Cookie settings: `COOKIE_SECURE=true`, `COOKIE_SAME_SITE` consistent with the frontend/backend origin relationship, and `NEXT_PUBLIC_APP_URL` matching the frontend origin.
+- Feature flags: `STELLAR_FEATURES_ENABLED` (backend) must match `NEXT_PUBLIC_STELLAR_FEATURES_ENABLED` (frontend).
+- Network selection: `STELLAR_NETWORK` must match `NEXT_PUBLIC_STELLAR_NETWORK`, and the contract IDs must match across targets.
+
+Only non-secret values are compared; secrets are never read or logged. On drift, readiness fails with a per-field report naming the field, both observed values, and remediation, for example:
+
+```text
+CONFIG_DRIFT NEXT_PUBLIC_STELLAR_NETWORK: vercel="mainnet" render="testnet"
+  remediation: set NEXT_PUBLIC_STELLAR_NETWORK=testnet in Vercel and redeploy the frontend
+```
+
+Remediation guidance:
+
+1. Fix the drifted value in the owning provider's environment settings.
+2. Redeploy the affected app (frontend changes require a rebuild because `NEXT_PUBLIC_*` values are inlined).
+3. Re-run `npm run production:readiness` and confirm it passes before promoting.
+
+## Regional Synthetic Checks
+
+Privacy-critical user flows are exercised by low-volume synthetic journeys from multiple regions. Checks use synthetic accounts and fixtures only — never real user data — and report per-step availability with bounded labels:
+
+- `region`: deployment region identifier (for example `us-east`, `eu-west`, `ap-southeast`).
+- `step`: one of `landing`, `login`, `create_confession`, `view_confession`, `health`.
+- `outcome`: one of `success`, `failure`, `timeout`.
+
+Configuration:
+
+```env
+SYNTHETIC_CHECKS_ENABLED=true
+SYNTHETIC_CHECK_REGIONS=us-east,eu-west,ap-southeast
+SYNTHETIC_CHECK_INTERVAL_SECONDS=300
+SYNTHETIC_CHECK_TIMEOUT_MS=10000
+SYNTHETIC_CHECK_BASE_URL=https://your-frontend-domain
+```
+
+Operational notes:
+
+- Keep volume low (one journey per region per interval) to avoid skewing real traffic metrics.
+- Synthetic accounts are isolated and cleaned up; they must not be able to read or write real confessions.
+- A failing step in any region fails the synthetic readiness report with the region and step named; regional routing, TLS, and edge-cache failures surface here before users report them.
+- Roll out by enabling one region first, confirming a clean run, then adding regions incrementally.
+
+Validation: `npm run readiness:test` covers the expected path, per-step failure reporting, and the regression risk of unbounded labels or real-user data leaking into synthetic journeys.

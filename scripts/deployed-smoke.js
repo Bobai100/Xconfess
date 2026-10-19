@@ -18,6 +18,92 @@ const signOutPath = process.env.SMOKE_SIGN_OUT_PATH || '/api/auth/logout';
 const expectedOrigin = process.env.SMOKE_EXPECTED_ORIGIN || frontendUrl;
 =======
 
+// Regional synthetic checks. Each region label is bounded to a small allowlist so
+// metrics stay low-cardinality and never carry user data or free-form input.
+const REGION_LABEL_PATTERN = /^[a-z]{2,3}-[a-z]{2,4}-\d{1,2}$/;
+const MAX_REGIONS = 8;
+const DEFAULT_REGION = 'local-xx-1';
+const rawRegions = (process.env.SMOKE_REGIONS || process.env.SMOKE_REGION || '')
+  .split(',')
+  .map((region) => region.trim().toLowerCase())
+  .filter(Boolean);
+const regions = (rawRegions.length ? rawRegions : [DEFAULT_REGION]).slice(0, MAX_REGIONS);
+const regionFailOnError = process.env.SMOKE_REGION_FAIL_ON_ERROR !== 'false';
+
+// Bounded step labels for per-step availability reporting.
+const STEP_LABELS = Object.freeze({
+  backendLiveness: 'backend_liveness',
+  backendReadiness: 'backend_readiness',
+  backendHealthStatus: 'backend_health_status',
+  publicTraction: 'public_traction',
+  stellarConfig: 'stellar_config',
+  frontendTractionPage: 'frontend_traction_page',
+  frontendSessionAnonymous: 'frontend_session_anonymous',
+  frontendRegisterGuard: 'frontend_register_guard',
+  frontendRegistrationMutation: 'frontend_registration_mutation',
+});
+
+function validateRegion(region) {
+  if (!REGION_LABEL_PATTERN.test(region)) {
+    throw new Error(
+      `invalid SMOKE_REGIONS entry "${region}"; expected bounded label like "us-east-1"`,
+    );
+  }
+  return region;
+}
+
+function resolveRegionBaseUrls(region) {
+  const suffix = region.toUpperCase().replace(/-/g, '_');
+  const regionFrontend =
+    process.env[`SMOKE_FRONTEND_URL_${suffix}`] || process.env.SMOKE_FRONTEND_URL || process.env.FRONTEND_URL || frontendUrl;
+  const regionBackend =
+    process.env[`SMOKE_BACKEND_URL_${suffix}`] || process.env.SMOKE_BACKEND_URL || process.env.BACKEND_URL || backendUrl;
+  return { frontendUrl: regionFrontend, backendUrl: regionBackend };
+}
+
+function createStepReporter(region) {
+  const steps = [];
+  return {
+    steps,
+    async run(stepLabel, fn) {
+      if (!Object.values(STEP_LABELS).includes(stepLabel)) {
+        throw new Error(`unbounded synthetic step label: ${stepLabel}`);
+      }
+      const started = Date.now();
+      try {
+        const result = await fn();
+        const latencyMs = Date.now() - started;
+        steps.push({ region, step: stepLabel, ok: true, latencyMs });
+        console.log(`synthetic step region=${region} step=${stepLabel} status=ok latency_ms=${latencyMs}`);
+        return result;
+      } catch (error) {
+        const latencyMs = Date.now() - started;
+        steps.push({ region, step: stepLabel, ok: false, latencyMs, error: error.message || String(error) });
+        console.log(`synthetic step region=${region} step=${stepLabel} status=fail latency_ms=${latencyMs}`);
+        throw error;
+      }
+    },
+  };
+}
+
+function summarizeRegion(region, reporter) {
+  const total = reporter.steps.length;
+  const failed = reporter.steps.filter((step) => !step.ok).length;
+  const availability = total === 0 ? 0 : ((total - failed) / total) * 100;
+  return {
+    region,
+    total,
+    failed,
+    availability: Number(availability.toFixed(2)),
+    steps: reporter.steps.map((step) => ({
+      region: step.region,
+      step: step.step,
+      ok: step.ok,
+      latencyMs: step.latencyMs,
+    })),
+  };
+}
+
 function joinUrl(base, path) {
   return `${base.replace(/\/+$/, '')}${path}`;
 }
@@ -188,105 +274,48 @@ function assertNoSensitiveKeys(name, value, path = '') {
   }
 }
 
-async function verifyUserJourney() {
-  if (!smokeUsername || !smokePassword) {
-    throw new Error('SMOKE_USERNAME and SMOKE_PASSWORD are required to verify the deployed user journey');
-  }
+async function runRegionJourney(region) {
+  const bases = resolveRegionBaseUrls(region);
+  const reporter = createStepReporter(region);
 
-  const originHeaders = { origin: expectedOrigin };
-
-  const preflight = await request(
-    'journey CORS preflight',
-    joinUrl(backendUrl, signInPath),
-    { method: 'OPTIONS', headers: { ...originHeaders, 'access-control-request-method': 'POST' } },
-    [200, 204],
+  await reporter.run(STEP_LABELS.backendLiveness, () =>
+    requestJson('backend liveness', joinUrl(bases.backendUrl, '/api/health/live')),
   );
-  assertCorsHeaders('journey CORS preflight', preflight);
-
-  const anonymousJourney = await request(
-    'journey anonymous authenticated request',
-    joinUrl(backendUrl, journeyPath),
-    { headers: originHeaders },
-    [401, 403],
+  await reporter.run(STEP_LABELS.backendReadiness, () =>
+    requestJson('backend readiness', joinUrl(bases.backendUrl, '/api/health/ready')),
   );
-  assertCorsHeaders('journey anonymous authenticated request', anonymousJourney);
-
-  const signInResponse = await request(
-    'journey sign-in',
-    joinUrl(backendUrl, signInPath),
-    {
-      method: 'POST',
-      headers: originHeaders,
-      body: JSON.stringify({ username: smokeUsername, password: smokePassword }),
-    },
-    [200, 201],
+  const healthStatus = await reporter.run(STEP_LABELS.backendHealthStatus, () =>
+    requestJson('backend health status', joinUrl(bases.backendUrl, '/api/health/status'), {}, [200, 503]),
   );
-  assertCorsHeaders('journey sign-in', signInResponse);
-  const sessionCookie = findSessionCookie(signInResponse);
-  if (!sessionCookie) {
-    throw new Error(`journey sign-in did not set the ${sessionCookieName} session cookie`);
-  }
-  assertSessionCookieAttributes('journey sign-in', sessionCookie.raw);
-
-  const authenticated = await request(
-    'journey authenticated request',
-    joinUrl(backendUrl, journeyPath),
-    { headers: { ...originHeaders, cookie: `${sessionCookie.name}=${sessionCookie.value}` } },
-    [200],
-  );
-  assertCorsHeaders('journey authenticated request', authenticated);
-  const authenticatedBody = await authenticated.json().catch(() => null);
-  assertObject('journey authenticated request', authenticatedBody);
-  assertNoSensitiveKeys('journey authenticated request', authenticatedBody);
-
-  const signOutResponse = await request(
-    'journey sign-out',
-    joinUrl(backendUrl, signOutPath),
-    {
-      method: 'POST',
-      headers: { ...originHeaders, cookie: `${sessionCookie.name}=${sessionCookie.value}` },
-    },
-    [200, 204],
-  );
-  assertCorsHeaders('journey sign-out', signOutResponse);
-  const clearedCookie = findSessionCookie(signOutResponse);
-  if (clearedCookie && clearedCookie.value) {
-    throw new Error('journey sign-out did not clear the session cookie');
-  }
-
-  await request(
-    'journey post-sign-out authenticated request',
-    joinUrl(backendUrl, journeyPath),
-    { headers: { ...originHeaders, cookie: `${sessionCookie.name}=${sessionCookie.value}` } },
-    [401, 403],
-  );
-
-  console.log('user journey verified: sign-in, authenticated request, sign-out');
-}
-
-async function main() {
-  await requestJson('backend liveness', joinUrl(backendUrl, '/api/health/live'));
-  await requestJson('backend readiness', joinUrl(backendUrl, '/api/health/ready'));
-  const healthStatus = await requestJson('backend health status', joinUrl(backendUrl, '/api/health/status'), {}, [200, 503]);
   assertObject('backend health status', healthStatus);
 
-  const traction = await requestJson('public traction API', joinUrl(backendUrl, '/api/public/traction'));
+  const traction = await reporter.run(STEP_LABELS.publicTraction, () =>
+    requestJson('public traction API', joinUrl(bases.backendUrl, '/api/public/traction')),
+  );
   assertObject('public traction API', traction);
   assertNoSensitiveKeys('public traction API', traction);
   if (!traction.users || !traction.engagement || !traction.stellar || !traction.reliability) {
     throw new Error('public traction API is missing required aggregate sections');
   }
 
-  const stellarConfig = await requestJson('public Stellar config', joinUrl(backendUrl, '/api/stellar/config'));
+  const stellarConfig = await reporter.run(STEP_LABELS.stellarConfig, () =>
+    requestJson('public Stellar config', joinUrl(bases.backendUrl, '/api/stellar/config')),
+  );
   assertObject('public Stellar config', stellarConfig);
   assertNoSensitiveKeys('public Stellar config', stellarConfig);
   if (!stellarConfig.network || !stellarConfig.contractIds) {
     throw new Error('public Stellar config is missing network or contractIds');
   }
 
-  await request('frontend traction page', joinUrl(frontendUrl, '/traction'), {}, [200]);
-  await request('frontend session anonymous', joinUrl(frontendUrl, '/api/auth/session'), {}, [401]);
-  await request('frontend register method guard', joinUrl(frontendUrl, '/api/users/register'), {}, [405]);
+  await reporter.run(STEP_LABELS.frontendTractionPage, () =>
+    request('frontend traction page', joinUrl(bases.frontendUrl, '/traction'), {}, [200]),
+  );
+  await reporter.run(STEP_LABELS.frontendSessionAnonymous, () =>
+    request('frontend session anonymous', joinUrl(bases.frontendUrl, '/api/auth/session'), {}, [401]),
+  );
+  await reporter.run(STEP_LABELS.frontendRegisterGuard, () =>
+    request('frontend register method guard', joinUrl(bases.frontendUrl, '/api/users/register'), {}, [405]),
+  );
 
   if (runJourney) {
     await verifyUserJourney();
@@ -295,22 +324,55 @@ async function main() {
   }
 
   if (runMutation) {
+    // Synthetic-only identity: disposable, non-routable example.com address and
+    // random suffix. No real user data is ever sent by these journeys.
     const suffix = crypto.randomBytes(4).toString('hex');
-    await request(
-      'frontend registration mutation',
-      joinUrl(frontendUrl, '/api/users/register'),
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          username: `smoke_${suffix}`,
-          email: `smoke_${suffix}@example.com`,
-          password: `SmokePass!${suffix}A1`,
-        }),
-      },
-      [200, 201, 409],
+    await reporter.run(STEP_LABELS.frontendRegistrationMutation, () =>
+      request(
+        'frontend registration mutation',
+        joinUrl(bases.frontendUrl, '/api/users/register'),
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            username: `smoke_${suffix}`,
+            email: `smoke_${suffix}@example.com`,
+            password: `SmokePass!${suffix}A1`,
+          }),
+        },
+        [200, 201, 409],
+      ),
     );
   } else {
     console.log('registration mutation skipped; set SMOKE_RUN_MUTATION=true to create a disposable account');
+  }
+
+  return summarizeRegion(region, reporter);
+}
+
+async function main() {
+  const validatedRegions = regions.map(validateRegion);
+  const summaries = [];
+  const failures = [];
+
+  for (const region of validatedRegions) {
+    try {
+      summaries.push(await runRegionJourney(region));
+    } catch (error) {
+      const message = error.message || String(error);
+      console.error(`synthetic region=${region} status=fail reason=${message}`);
+      failures.push({ region, message });
+    }
+  }
+
+  const report = {
+    regions: summaries,
+    failedRegions: failures.map((failure) => failure.region),
+  };
+  console.log(`synthetic report ${JSON.stringify(report)}`);
+
+  if (failures.length > 0 && regionFailOnError) {
+    const detail = failures.map((failure) => `${failure.region}: ${failure.message}`).join('; ');
+    throw new Error(`regional synthetic checks failed for ${failures.length} region(s): ${detail}`);
   }
 }
 

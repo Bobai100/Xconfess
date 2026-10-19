@@ -9,6 +9,8 @@ import {
   UseGuards,
   Req,
   Query,
+  ForbiddenException,
+  UnauthorizedException,
 } from '@nestjs/common';
 
 import {
@@ -32,11 +34,14 @@ export class SearchDiscoveryController {
   @Get()
   @RequestCost(COST.MEDIUM) // full-text search + filtering is more expensive than a simple read
   @ApiOperation({ summary: 'Execute full text search with filters and highlighting' })
-  executeSearch(
+  async executeSearch(
     @Req() req: any,
     @Query() query: SearchConfessionDto,
+    @Query('personalized') personalized?: string,
   ) {
-    return this.service.executeFullTextSearch(req.user.id, query);
+    const userId = this.requireUserId(req);
+    const mode = await this.resolvePersonalizedMode(userId, personalized);
+    return this.service.executeFullTextSearch(userId, query, mode);
   }
 
   @Post('presets')
@@ -65,8 +70,14 @@ export class SearchDiscoveryController {
 
   @Get('recommendations')
   @ApiOperation({ summary: 'Get personalized recommendations with safeguards and explanations' })
-  getRecommendations(@Req() req: any, @Query('limit') limit?: number) {
-    return this.service.getPersonalizedRecommendations(req.user.id, limit);
+  async getRecommendations(
+    @Req() req: any,
+    @Query('limit') limit?: number,
+    @Query('personalized') personalized?: string,
+  ) {
+    const userId = this.requireUserId(req);
+    const mode = await this.resolvePersonalizedMode(userId, personalized);
+    return this.service.getPersonalizedRecommendations(userId, limit, mode);
   }
 
   @Get('preferences')
@@ -79,5 +90,57 @@ export class SearchDiscoveryController {
   @ApiOperation({ summary: 'Update personalization opt-out and diversity preferences' })
   updatePreferences(@Req() req: any, @Body() dto: any) {
     return this.service.updateUserDiscoveryPreference(req.user.id, dto);
+  }
+
+  /**
+   * Resolves the effective personalization mode for a request.
+   *
+   * - When the caller does not supply `personalized`, the persisted user
+   *   preference is authoritative (opt-out is always honored).
+   * - When the caller explicitly requests a mode, it may only *disable*
+   *   personalization. Forcing personalization on while the user has opted out
+   *   is rejected so hidden signals can never be re-enabled implicitly.
+   */
+  private async resolvePersonalizedMode(
+    userId: string,
+    personalized?: string,
+  ): Promise<boolean> {
+    const preference = await this.service.getUserDiscoveryPreference(userId);
+    const optedOut = preference?.personalizationEnabled === false;
+
+    if (personalized === undefined || personalized === null || personalized === '') {
+      return !optedOut;
+    }
+
+    const requested = this.parseBooleanFlag(personalized);
+    if (requested === null) {
+      throw new ForbiddenException(
+        'Invalid "personalized" flag; expected "true" or "false".',
+      );
+    }
+
+    if (requested && optedOut) {
+      throw new ForbiddenException(
+        'Personalization is disabled for this account; non-personalized mode is enforced.',
+      );
+    }
+
+    return requested;
+  }
+
+  private parseBooleanFlag(value: string): boolean | null {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return null;
+  }
+
+  private requireUserId(req: any): string {
+    const userId = req?.user?.id;
+    if (!userId) {
+      throw new UnauthorizedException(
+        'Authentication is required to select a discovery mode.',
+      );
+    }
+    return userId;
   }
 }

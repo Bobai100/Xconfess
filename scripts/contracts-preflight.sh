@@ -140,6 +140,73 @@ for crate in "${expected_crates[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
+# 3b. Storage migration rehearsal fixtures (#275)
+# ---------------------------------------------------------------------------
+header "Storage migration rehearsal fixtures"
+
+FIXTURES_DIR="$CONTRACTS_DIR/tests/fixtures/storage"
+if [[ -d "$FIXTURES_DIR" ]]; then
+  ok "storage fixtures directory exists"
+  fixture_count=0
+  for fixture in "$FIXTURES_DIR"/*.json; do
+    [[ -e "$fixture" ]] || continue
+    fixture_count=$((fixture_count + 1))
+  done
+  if [[ "$fixture_count" -gt 0 ]]; then
+    ok "$fixture_count prior-version storage fixture(s) present"
+  else
+    fail "no prior-version storage fixtures found in $FIXTURES_DIR — migration rehearsal cannot run"
+  fi
+else
+  fail "storage fixtures directory missing at: $FIXTURES_DIR — add representative prior-version state fixtures"
+fi
+
+REHEARSAL_SCRIPT="$REPO_ROOT/scripts/contracts-migration-rehearsal.sh"
+if [[ -f "$REHEARSAL_SCRIPT" ]]; then
+  ok "migration rehearsal script present"
+else
+  fail "migration rehearsal script missing at: $REHEARSAL_SCRIPT"
+fi
+
+# ---------------------------------------------------------------------------
+# 3c. Storage compatibility report prerequisites (#280)
+# ---------------------------------------------------------------------------
+header "Storage compatibility report"
+
+REPORT_SCRIPT="$REPO_ROOT/scripts/contracts-compat-report.sh"
+if [[ -f "$REPORT_SCRIPT" ]]; then
+  ok "compatibility report generator present"
+else
+  fail "compatibility report generator missing at: $REPORT_SCRIPT"
+fi
+
+MANIFEST_DIR="$CONTRACTS_DIR/deployments"
+if [[ -d "$MANIFEST_DIR" ]]; then
+  ok "deployment manifest directory exists"
+else
+  fail "deployment manifest directory missing at: $MANIFEST_DIR — report cannot diff manifests"
+fi
+
+# Authorization env vars are only required when actually running the report or
+# rehearsal against a live network; build-only checks just warn.
+required_auth_vars=(
+  "XCONFESS_RELEASE_APPROVER"
+  "XCONFESS_STORAGE_VERSION"
+)
+
+for var in "${required_auth_vars[@]}"; do
+  if [[ -n "${!var:-}" ]]; then
+    ok "$var is set"
+  else
+    if [[ "$DEPLOY_MODE" -eq 1 ]]; then
+      fail "$var is not set — required to authorize migration/report before deploy"
+    else
+      printf "  [SKIP] %s not set — required only for deploy/report runs\n" "$var"
+    fi
+  fi
+done
+
+# ---------------------------------------------------------------------------
 # 4. Stellar CLI (build checks are complete without it; deploy needs it)
 # ---------------------------------------------------------------------------
 header "Stellar CLI"

@@ -11,7 +11,10 @@ import {
   InvalidationPrefixes,
 } from '../cache/cache-namespace';
 import { toWindowBoundaries } from '../types/analytics.types';
-import { ANALYTICS_PRIVACY } from './analytics.constants';
+import {
+  ANALYTICS_PRIVACY,
+  RANKING_QUALITY_DRIFT,
+} from './analytics.constants';
 
 type TrendDirection = 'increasing' | 'decreasing' | 'stable';
 
@@ -88,10 +91,89 @@ interface ReactionDistributionRow {
   count: string;
 }
 
+/**
+ * Aggregate-only ranking quality indicators (#267).
+ *
+ * These are computed from cohort-level counters only — no per-user history is
+ * retained or persisted. Each indicator is a ratio of aggregate counters.
+ */
+export interface RankingQualityIndicators {
+  /** Click-through rate: clicks / impressions (0..1). */
+  ctr: number;
+  /** Mean dwell time in milliseconds across the cohort. */
+  dwellMs: number;
+  /** Satisfaction: positive feedback / total feedback (0..1). */
+  satisfaction: number;
+}
+
+export interface RankingQualityCohort {
+  rankingVersion: string;
+  cohortSize: number;
+  indicators: RankingQualityIndicators;
+}
+
+export type DriftStatus = 'ok' | 'insufficient-cohort' | 'drift-detected';
+
+export interface RankingQualityDriftResult {
+  status: DriftStatus;
+  rankingVersion: string;
+  cohortSize: number;
+  baseline: RankingQualityIndicators | null;
+  current: RankingQualityIndicators | null;
+  breaches: Array<{
+    metric: keyof RankingQualityIndicators;
+    baseline: number;
+    current: number;
+    relativeChange: number;
+    threshold: number;
+  }>;
+  /** True when the ranking version should be disabled pending review. */
+  requiresReview: boolean;
+  evaluatedAt: string;
+}
+
+export interface RankingVersionReview {
+  rankingVersion: string;
+  disabled: boolean;
+  reason: string;
+  reviewedAt: string;
+}
+
+/**
+ * Raw aggregate counters supplied by the ranking pipeline. These are the only
+ * inputs to drift detection; user-level rows are never accepted or stored.
+ */
+export interface RankingQualityAggregateCounters {
+  rankingVersion: string;
+  cohortSize: number;
+  impressions: number;
+  clicks: number;
+  dwellTotalMs: number;
+  dwellSamples: number;
+  positiveFeedback: number;
+  totalFeedback: number;
+}
+
 @Injectable()
 export class AnalyticsService {
   private readonly logger = new Logger(AnalyticsService.name);
   private readonly CACHE_TTL = 900; // 15 minutes in seconds
+
+  /**
+   * In-memory, aggregate-only store of ranking quality counters keyed by
+   * ranking version. Bounded by RANKING_QUALITY_DRIFT.RETENTION_LIMIT entries
+   * and pruned by age — no user-level histories are ever retained here.
+   */
+  private readonly rankingQualityAggregates = new Map<
+    string,
+    { counters: RankingQualityAggregateCounters; recordedAt: Date }
+  >();
+
+  /** Ranking versions disabled pending review (feature-flag style). */
+  private readonly disabledRankingVersions = new Map<
+    string,
+    RankingVersionReview
+  >();
 
   constructor(
     @InjectRepository(AnonymousConfession)
@@ -364,6 +446,212 @@ export class AnalyticsService {
             };
           }),
       },
+    };
+  }
+
+  // ─── Ranking quality drift (#267) ──────────────────────────────────────────
+  //
+  // Drift detection operates exclusively on aggregate counters. User-level
+  // histories are never persisted: callers submit cohort totals, and only the
+  // derived ratios plus the cohort size are retained (bounded by retention
+  // limits). This keeps the privacy surface minimal while still surfacing
+  // real-world ranking quality regressions.
+
+  /**
+   * Record aggregate counters for a ranking version. Rejects cohorts smaller
+   * than the configured minimum so individual behaviour cannot be inferred.
+   */
+  recordRankingQualityAggregates(
+    counters: RankingQualityAggregateCounters,
+  ): { accepted: boolean; reason?: string } {
+    if (counters.cohortSize < RANKING_QUALITY_DRIFT.MIN_COHORT_SIZE) {
+      return {
+        accepted: false,
+        reason: `cohort size ${counters.cohortSize} below minimum ${RANKING_QUALITY_DRIFT.MIN_COHORT_SIZE}`,
+      };
+    }
+
+    this.rankingQualityAggregates.set(counters.rankingVersion, {
+      counters,
+      recordedAt: new Date(),
+    });
+    this.enforceRankingQualityRetention();
+
+    return { accepted: true };
+  }
+
+  /**
+   * Evaluate drift for a ranking version against a baseline version using
+   * aggregate indicators only. Returns `insufficient-cohort` when either
+   * cohort is below the minimum size.
+   */
+  evaluateRankingQualityDrift(
+    rankingVersion: string,
+    baselineVersion: string,
+  ): RankingQualityDriftResult {
+    const evaluatedAt = new Date().toISOString();
+    const currentEntry = this.rankingQualityAggregates.get(rankingVersion);
+    const baselineEntry = this.rankingQualityAggregates.get(baselineVersion);
+
+    if (!currentEntry || !baselineEntry) {
+      return {
+        status: 'insufficient-cohort',
+        rankingVersion,
+        cohortSize: currentEntry?.counters.cohortSize ?? 0,
+        baseline: baselineEntry
+          ? this.toRankingQualityIndicators(baselineEntry.counters)
+          : null,
+        current: currentEntry
+          ? this.toRankingQualityIndicators(currentEntry.counters)
+          : null,
+        breaches: [],
+        requiresReview: false,
+        evaluatedAt,
+      };
+    }
+
+    if (
+      currentEntry.counters.cohortSize <
+        RANKING_QUALITY_DRIFT.MIN_COHORT_SIZE ||
+      baselineEntry.counters.cohortSize <
+        RANKING_QUALITY_DRIFT.MIN_COHORT_SIZE
+    ) {
+      return {
+        status: 'insufficient-cohort',
+        rankingVersion,
+        cohortSize: currentEntry.counters.cohortSize,
+        baseline: this.toRankingQualityIndicators(baselineEntry.counters),
+        current: this.toRankingQualityIndicators(currentEntry.counters),
+        breaches: [],
+        requiresReview: false,
+        evaluatedAt,
+      };
+    }
+
+    const baseline = this.toRankingQualityIndicators(baselineEntry.counters);
+    const current = this.toRankingQualityIndicators(currentEntry.counters);
+
+    const breaches: RankingQualityDriftResult['breaches'] = [];
+    (
+      Object.keys(RANKING_QUALITY_DRIFT.THRESHOLDS) as Array<
+        keyof RankingQualityIndicators
+      >
+    ).forEach((metric) => {
+      const threshold = RANKING_QUALITY_DRIFT.THRESHOLDS[metric];
+      const baselineValue = baseline[metric];
+      const currentValue = current[metric];
+      if (baselineValue === 0) {
+        return;
+      }
+      const relativeChange = (currentValue - baselineValue) / baselineValue;
+      // A drop larger than the threshold (in magnitude) is a breach.
+      if (relativeChange < -threshold) {
+        breaches.push({
+          metric,
+          baseline: baselineValue,
+          current: currentValue,
+          relativeChange: parseFloat(relativeChange.toFixed(4)),
+          threshold,
+        });
+      }
+    });
+
+    const status: DriftStatus =
+      breaches.length > 0 ? 'drift-detected' : 'ok';
+
+    return {
+      status,
+      rankingVersion,
+      cohortSize: currentEntry.counters.cohortSize,
+      baseline,
+      current,
+      breaches,
+      requiresReview: status === 'drift-detected',
+      evaluatedAt,
+    };
+  }
+
+  /**
+   * Admin review path: disable (or re-enable) a ranking version. Disabling is
+   * the mechanism by which a drifting ranking version is rolled back.
+   */
+  reviewRankingVersion(
+    rankingVersion: string,
+    disable: boolean,
+    reason: string,
+  ): RankingVersionReview {
+    const review: RankingVersionReview = {
+      rankingVersion,
+      disabled: disable,
+      reason,
+      reviewedAt: new Date().toISOString(),
+    };
+
+    if (disable) {
+      this.disabledRankingVersions.set(rankingVersion, review);
+      this.logger.warn(
+        `Ranking version ${rankingVersion} disabled pending review: ${reason}`,
+      );
+    } else {
+      this.disabledRankingVersions.delete(rankingVersion);
+      this.logger.log(`Ranking version ${rankingVersion} re-enabled: ${reason}`);
+    }
+
+    return review;
+  }
+
+  /** Whether a ranking version is currently disabled by review. */
+  isRankingVersionDisabled(rankingVersion: string): boolean {
+    return this.disabledRankingVersions.get(rankingVersion)?.disabled === true;
+  }
+
+  /**
+   * Enforce retention limits: drop aggregate entries older than the retention
+   * window and cap the number of retained versions.
+   */
+  private enforceRankingQualityRetention(): void {
+    const cutoff =
+      Date.now() - RANKING_QUALITY_DRIFT.RETENTION_MS;
+
+    for (const [version, entry] of this.rankingQualityAggregates) {
+      if (entry.recordedAt.getTime() < cutoff) {
+        this.rankingQualityAggregates.delete(version);
+      }
+    }
+
+    while (
+      this.rankingQualityAggregates.size >
+      RANKING_QUALITY_DRIFT.RETENTION_LIMIT
+    ) {
+      const oldestKey = this.rankingQualityAggregates.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      this.rankingQualityAggregates.delete(oldestKey);
+    }
+  }
+
+  /** Number of aggregate entries currently retained (for tests/ops). */
+  getRetainedRankingQualityCount(): number {
+    return this.rankingQualityAggregates.size;
+  }
+
+  private toRankingQualityIndicators(
+    counters: RankingQualityAggregateCounters,
+  ): RankingQualityIndicators {
+    return {
+      ctr:
+        counters.impressions > 0
+          ? counters.clicks / counters.impressions
+          : 0,
+      dwellMs:
+        counters.dwellSamples > 0
+          ? counters.dwellTotalMs / counters.dwellSamples
+          : 0,
+      satisfaction:
+        counters.totalFeedback > 0
+          ? counters.positiveFeedback / counters.totalFeedback
+          : 0,
     };
   }
 

@@ -75,3 +75,102 @@ fn migration_preserves_pre_existing_badges_and_reputation() {
     assert_eq!(client.get_badge(&badge_id).unwrap().owner, user);
     assert_eq!(client.get_user_reputation(&user), 42i128);
 }
+
+/// Representative prior-version state fixture: several users, several badge
+/// types, and non-trivial reputation balances. This mirrors what a real
+/// deployed instance would hold when an upgrade is rehearsed.
+struct PriorStateFixture {
+    users: [Address; 3],
+    badge_ids: [u64; 3],
+    reputation: [i128; 3],
+}
+
+fn seed_prior_state(env: &Env, client: &ReputationBadgesClient<'static>) -> PriorStateFixture {
+    let user_a = Address::generate(env);
+    let user_b = Address::generate(env);
+    let user_c = Address::generate(env);
+
+    let reason = soroban_sdk::String::from_str(env, "prior-version activity");
+
+    let badge_a = client.mint_badge(&user_a, &BadgeType::ConfessionStarter);
+    let badge_b = client.mint_badge(&user_b, &BadgeType::ConfessionVeteran);
+    let badge_c = client.mint_badge(&user_c, &BadgeType::ConfessionStarter);
+
+    client.adjust_reputation(&user_a, &10i128, &reason);
+    client.adjust_reputation(&user_b, &250i128, &reason);
+    client.adjust_reputation(&user_c, &-5i128, &reason);
+
+    PriorStateFixture {
+        users: [user_a, user_b, user_c],
+        badge_ids: [badge_a, badge_b, badge_c],
+        reputation: [10i128, 250i128, -5i128],
+    }
+}
+
+/// Rehearse the full upgrade: seed prior-version state, migrate, and assert
+/// every pre-existing key is preserved byte-for-byte.
+#[test]
+fn rehearsal_migration_preserves_prior_version_fixture() {
+    let (env, admin, client) = setup();
+    let fixture = seed_prior_state(&env, &client);
+
+    assert_eq!(client.schema_version(), SCHEMA_VERSION_INITIAL);
+
+    let new_version = client.migrate(&admin);
+    assert_eq!(new_version, SCHEMA_VERSION_CURRENT);
+    assert_eq!(client.schema_version(), SCHEMA_VERSION_CURRENT);
+
+    for i in 0..fixture.users.len() {
+        let badge = client.get_badge(&fixture.badge_ids[i]).unwrap();
+        assert_eq!(badge.owner, fixture.users[i]);
+        assert_eq!(
+            client.get_user_reputation(&fixture.users[i]),
+            fixture.reputation[i]
+        );
+    }
+}
+
+/// Rollback constraint: migration must be idempotent so a re-run after a
+/// failed rollout cannot corrupt or duplicate prior-version state.
+#[test]
+fn rehearsal_migration_is_replayable_without_state_loss() {
+    let (env, admin, client) = setup();
+    let fixture = seed_prior_state(&env, &client);
+
+    client.migrate(&admin);
+    client.migrate(&admin);
+
+    assert_eq!(client.schema_version(), SCHEMA_VERSION_CURRENT);
+    for i in 0..fixture.users.len() {
+        let badge = client.get_badge(&fixture.badge_ids[i]).unwrap();
+        assert_eq!(badge.owner, fixture.users[i]);
+        assert_eq!(
+            client.get_user_reputation(&fixture.users[i]),
+            fixture.reputation[i]
+        );
+    }
+}
+
+/// Rollback constraint: a non-admin cannot trigger a migration, so an
+/// unauthorized operator cannot force a state transition during rollback.
+#[test]
+fn rehearsal_migration_rejects_unauthorized_operator() {
+    use reputation_badges::Error;
+    let (env, _admin, client) = setup();
+    let fixture = seed_prior_state(&env, &client);
+    let rogue = Address::generate(&env);
+
+    let result = client.try_migrate(&rogue);
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+
+    // State must be untouched after a rejected migration attempt.
+    assert_eq!(client.schema_version(), SCHEMA_VERSION_INITIAL);
+    for i in 0..fixture.users.len() {
+        let badge = client.get_badge(&fixture.badge_ids[i]).unwrap();
+        assert_eq!(badge.owner, fixture.users[i]);
+        assert_eq!(
+            client.get_user_reputation(&fixture.users[i]),
+            fixture.reputation[i]
+        );
+    }
+}

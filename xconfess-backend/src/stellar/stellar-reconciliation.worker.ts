@@ -12,6 +12,10 @@ import { AnonymousConfession } from '../confession/entities/confession.entity';
 import { decryptConfession } from '../utils/confession-encryption';
 import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import {
+  MultiContractSaga,
+  SagaStatus,
+} from './entities/multi-contract-saga.entity';
 
 interface ReconciliationConfig {
   interval: string;
@@ -19,23 +23,81 @@ interface ReconciliationConfig {
   batchSize: number;
   maxRetries: number;
   backoffBaseMinutes: number;
+  sagaBatchSize: number;
+  sagaMaxRetries: number;
+  sagaBackoffBaseMinutes: number;
+}
+
+/**
+ * Configuration for the periodic indexed-event-range verification job.
+ *
+ * The verifier is read-only: it compares the locally indexed Soroban event
+ * ranges against ledger data and reports gaps. When gaps are found it may
+ * trigger a *bounded* reprocessing window, capped by `maxReprocessRanges`.
+ */
+interface EventRangeVerificationConfig {
+  enabled: boolean;
+  interval: string;
+  /** Number of most recent checkpoints to verify per run. */
+  checkpointWindow: number;
+  /** Maximum number of gap ranges to reprocess per run. */
+  maxReprocessRanges: number;
+  /** Maximum number of ledgers a single reprocess range may span. */
+  maxLedgersPerRange: number;
+  /** When false, gaps are only reported and never reprocessed. */
+  reprocessEnabled: boolean;
+}
+
+/**
+ * Minimal read-only contract the verifier depends on. Implementations live in
+ * the ingestion boundary; this worker only orchestrates scheduling/reporting.
+ */
+export interface EventRangeVerifier {
+  /** Returns the checkpoint ids to verify, newest first. */
+  listCheckpoints(limit: number): Promise<string[]>;
+  /** Compares a checkpoint's indexed range against ledger data. */
+  verifyCheckpoint(checkpointId: string): Promise<EventRangeVerificationResult>;
+  /** Safely reprocesses a bounded ledger range. Must be idempotent. */
+  reprocessRange(
+    checkpointId: string,
+    fromLedger: number,
+    toLedger: number,
+  ): Promise<void>;
+}
+
+export interface EventRangeGap {
+  checkpointId: string;
+  fromLedger: number;
+  toLedger: number;
+  reason: 'missing' | 'misclassified' | 'out_of_order';
+}
+
+export interface EventRangeVerificationResult {
+  checkpointId: string;
+  verified: boolean;
+  gaps: EventRangeGap[];
 }
 
 @Injectable()
 export class StellarReconciliationWorker {
   private readonly logger = new Logger(StellarReconciliationWorker.name);
   private readonly config: ReconciliationConfig;
+  private readonly eventRangeConfig: EventRangeVerificationConfig;
+  private eventRangeVerificationRunning = false;
 
   constructor(
     @InjectRepository(StellarAnchor)
     private readonly anchorRepository: Repository<StellarAnchor>,
     @InjectRepository(AnonymousConfession)
     private readonly confessionRepository: Repository<AnonymousConfession>,
+    @InjectRepository(MultiContractSaga)
+    private readonly sagaRepository: Repository<MultiContractSaga>,
     private readonly stellarService: StellarService,
     private readonly contractService: ContractService,
     private readonly auditService: AuditLogService,
     private readonly configService: ConfigService,
     private readonly eventEmitter: EventEmitter2,
+    private readonly eventRangeVerifier?: EventRangeVerifier,
   ) {
     const envInterval = process.env.STELLAR_RECONCILIATION_INTERVAL;
     this.config = {
@@ -44,6 +106,33 @@ export class StellarReconciliationWorker {
       batchSize: parseInt(process.env.STELLAR_RECONCILIATION_BATCH_SIZE || '50', 10),
       maxRetries: parseInt(process.env.STELLAR_RECONCILIATION_MAX_RETRIES || '5', 10),
       backoffBaseMinutes: parseInt(process.env.STELLAR_RECONCILIATION_BACKOFF_BASE || '2', 10),
+      sagaBatchSize: parseInt(process.env.STELLAR_SAGA_RECONCILIATION_BATCH_SIZE || '50', 10),
+      sagaMaxRetries: parseInt(process.env.STELLAR_SAGA_RECONCILIATION_MAX_RETRIES || '5', 10),
+      sagaBackoffBaseMinutes: parseInt(
+        process.env.STELLAR_SAGA_RECONCILIATION_BACKOFF_BASE || '2',
+        10,
+      ),
+    };
+
+    this.eventRangeConfig = {
+      enabled:
+        (process.env.STELLAR_EVENT_RANGE_VERIFY_ENABLED || 'true') === 'true',
+      interval:
+        process.env.STELLAR_EVENT_RANGE_VERIFY_INTERVAL || '*/30 * * * *',
+      checkpointWindow: parseInt(
+        process.env.STELLAR_EVENT_RANGE_VERIFY_WINDOW || '10',
+        10,
+      ),
+      maxReprocessRanges: parseInt(
+        process.env.STELLAR_EVENT_RANGE_MAX_REPROCESS_RANGES || '5',
+        10,
+      ),
+      maxLedgersPerRange: parseInt(
+        process.env.STELLAR_EVENT_RANGE_MAX_LEDGERS_PER_RANGE || '1000',
+        10,
+      ),
+      reprocessEnabled:
+        (process.env.STELLAR_EVENT_RANGE_REPROCESS_ENABLED || 'true') === 'true',
     };
   }
 
@@ -100,6 +189,337 @@ export class StellarReconciliationWorker {
         expired,
         timestamp: new Date(),
       });
+    }
+  }
+
+  /**
+   * Periodic read-only verification of indexed Soroban event ranges.
+   *
+   * Compares indexed checkpoints against ledger data, reports gaps by
+   * checkpoint, and (when enabled) triggers bounded, idempotent reprocessing
+   * of the reported gap ranges. Never mutates anchor state directly.
+   */
+  @Cron(process.env.STELLAR_EVENT_RANGE_VERIFY_INTERVAL || '*/30 * * * *')
+  async verifyIndexedEventRanges(): Promise<void> {
+    if (!this.eventRangeConfig.enabled) {
+      return;
+    }
+    if (!this.eventRangeVerifier || this.eventRangeVerificationRunning) return;
+
+    this.eventRangeVerificationRunning = true;
+    try {
+      const checkpointIds = await this.eventRangeVerifier.listCheckpoints(
+        this.eventRangeConfig.checkpointWindow,
+      );
+      const gapsByCheckpoint: Record<string, EventRangeGap[]> = {};
+      for (const checkpointId of checkpointIds) {
+        try {
+          const result = await this.eventRangeVerifier.verifyCheckpoint(checkpointId);
+          if (!result.verified && result.gaps.length > 0) {
+            gapsByCheckpoint[checkpointId] = result.gaps;
+          }
+        } catch (error) {
+          this.logger.warn({
+            event: 'stellar_event_range_verify_error',
+            checkpointId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      if (this.eventRangeConfig.reprocessEnabled) {
+        await this.reprocessGapRanges(randomUUID(), gapsByCheckpoint);
+      }
+    } finally {
+      this.eventRangeVerificationRunning = false;
+    }
+  }
+
+  /**
+   * Reprocesses gap ranges within configured bounds. Each range is clamped to
+   * `maxReprocessRanges`. Reprocessing is idempotent and failures are isolated
+   * per range so one bad range cannot block the rest.
+   */
+  private async reprocessGapRanges(
+    requestId: string,
+    gapsByCheckpoint: Record<string, EventRangeGap[]>,
+  ): Promise<void> {
+    if (!this.eventRangeVerifier) return;
+
+    let processed = 0;
+    let skipped = 0;
+
+    for (const [checkpointId, gaps] of Object.entries(gapsByCheckpoint)) {
+      for (const gap of gaps) {
+        if (processed >= this.eventRangeConfig.maxReprocessRanges) {
+          skipped++;
+          continue;
+        }
+
+        const fromLedger = Math.min(gap.fromLedger, gap.toLedger);
+        const toLedger = Math.min(
+          Math.max(gap.fromLedger, gap.toLedger),
+          fromLedger + this.eventRangeConfig.maxLedgersPerRange - 1,
+        );
+
+        if (toLedger < fromLedger) {
+          skipped++;
+          continue;
+        }
+
+        try {
+          await this.eventRangeVerifier.reprocessRange(
+            checkpointId,
+            fromLedger,
+            toLedger,
+          );
+          processed++;
+
+          this.logger.log({
+            event: 'stellar_event_range_reprocessed',
+            requestId,
+            checkpointId,
+            fromLedger,
+            toLedger,
+            reason: gap.reason,
+          });
+        } catch (error: any) {
+          skipped++;
+          this.logger.warn({
+            event: 'stellar_event_range_reprocess_error',
+            requestId,
+            checkpointId,
+            fromLedger,
+            toLedger,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+
+    this.logger.log({
+      event: 'stellar_event_range_reprocess_complete',
+      requestId,
+      processed,
+      skipped,
+      maxReprocessRanges: this.eventRangeConfig.maxReprocessRanges,
+    });
+  }
+
+  /**
+   * Bounded recovery for partial multi-contract operations.
+   *
+   * A saga that is not in a terminal state (COMPLETED / COMPENSATED / FAILED)
+   * may have partially applied external calls. Each run re-drives the saga
+   * with exponential backoff; once the retry budget is exhausted the saga is
+   * marked UNKNOWN so it is surfaced for manual reconciliation instead of
+   * being retried forever.
+   */
+  @Cron(process.env.STELLAR_SAGA_RECONCILIATION_INTERVAL || '*/15 * * * *')
+  async reconcilePartialSagas() {
+    const sagas = await this.sagaRepository.find({
+      where: [
+        { status: SagaStatus.PENDING },
+        { status: SagaStatus.IN_PROGRESS },
+        { status: SagaStatus.COMPENSATING },
+      ],
+      take: this.config.sagaBatchSize,
+      order: { createdAt: 'ASC' },
+    });
+
+    if (sagas.length === 0) return;
+
+    this.logger.log(
+      `Reconciling ${sagas.length} partial multi-contract sagas ` +
+        `(batch size: ${this.config.sagaBatchSize})`,
+    );
+
+    let recovered = 0;
+    let compensated = 0;
+    let unknown = 0;
+
+    for (const saga of sagas) {
+      const result = await this.recoverSaga(saga);
+      if (result === 'recovered') recovered++;
+      else if (result === 'compensated') compensated++;
+      else if (result === 'unknown') unknown++;
+    }
+
+    this.logger.log(
+      `Saga reconciliation complete: ${recovered} recovered, ${compensated} compensated, ${unknown} unknown`,
+    );
+
+    if (compensated > 0 || unknown > 0) {
+      this.eventEmitter.emit('stellar.saga.reconciliation.discrepancies', {
+        recovered,
+        compensated,
+        unknown,
+        timestamp: new Date(),
+      });
+    }
+  }
+
+  private async recoverSaga(
+    saga: MultiContractSaga,
+  ): Promise<'recovered' | 'compensated' | 'unknown' | 'skipped'> {
+    // Exponential backoff between attempts, bounded by the retry budget.
+    const delay =
+      Math.pow(2, saga.retryCount) *
+      this.config.sagaBackoffBaseMinutes *
+      60 *
+      1000;
+    const timeSinceLastRetry =
+      Date.now() -
+      (saga.lastRetryAt?.getTime() || saga.createdAt.getTime());
+
+    if (timeSinceLastRetry < delay) {
+      return 'skipped';
+    }
+
+    const requestId = randomUUID();
+    saga.retryCount += 1;
+    saga.lastRetryAt = new Date();
+
+    try {
+      this.logger.debug({
+        event: 'stellar_saga_recovery_attempt',
+        requestId,
+        sagaId: saga.id,
+        sagaType: saga.sagaType,
+        status: saga.status,
+        attemptNumber: saga.retryCount,
+      });
+
+      // Re-drive the saga from its last recorded step. The saga service is
+      // idempotent per step, so re-invoking a step that already succeeded is
+      // safe and lets us resume after an interruption at any external call.
+      const outcome = await this.contractService.resumeSaga(saga);
+
+      if (outcome.status === SagaStatus.COMPLETED) {
+        saga.status = SagaStatus.COMPLETED;
+        saga.lastError = null;
+        saga.retryCount = 0;
+        await this.sagaRepository.save(saga);
+
+        await this.auditService.log({
+          actionType: AuditActionType.STELLAR_SAGA_RECOVERED,
+          metadata: {
+            requestId,
+            entityId: saga.id,
+            sagaType: saga.sagaType,
+            result: 'completed',
+            attempt_number: saga.retryCount,
+          },
+        });
+        return 'recovered';
+      }
+
+      if (outcome.status === SagaStatus.COMPENSATED) {
+        saga.status = SagaStatus.COMPENSATED;
+        saga.lastError = null;
+        await this.sagaRepository.save(saga);
+
+        await this.auditService.log({
+          actionType: AuditActionType.STELLAR_SAGA_COMPENSATED,
+          metadata: {
+            requestId,
+            entityId: saga.id,
+            sagaType: saga.sagaType,
+            result: 'compensated',
+            attempt_number: saga.retryCount,
+          },
+        });
+        return 'compensated';
+      }
+
+      // Still partial: keep the saga in its non-terminal state for the next
+      // bounded attempt.
+      saga.status = outcome.status;
+      saga.lastError = outcome.error ?? null;
+      await this.sagaRepository.save(saga);
+      return 'skipped';
+    } catch (error: any) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      saga.lastError = errorMessage;
+
+      this.logger.warn({
+        event: 'stellar_saga_recovery_error',
+        requestId,
+        sagaId: saga.id,
+        sagaType: saga.sagaType,
+        attemptNumber: saga.retryCount,
+        error: errorMessage,
+      });
+
+      await this.auditService.log({
+        actionType: AuditActionType.STELLAR_SAGA_RECOVERY_FAILED,
+        metadata: {
+          requestId,
+          entityId: saga.id,
+          sagaType: saga.sagaType,
+          error_message: errorMessage,
+          attempt_number: saga.retryCount,
+        },
+      });
+
+      if (saga.retryCount >= this.config.sagaMaxRetries) {
+        // Bounded recovery exhausted: attempt compensation, then mark UNKNOWN
+        // so the partial state is surfaced rather than silently retried.
+        try {
+          await this.contractService.compensateSaga(saga);
+          saga.status = SagaStatus.COMPENSATED;
+          saga.lastError = errorMessage;
+          await this.sagaRepository.save(saga);
+
+          await this.auditService.log({
+            actionType: AuditActionType.STELLAR_SAGA_COMPENSATED,
+            metadata: {
+              requestId,
+              entityId: saga.id,
+              sagaType: saga.sagaType,
+              result: 'compensated_after_max_retries',
+              attempts: saga.retryCount,
+              last_error: errorMessage,
+            },
+          });
+          return 'compensated';
+        } catch (compensationError: any) {
+          const compensationMessage =
+            compensationError instanceof Error
+              ? compensationError.message
+              : String(compensationError);
+
+          saga.status = SagaStatus.UNKNOWN;
+          saga.lastError = compensationMessage;
+          await this.sagaRepository.save(saga);
+
+          this.logger.error({
+            event: 'stellar_saga_unknown',
+            requestId,
+            sagaId: saga.id,
+            sagaType: saga.sagaType,
+            attempts: saga.retryCount,
+            error: errorMessage,
+            compensationError: compensationMessage,
+          });
+
+          await this.auditService.log({
+            actionType: AuditActionType.STELLAR_SAGA_UNKNOWN,
+            metadata: {
+              requestId,
+              entityId: saga.id,
+              sagaType: saga.sagaType,
+              attempts: saga.retryCount,
+              last_error: errorMessage,
+              compensation_error: compensationMessage,
+            },
+          });
+          return 'unknown';
+        }
+      }
+
+      await this.sagaRepository.save(saga);
+      return 'skipped';
     }
   }
 

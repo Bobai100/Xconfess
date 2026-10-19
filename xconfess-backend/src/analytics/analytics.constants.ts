@@ -30,6 +30,76 @@ export const ANALYTICS_PRIVACY = {
   MIN_COHORT_SIZE: 5,
 } as const;
 
+// ─── Ranking quality drift (#267) ─────────────────────────────────────────────
+
+/**
+ * Aggregate-only ranking quality drift detection.
+ *
+ * Offline evaluation cannot catch every real-world ranking regression, but
+ * retaining per-user result histories to detect drift creates privacy risk.
+ * Instead we keep only minimum-cohort aggregate indicators (e.g. per ranking
+ * version: impressions, clicks, mean reciprocal rank, abandonment rate) and
+ * compare a candidate window against a baseline window.
+ *
+ * No user-level identifiers are stored for drift detection; aggregates below
+ * MIN_COHORT_SIZE are suppressed exactly like other analytics cohorts.
+ */
+export const RANKING_QUALITY_DRIFT = {
+  /**
+   * Minimum number of distinct users/impressions in an aggregate bucket
+   * before it may be used for drift evaluation. Reuses the analytics
+   * k-anonymity floor so drift detection cannot become a side channel.
+   */
+  MIN_COHORT_SIZE: ANALYTICS_PRIVACY.MIN_COHORT_SIZE,
+
+  /**
+   * Relative degradation (0..1) of a quality indicator versus baseline that
+   * triggers a drift alert. 0.1 = a 10% relative drop.
+   */
+  RELATIVE_DROP_THRESHOLD: 0.1,
+
+  /**
+   * Absolute degradation of a quality indicator versus baseline that
+   * triggers a drift alert, regardless of relative size. Guards against
+   * noisy small-baseline comparisons.
+   */
+  ABSOLUTE_DROP_THRESHOLD: 0.02,
+
+  /**
+   * Minimum number of aggregate buckets (e.g. daily windows) that must
+   * breach a threshold before drift is declared, to avoid single-window
+   * flapping.
+   */
+  MIN_CONSECUTIVE_BREACHES: 2,
+
+  /**
+   * Retention window, in days, for ranking quality aggregates. Only
+   * aggregates are retained; per-user histories are never persisted for
+   * drift detection.
+   */
+  RETENTION_DAYS: 30,
+
+  /**
+   * Maximum number of ranking versions whose aggregates may be retained at
+   * once. Older versions are purged so drift data cannot accumulate into a
+   * long-term behavioural profile.
+   */
+  MAX_RETAINED_VERSIONS: 5,
+} as const;
+
+/**
+ * Feature flag key that gates whether a ranking version is served.
+ * When drift review disables a version, this flag is turned off for it.
+ */
+export const RANKING_VERSION_FEATURE_FLAG_PREFIX = 'ranking.version.enabled';
+
+/**
+ * Builds the feature flag key for a specific ranking version.
+ */
+export function getRankingVersionFeatureFlagKey(version: string): string {
+  return `${RANKING_VERSION_FEATURE_FLAG_PREFIX}.${version}`;
+}
+
 // ─── Schema Registry (#86) ───────────────────────────────────────────────────
 
 /**

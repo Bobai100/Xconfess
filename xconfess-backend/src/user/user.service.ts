@@ -29,6 +29,19 @@ import { ConfigService } from '@nestjs/config';
 import { AppException } from '../common/errors/app-exception';
 import { ErrorCode } from '../common/errors/error-codes';
 import { AnalyticsEventService } from '../analytics/analytics-event.service';
+import { Cache } from 'cache-manager';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+
+/**
+ * Cache namespaces that hold personalization-derived discovery results for a
+ * user. When a user toggles their personalization preference these must be
+ * invalidated so stale personalized results cannot leak back to them.
+ */
+export const PERSONALIZATION_CACHE_NAMESPACES = [
+  'search-discovery',
+  'discovery-feed',
+  'recommendations',
+] as const;
 
 @Injectable()
 export class UserService {
@@ -42,6 +55,9 @@ export class UserService {
     private readonly configService: ConfigService,
     @Optional()
     private readonly analyticsEventService?: AnalyticsEventService,
+    @Optional()
+    @Inject(CACHE_MANAGER)
+    private readonly cacheManager?: Cache,
   ) {}
 
   // =========================
@@ -856,6 +872,82 @@ export class UserService {
     await this.userRepository.save(user);
     await this.enforcePrivacyPolicies(user);
     return user;
+  }
+
+  // =========================
+  // 🕵️ PERSONALIZATION PREFERENCE
+  // =========================
+
+  /**
+   * Returns whether personalization (personal ranking signals) is enabled for
+   * the user. Defaults to `true` when the column has not been populated.
+   */
+  async getPersonalizationPreference(userId: number): Promise<boolean> {
+    const user = await this.findById(userId);
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+    return user.personalizationEnabled !== false;
+  }
+
+  /**
+   * Persist the user's personalization preference and invalidate any cached
+   * discovery results that may have been computed from personal signals.
+   */
+  async updatePersonalizationPreference(
+    userId: number,
+    enabled: boolean,
+  ): Promise<{ personalizationEnabled: boolean }> {
+    const user = await this.findById(userId);
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    user.personalizationEnabled = enabled;
+
+    try {
+      await this.userRepository.save(user);
+    } catch {
+      throw new InternalServerErrorException(
+        'Failed to update personalization preference',
+      );
+    }
+
+    await this.invalidatePersonalizationCache(userId);
+
+    this.logger.debug(
+      `Personalization ${enabled ? 'enabled' : 'disabled'} for user ${userId}`,
+    );
+
+    return { personalizationEnabled: user.personalizationEnabled !== false };
+  }
+
+  /**
+   * Drop cached discovery results for a user across all personalization
+   * namespaces. Failures are logged but never block the preference write.
+   */
+  async invalidatePersonalizationCache(userId: number): Promise<void> {
+    if (!this.cacheManager) {
+      return;
+    }
+
+    const keys = PERSONALIZATION_CACHE_NAMESPACES.map(
+      (namespace) => `${namespace}:user:${userId}`,
+    );
+
+    await Promise.all(
+      keys.map(async (key) => {
+        try {
+          await this.cacheManager!.del(key);
+        } catch (err) {
+          this.logger.warn(
+            `Failed to invalidate cache key ${key}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }),
+    );
   }
 
   async getPublicProfile(userId: string | number): Promise<any> {

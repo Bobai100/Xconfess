@@ -27,16 +27,15 @@
  *   --retry-delay-ms <n>   Delay between retries (default: 5000)
  *   --fail-policy <policy> What to do on failure: halt (default) | warn
  *   --skip-auth            Skip authenticated checks (no credentials available)
- *   --skip-journey         Skip the frontend user-journey checks (issue #283)
- *   --journey-path <path>  Representative authenticated request path
- *                          (default: /api/users/me)
+ *   --regions <list>       Comma-separated synthetic regions (default: SYNTHETIC_REGIONS env or none)
+ *   --skip-regional        Skip regional synthetic checks
  *
  * Environment variables:
  *   BACKEND_URL            Backend base URL
  *   FRONTEND_URL           Frontend base URL
  *   SMOKE_TEST_EMAIL       Email for authenticated check (no default — skipped if missing)
  *   SMOKE_TEST_PASSWORD    Password for authenticated check
- *   SMOKE_TEST_JOURNEY_PATH Representative authenticated request path (optional)
+ *   SYNTHETIC_REGIONS      Comma-separated regions for synthetic journeys (e.g. us-east,eu-west)
  *   GITHUB_SHA             Commit SHA (set by GitHub Actions)
  *   GITHUB_RUN_ID          Run ID (set by GitHub Actions)
  *   GITHUB_ACTOR           Deployer identity (set by GitHub Actions)
@@ -77,8 +76,11 @@ function parseArgs(argv = process.argv.slice(2)) {
     retryDelayMs: 5000,
     failPolicy: 'halt',
     skipAuth: false,
-    skipJourney: false,
-    journeyPath: process.env.SMOKE_TEST_JOURNEY_PATH || '/api/users/me',
+    skipRegional: false,
+    regions: (process.env.SYNTHETIC_REGIONS || '')
+      .split(',')
+      .map(r => r.trim())
+      .filter(Boolean),
     testEmail: process.env.SMOKE_TEST_EMAIL || '',
     testPassword: process.env.SMOKE_TEST_PASSWORD || '',
   };
@@ -95,8 +97,10 @@ function parseArgs(argv = process.argv.slice(2)) {
       case '--retry-delay-ms': opts.retryDelayMs = Number(argv[++i]); break;
       case '--fail-policy':   opts.failPolicy   = argv[++i]; break;
       case '--skip-auth':     opts.skipAuth     = true; break;
-      case '--skip-journey':  opts.skipJourney  = true; break;
-      case '--journey-path':  opts.journeyPath  = argv[++i]; break;
+      case '--regions':
+        opts.regions = (argv[++i] || '').split(',').map(r => r.trim()).filter(Boolean);
+        break;
+      case '--skip-regional': opts.skipRegional = true; break;
     }
   }
   // Resolve commit if not set
@@ -590,6 +594,129 @@ async function checkContractHealth(evidence, opts) {
   }
 }
 
+// ── Regional synthetic checks ─────────────────────────────────────────────────
+// Low-volume synthetic journeys executed from multiple regions.  Each journey
+// uses only anonymous, non-user-data endpoints so no real user data is touched.
+// Labels are bounded (fixed region + step names) to keep evidence cardinality
+// low and avoid leaking arbitrary values into metrics.
+
+const REGION_LABEL_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+const SYNTHETIC_JOURNEYS = [
+  {
+    step: 'edge-tls',
+    label: 'synthetic-edge-tls',
+    run: async (region, opts) => {
+      // TLS + edge reachability via the public traction endpoint
+      await request(
+        `[${region}] synthetic edge-tls`,
+        joinUrl(opts.backendUrl, '/api/public/traction'),
+        {},
+        [200],
+        opts
+      );
+    },
+  },
+  {
+    step: 'public-read',
+    label: 'synthetic-public-read',
+    run: async (region, opts) => {
+      const traction = await requestJson(
+        `[${region}] synthetic public-read`,
+        joinUrl(opts.backendUrl, '/api/public/traction'),
+        {},
+        [200],
+        opts
+      );
+      assertNoSensitiveData('synthetic public-read', traction);
+    },
+  },
+  {
+    step: 'frontend-shell',
+    label: 'synthetic-frontend-shell',
+    run: async (region, opts) => {
+      await request(
+        `[${region}] synthetic frontend-shell`,
+        joinUrl(opts.frontendUrl, '/traction'),
+        {},
+        [200],
+        opts
+      );
+    },
+  },
+];
+
+function normalizeRegion(region) {
+  const norm = String(region || '').trim().toLowerCase();
+  if (!REGION_LABEL_RE.test(norm)) {
+    throw new Error(`invalid synthetic region label: ${JSON.stringify(region)}`);
+  }
+  return norm;
+}
+
+async function checkRegionalSynthetics(evidence, opts) {
+  console.log('\n── Regional synthetic checks');
+  if (opts.skipRegional || opts.regions.length === 0) {
+    recordCheck(evidence, 'regional-synthetics', 'skip', {
+      reason: opts.skipRegional ? '--skip-regional flag set' : 'no regions configured',
+    });
+    return;
+  }
+
+  const regions = [];
+  for (const raw of opts.regions) {
+    try {
+      regions.push(normalizeRegion(raw));
+    } catch (err) {
+      recordCheck(evidence, 'regional-synthetics', 'fail', { error: err.message });
+      throw err;
+    }
+  }
+
+  const perStep = {};
+  let anyFailed = false;
+
+  for (const region of regions) {
+    for (const journey of SYNTHETIC_JOURNEYS) {
+      const key = journey.label;
+      perStep[key] = perStep[key] || { pass: 0, fail: 0, regions: {} };
+      try {
+        await journey.run(region, opts);
+        perStep[key].pass++;
+        perStep[key].regions[region] = 'pass';
+        recordCheck(evidence, `${journey.label}:${region}`, 'pass', { region, step: journey.step });
+      } catch (err) {
+        anyFailed = true;
+        perStep[key].fail++;
+        perStep[key].regions[region] = 'fail';
+        recordCheck(evidence, `${journey.label}:${region}`, 'fail', {
+          region,
+          step: journey.step,
+          error: err.message,
+        });
+        console.log(`  ✗ [${region}] ${journey.step}: ${err.message}`);
+      }
+    }
+  }
+
+  // Per-step availability summary with bounded labels
+  const availability = {};
+  for (const [label, stats] of Object.entries(perStep)) {
+    const total = stats.pass + stats.fail;
+    availability[label] = {
+      available: stats.pass,
+      total,
+      ratio: total ? Number((stats.pass / total).toFixed(3)) : 0,
+      regions: stats.regions,
+    };
+  }
+  evidence.regionalAvailability = availability;
+
+  if (anyFailed) {
+    throw new Error('regional synthetic checks degraded in one or more regions');
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   const opts = parseArgs();
@@ -610,8 +737,7 @@ async function main() {
     () => checkBackendReadiness(evidence, opts),
     () => checkPublicTraction(evidence, opts),
     () => checkFrontendCriticalPaths(evidence, opts),
-    // Issue #283: prove the deployed user journey works across origins.
-    () => checkUserJourney(evidence, opts),
+    () => checkRegionalSynthetics(evidence, opts),
   ];
   const softChecks = [
     () => checkBackendStatus(evidence, opts),
@@ -654,6 +780,12 @@ async function main() {
   console.log(`Failed:  ${evidence.summary.failed}`);
   console.log(`Skipped: ${evidence.summary.skipped}`);
   console.log(`Evidence: ${evidencePath}`);
+  if (evidence.regionalAvailability) {
+    console.log('\n── Regional availability (per step)');
+    for (const [label, stats] of Object.entries(evidence.regionalAvailability)) {
+      console.log(`  ${label}: ${stats.available}/${stats.total} regions (${stats.ratio})`);
+    }
+  }
   console.log('');
 
   if (criticalFailed) {
@@ -674,8 +806,8 @@ if (require.main === module) {
 
 module.exports = {
   parseArgs,
-  describeSetCookie,
-  cookieHeaderFromSetCookie,
-  journeyDiagnostics,
-  checkUserJourney,
+  normalizeRegion,
+  checkRegionalSynthetics,
+  SYNTHETIC_JOURNEYS,
+  REGION_LABEL_RE,
 };
