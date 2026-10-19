@@ -48,6 +48,12 @@
  *   - Covers critical paths without exposing user data
  *   - Failures halt or roll back per policy
  *   - Evidence is retained with release identity
+ *
+ * Acceptance criteria (issue #283):
+ *   - Verifies a full user journey through the frontend proxy origin:
+ *     sign-in → representative authenticated request → sign-out
+ *   - Asserts session cookie credentials and CORS/origin behavior
+ *   - Emits secret-free, redacted diagnostics on failure
  */
 
 'use strict';
@@ -380,6 +386,193 @@ async function checkAuthenticatedPaths(evidence, opts) {
       console.log(`  ⚠ authenticated-profile: ${err.message} (non-fatal)`);
     }
   }
+}
+
+// ── User journey (issue #283) ─────────────────────────────────────────────────
+// The journey exercises the *frontend* origin so that browser proxy routes,
+// cookie credentials, and deployed CORS/origin settings are all proven to work
+// together — a backend health response alone does not prove this.
+
+function originOf(url) {
+  try { return new URL(url).origin; } catch { return url; }
+}
+
+// Parse a Set-Cookie header into a minimal, secret-free descriptor.
+function describeSetCookie(setCookie) {
+  if (!setCookie) return { present: false };
+  const parts = setCookie.split(';').map(s => s.trim());
+  const [nameValue] = parts;
+  const eq = nameValue.indexOf('=');
+  const name = eq >= 0 ? nameValue.slice(0, eq) : nameValue;
+  const attrs = parts.slice(1).map(a => a.toLowerCase());
+  return {
+    present: true,
+    name,
+    hasValue: eq >= 0 && nameValue.length > eq + 1,
+    httpOnly: attrs.includes('httponly'),
+    secure: attrs.includes('secure'),
+    sameSite: (attrs.find(a => a.startsWith('samesite=')) || '').split('=')[1] || null,
+    // Never record the cookie value itself.
+  };
+}
+
+// Build a Cookie request header from a Set-Cookie header, dropping attributes.
+function cookieHeaderFromSetCookie(setCookie) {
+  if (!setCookie) return '';
+  return setCookie.split(';')[0].trim();
+}
+
+// Redacted, secret-free diagnostics for a failed journey step.
+function journeyDiagnostics(step, opts, extra = {}) {
+  return {
+    step,
+    frontendOrigin: originOf(opts.frontendUrl),
+    backendOrigin: originOf(opts.backendUrl),
+    journeyPath: opts.journeyPath,
+    ...extra,
+  };
+}
+
+async function checkUserJourney(evidence, opts) {
+  const label = 'user-journey';
+  if (opts.skipJourney) {
+    console.log('\n── User journey checks (skipped — --skip-journey)');
+    recordCheck(evidence, label, 'skip', { reason: '--skip-journey flag set' });
+    return;
+  }
+  if (opts.skipAuth || !opts.testEmail || !opts.testPassword) {
+    console.log('\n── User journey checks (skipped — no credentials)');
+    recordCheck(evidence, label, 'skip', {
+      reason: opts.skipAuth ? '--skip-auth flag set' : 'SMOKE_TEST_EMAIL/PASSWORD not set',
+    });
+    return;
+  }
+
+  console.log('\n── User journey checks (frontend proxy origin)');
+  const frontendOrigin = originOf(opts.frontendUrl);
+  const backendOrigin = originOf(opts.backendUrl);
+
+  // 1) Sign-in through the frontend proxy.
+  let setCookie = '';
+  let cookieHeader = '';
+  try {
+    const res = await request(
+      'journey sign-in',
+      joinUrl(opts.frontendUrl, '/api/auth/login'),
+      {
+        method: 'POST',
+        body: JSON.stringify({ email: opts.testEmail, password: opts.testPassword }),
+        headers: { origin: frontendOrigin },
+        credentials: 'include',
+      },
+      [200, 201],
+      opts
+    );
+    setCookie = res.headers.get('set-cookie') || '';
+    const cookie = describeSetCookie(setCookie);
+    if (!cookie.present || !cookie.hasValue) {
+      throw new Error('sign-in did not set a session cookie');
+    }
+    cookieHeader = cookieHeaderFromSetCookie(setCookie);
+    recordCheck(evidence, 'journey-sign-in', 'pass', {
+      cookie: cookie, // descriptor only — never the value
+    });
+  } catch (err) {
+    recordCheck(evidence, 'journey-sign-in', 'fail', {
+      error: err.message,
+      diagnostics: journeyDiagnostics('sign-in', opts),
+    });
+    throw err;
+  }
+
+  // 2) Representative authenticated request through the frontend proxy.
+  try {
+    const res = await request(
+      `journey authenticated ${opts.journeyPath}`,
+      joinUrl(opts.frontendUrl, opts.journeyPath),
+      {
+        headers: { cookie: cookieHeader, origin: frontendOrigin },
+        credentials: 'include',
+      },
+      [200],
+      opts
+    );
+    // CORS/origin behavior: if the proxy echoes an allow-origin header it must
+    // match the frontend origin (never a wildcard for credentialed requests).
+    const allowOrigin = res.headers.get('access-control-allow-origin');
+    const allowCreds = res.headers.get('access-control-allow-credentials');
+    if (allowOrigin && allowOrigin !== '*' && allowOrigin !== frontendOrigin) {
+      throw new Error(`CORS allow-origin mismatch: ${allowOrigin} !== ${frontendOrigin}`);
+    }
+    if (allowOrigin === '*' && allowCreds === 'true') {
+      throw new Error('CORS allows wildcard origin with credentials');
+    }
+    recordCheck(evidence, 'journey-authenticated-request', 'pass', {
+      path: opts.journeyPath,
+      cors: {
+        allowOrigin: allowOrigin || null,
+        allowCredentials: allowCreds || null,
+      },
+    });
+  } catch (err) {
+    recordCheck(evidence, 'journey-authenticated-request', 'fail', {
+      error: err.message,
+      diagnostics: journeyDiagnostics('authenticated-request', opts),
+    });
+    throw err;
+  }
+
+  // 3) Sign-out through the frontend proxy.
+  try {
+    const res = await request(
+      'journey sign-out',
+      joinUrl(opts.frontendUrl, '/api/auth/logout'),
+      {
+        method: 'POST',
+        headers: { cookie: cookieHeader, origin: frontendOrigin },
+        credentials: 'include',
+      },
+      [200, 204],
+      opts
+    );
+    const cleared = describeSetCookie(res.headers.get('set-cookie') || '');
+    recordCheck(evidence, 'journey-sign-out', 'pass', {
+      cookieCleared: cleared.present,
+    });
+  } catch (err) {
+    recordCheck(evidence, 'journey-sign-out', 'fail', {
+      error: err.message,
+      diagnostics: journeyDiagnostics('sign-out', opts),
+    });
+    throw err;
+  }
+
+  // 4) Post-sign-out: the session must no longer be authorized.
+  try {
+    await request(
+      'journey post-sign-out',
+      joinUrl(opts.frontendUrl, opts.journeyPath),
+      {
+        headers: { cookie: cookieHeader, origin: frontendOrigin },
+        credentials: 'include',
+      },
+      [401, 403],
+      opts
+    );
+    recordCheck(evidence, 'journey-post-sign-out', 'pass');
+  } catch (err) {
+    recordCheck(evidence, 'journey-post-sign-out', 'fail', {
+      error: err.message,
+      diagnostics: journeyDiagnostics('post-sign-out', opts),
+    });
+    throw err;
+  }
+
+  recordCheck(evidence, label, 'pass', {
+    frontendOrigin,
+    backendOrigin,
+    journeyPath: opts.journeyPath,
+  });
 }
 
 async function checkContractHealth(evidence, opts) {

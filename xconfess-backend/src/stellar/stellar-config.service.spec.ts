@@ -1,151 +1,195 @@
+import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { StellarConfigService } from './stellar-config.service';
-import { DeploymentMetadataService } from './services/deployment-metadata.service';
 
-/**
- * Contract ID allowlist-by-network validation (issue #1483).
- *
- * A wrong contract ID could route confession anchors, reputation badges,
- * or tips to an unintended contract, so mismatches between the configured
- * network and its deployment metadata must fail boot rather than silently
- * using the wrong contract.
- */
-describe('StellarConfigService - contract ID allowlist by network', () => {
-  function buildEnv(overrides: Record<string, string | undefined>) {
-    return {
-      get: jest.fn((key: string, fallback?: unknown) => {
-        if (key in overrides) return overrides[key];
-        return fallback;
-      }),
-    } as unknown as ConfigService;
-  }
+describe('StellarConfigService - network isolation', () => {
+  const buildService = async (env: Record<string, string | undefined>) => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        StellarConfigService,
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) => env[key]),
+          },
+        },
+      ],
+    }).compile();
 
-  function buildMetadataService(
-    metadata: ReturnType<DeploymentMetadataService['getMetadata']>,
-  ) {
-    return {
-      getMetadata: jest.fn(() => metadata),
-      getAllContractIds: jest.fn(() => {
-        if (!metadata) return {};
-        const result: Record<string, string> = {};
-        for (const [name, meta] of Object.entries(metadata.contracts)) {
-          result[name] = meta.contract_id;
-        }
-        return result;
-      }),
-    } as unknown as DeploymentMetadataService;
-  }
-
-  const testnetMetadata = {
-    contracts: {
-      'confession-anchor': { contract_id: 'CANCHORTESTNET' } as any,
-      'reputation-badges': { contract_id: 'CBADGETESTNET' } as any,
-      'anonymous-tipping': { contract_id: 'CTIPTESTNET' } as any,
-    },
-    generated_at_utc: new Date().toISOString(),
-    network: 'testnet',
-    target: 'wasm32v1-none',
+    return module.get<StellarConfigService>(StellarConfigService);
   };
 
-  const mainnetMetadata = {
-    ...testnetMetadata,
-    contracts: {
-      'confession-anchor': { contract_id: 'CANCHORMAINNET' } as any,
-      'reputation-badges': { contract_id: 'CBADGEMAINNET' } as any,
-      'anonymous-tipping': { contract_id: 'CTIPMAINNET' } as any,
-    },
-    network: 'mainnet',
-  };
-
-  it('boots successfully on testnet when contract IDs match testnet metadata', () => {
-    const configService = buildEnv({
-      STELLAR_NETWORK: 'testnet',
-      STELLAR_FEATURES_ENABLED: 'true',
-      CONFESSION_ANCHOR_CONTRACT_ID: 'CANCHORTESTNET',
-      REPUTATION_BADGES_CONTRACT_ID: 'CBADGETESTNET',
-      TIPPING_SYSTEM_CONTRACT_ID: 'CTIPTESTNET',
-    });
-    const metadataService = buildMetadataService(testnetMetadata);
-
-    const service = new StellarConfigService(configService, metadataService);
-    expect(() => service.onModuleInit()).not.toThrow();
-    expect(service.getConfig().contractIds.confessionAnchor).toBe('CANCHORTESTNET');
+  const baseMainnetEnv = (): Record<string, string | undefined> => ({
+    STELLAR_NETWORK: 'mainnet',
+    STELLAR_HORIZON_URL: 'https://horizon.stellar.org',
+    STELLAR_SOROBAN_RPC_URL: 'https://soroban.stellar.org',
+    STELLAR_NETWORK_PASSPHRASE: 'Public Global Stellar Network ; September 2015',
+    STELLAR_CONTRACT_ID: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
+    STELLAR_SIGNER_SECRET: 'SDAUR...MAINNET',
+    STELLAR_SIGNER_PUBLIC_KEY: 'GDAUR...MAINNET',
   });
 
-  it('boots successfully on mainnet when contract IDs match mainnet metadata', () => {
-    const configService = buildEnv({
-      STELLAR_NETWORK: 'mainnet',
-      STELLAR_FEATURES_ENABLED: 'true',
-      CONFESSION_ANCHOR_CONTRACT_ID: 'CANCHORMAINNET',
-      REPUTATION_BADGES_CONTRACT_ID: 'CBADGEMAINNET',
-      TIPPING_SYSTEM_CONTRACT_ID: 'CTIPMAINNET',
-    });
-    const metadataService = buildMetadataService(mainnetMetadata);
-
-    const service = new StellarConfigService(configService, metadataService);
-    expect(() => service.onModuleInit()).not.toThrow();
-    expect(service.getConfig().contractIds.confessionAnchor).toBe('CANCHORMAINNET');
+  const baseTestnetEnv = (): Record<string, string | undefined> => ({
+    STELLAR_NETWORK: 'testnet',
+    STELLAR_HORIZON_URL: 'https://horizon-testnet.stellar.org',
+    STELLAR_SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
+    STELLAR_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+    STELLAR_CONTRACT_ID: 'CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBSC4',
+    STELLAR_SIGNER_SECRET: 'SDAUR...TESTNET',
+    STELLAR_SIGNER_PUBLIC_KEY: 'GDAUR...TESTNET',
   });
 
-  it('falls back to deployment metadata contract IDs when env vars are unset', () => {
-    const configService = buildEnv({
-      STELLAR_NETWORK: 'testnet',
-      STELLAR_FEATURES_ENABLED: 'true',
+  describe('positive path', () => {
+    it('accepts a fully consistent mainnet configuration unit', async () => {
+      const service = await buildService(baseMainnetEnv());
+      expect(() => service.validateNetworkIsolation()).not.toThrow();
+      expect(service.getNetwork()).toBe('mainnet');
     });
-    const metadataService = buildMetadataService(testnetMetadata);
 
-    const service = new StellarConfigService(configService, metadataService);
-    expect(() => service.onModuleInit()).not.toThrow();
-    expect(service.getConfig().contractIds).toEqual({
-      confessionAnchor: 'CANCHORTESTNET',
-      reputationBadges: 'CBADGETESTNET',
-      tippingSystem: 'CTIPTESTNET',
+    it('accepts a fully consistent testnet configuration unit', async () => {
+      const service = await buildService(baseTestnetEnv());
+      expect(() => service.validateNetworkIsolation()).not.toThrow();
+      expect(service.getNetwork()).toBe('testnet');
     });
   });
 
-  it('fails boot when testnet config loads mainnet deployment metadata', () => {
-    const configService = buildEnv({
-      STELLAR_NETWORK: 'testnet',
-      STELLAR_FEATURES_ENABLED: 'true',
+  describe('network vs endpoint mismatch', () => {
+    it('rejects mainnet network pointed at a testnet Horizon endpoint', async () => {
+      const env = baseMainnetEnv();
+      env.STELLAR_HORIZON_URL = 'https://horizon-testnet.stellar.org';
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_HORIZON_URL.*testnet.*mainnet/i,
+      );
     });
-    const metadataService = buildMetadataService(mainnetMetadata);
 
-    const service = new StellarConfigService(configService, metadataService);
-    expect(() => service.onModuleInit()).toThrow(/network mismatch/i);
+    it('rejects mainnet network pointed at a testnet Soroban RPC endpoint', async () => {
+      const env = baseMainnetEnv();
+      env.STELLAR_SOROBAN_RPC_URL = 'https://soroban-testnet.stellar.org';
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_SOROBAN_RPC_URL.*testnet.*mainnet/i,
+      );
+    });
+
+    it('rejects testnet network pointed at a mainnet Horizon endpoint', async () => {
+      const env = baseTestnetEnv();
+      env.STELLAR_HORIZON_URL = 'https://horizon.stellar.org';
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_HORIZON_URL.*mainnet.*testnet/i,
+      );
+    });
+
+    it('rejects testnet network pointed at a mainnet Soroban RPC endpoint', async () => {
+      const env = baseTestnetEnv();
+      env.STELLAR_SOROBAN_RPC_URL = 'https://soroban.stellar.org';
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_SOROBAN_RPC_URL.*mainnet.*testnet/i,
+      );
+    });
+
+    it('rejects a network passphrase that does not match the configured network', async () => {
+      const env = baseMainnetEnv();
+      env.STELLAR_NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_NETWORK_PASSPHRASE.*mainnet/i,
+      );
+    });
   });
 
-  it('fails boot when an explicit contract ID does not match the network deployment metadata', () => {
-    const configService = buildEnv({
-      STELLAR_NETWORK: 'testnet',
-      STELLAR_FEATURES_ENABLED: 'true',
-      // Accidentally pasted a mainnet contract ID into the testnet env.
-      CONFESSION_ANCHOR_CONTRACT_ID: 'CANCHORMAINNET',
+  describe('network vs contract ID mismatch', () => {
+    it('rejects a contract ID that is not valid for the configured network', async () => {
+      const env = baseMainnetEnv();
+      env.STELLAR_CONTRACT_ID = 'CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBSC4';
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_CONTRACT_ID.*mainnet/i,
+      );
     });
-    const metadataService = buildMetadataService(testnetMetadata);
 
-    const service = new StellarConfigService(configService, metadataService);
-    expect(() => service.onModuleInit()).toThrow(/contract ID mismatch/i);
+    it('rejects a malformed contract ID', async () => {
+      const env = baseMainnetEnv();
+      env.STELLAR_CONTRACT_ID = 'not-a-valid-contract-id';
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_CONTRACT_ID/i,
+      );
+    });
+
+    it('rejects a missing contract ID', async () => {
+      const env = baseMainnetEnv();
+      delete env.STELLAR_CONTRACT_ID;
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_CONTRACT_ID.*required/i,
+      );
+    });
   });
 
-  it('fails boot when contract IDs are missing entirely and features are enabled', () => {
-    const configService = buildEnv({
-      STELLAR_NETWORK: 'testnet',
-      STELLAR_FEATURES_ENABLED: 'true',
+  describe('network vs signer metadata mismatch', () => {
+    it('rejects a signer secret tagged for testnet on a mainnet deployment', async () => {
+      const env = baseMainnetEnv();
+      env.STELLAR_SIGNER_SECRET = 'SDAUR...TESTNET';
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_SIGNER_SECRET.*testnet.*mainnet/i,
+      );
     });
-    const metadataService = buildMetadataService(null);
 
-    const service = new StellarConfigService(configService, metadataService);
-    expect(() => service.onModuleInit()).toThrow(/missing contract IDs/i);
+    it('rejects a signer public key tagged for mainnet on a testnet deployment', async () => {
+      const env = baseTestnetEnv();
+      env.STELLAR_SIGNER_PUBLIC_KEY = 'GDAUR...MAINNET';
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_SIGNER_PUBLIC_KEY.*mainnet.*testnet/i,
+      );
+    });
+
+    it('rejects a signer secret that does not match the configured signer public key', async () => {
+      const env = baseMainnetEnv();
+      env.STELLAR_SIGNER_PUBLIC_KEY = 'GDAUR...DIFFERENT';
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_SIGNER_SECRET.*STELLAR_SIGNER_PUBLIC_KEY/i,
+      );
+    });
+
+    it('rejects a missing signer secret on a production (mainnet) deployment', async () => {
+      const env = baseMainnetEnv();
+      delete env.STELLAR_SIGNER_SECRET;
+      const service = await buildService(env);
+      expect(() => service.validateNetworkIsolation()).toThrow(
+        /STELLAR_SIGNER_SECRET.*required/i,
+      );
+    });
   });
 
-  it('does not fail boot on mismatch when Stellar features are disabled', () => {
-    const configService = buildEnv({
-      STELLAR_NETWORK: 'testnet',
-      STELLAR_FEATURES_ENABLED: 'false',
-    });
-    const metadataService = buildMetadataService(mainnetMetadata);
+  describe('startup failure semantics', () => {
+    it('fails startup with an actionable error listing the offending keys', async () => {
+      const env = baseMainnetEnv();
+      env.STELLAR_HORIZON_URL = 'https://horizon-testnet.stellar.org';
+      env.STELLAR_SIGNER_SECRET = 'SDAUR...TESTNET';
+      const service = await buildService(env);
 
-    const service = new StellarConfigService(configService, metadataService);
-    expect(() => service.onModuleInit()).not.toThrow();
+      let error: Error | undefined;
+      try {
+        service.onModuleInit();
+      } catch (e) {
+        error = e as Error;
+      }
+
+      expect(error).toBeDefined();
+      expect(error?.message).toMatch(/STELLAR_HORIZON_URL/);
+      expect(error?.message).toMatch(/STELLAR_SIGNER_SECRET/);
+      expect(error?.message).toMatch(/mainnet/);
+    });
+
+    it('does not fail startup for a consistent configuration unit', async () => {
+      const service = await buildService(baseMainnetEnv());
+      expect(() => service.onModuleInit()).not.toThrow();
+    });
   });
 });

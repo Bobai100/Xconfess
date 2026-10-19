@@ -7,6 +7,48 @@ const productionHexKey = Joi.string()
   .invalid('0000000000000000000000000000000000000000000000000000000000000000');
 
 /**
+ * Network isolation helpers.
+ *
+ * Testnet and mainnet configuration must never be mixed: a production signer
+ * pointed at testnet, or a testnet contract ID deployed to mainnet, is a
+ * critical misconfiguration. These helpers are exported so the negative tests
+ * can assert the exact same rules the schema enforces.
+ */
+export const STELLAR_NETWORKS = ['testnet', 'mainnet'] as const;
+export type StellarNetwork = (typeof STELLAR_NETWORKS)[number];
+
+const TESTNET_HOST_MARKERS = ['testnet', 'testnet2', 'futurenet', 'sandbox'];
+const MAINNET_HOST_MARKERS = ['mainnet', 'public'];
+
+/** Returns true when a URL host looks like a testnet endpoint. */
+export function isTestnetEndpoint(url: string | undefined): boolean {
+  if (!url) return false;
+  const lower = url.toLowerCase();
+  return TESTNET_HOST_MARKERS.some((marker) => lower.includes(marker));
+}
+
+/** Returns true when a URL host looks like a mainnet endpoint. */
+export function isMainnetEndpoint(url: string | undefined): boolean {
+  if (!url) return false;
+  const lower = url.toLowerCase();
+  return MAINNET_HOST_MARKERS.some((marker) => lower.includes(marker));
+}
+
+/**
+ * Stellar contract IDs are network-agnostic strings, so we cannot derive the
+ * network from the ID itself. Instead we require operators to declare the
+ * network the IDs were deployed to via STELLAR_CONTRACT_NETWORK and reject any
+ * mismatch with STELLAR_NETWORK.
+ */
+export function contractNetworkMismatch(
+  declaredNetwork: string | undefined,
+  stellarNetwork: string | undefined,
+): boolean {
+  if (!declaredNetwork || !stellarNetwork) return false;
+  return declaredNetwork !== stellarNetwork;
+}
+
+/**
  * Centralized environment-variable validation schema.
  *
  * Called by ConfigModule.forRoot() at bootstrap.
@@ -107,10 +149,41 @@ export const envValidationSchema = Joi.object({
   STELLAR_FEATURES_ENABLED: Joi.string()
     .valid('true', 'false')
     .default('false'),
-  STELLAR_NETWORK: Joi.string().valid('testnet', 'mainnet').default('testnet'),
+  STELLAR_NETWORK: Joi.string()
+    .valid(...STELLAR_NETWORKS)
+    .default('testnet'),
   STELLAR_HORIZON_URL: Joi.string()
     .uri()
-    .default('https://horizon-testnet.stellar.org'),
+    .default('https://horizon-testnet.stellar.org')
+    .when('STELLAR_NETWORK', {
+      is: 'mainnet',
+      then: Joi.string()
+        .uri()
+        .custom((value, helpers) => {
+          if (isTestnetEndpoint(value)) {
+            return helpers.error('stellar.network.endpointMismatch', {
+              field: 'STELLAR_HORIZON_URL',
+              network: 'mainnet',
+            });
+          }
+          return value;
+        }),
+      otherwise: Joi.string()
+        .uri()
+        .custom((value, helpers) => {
+          if (isMainnetEndpoint(value)) {
+            return helpers.error('stellar.network.endpointMismatch', {
+              field: 'STELLAR_HORIZON_URL',
+              network: 'testnet',
+            });
+          }
+          return value;
+        }),
+    })
+    .messages({
+      'stellar.network.endpointMismatch':
+        '{{#field}} points at a {{#network}}-incompatible endpoint; STELLAR_NETWORK and endpoints must agree.',
+    }),
   STELLAR_SOROBAN_RPC_URL: Joi.string()
     .uri()
     .default('https://soroban-rpc-testnet.stellar.org'),
@@ -147,6 +220,34 @@ export const envValidationSchema = Joi.object({
   // Max time to wait for a sequence lease before failing the submission.
   STELLAR_SEQUENCE_LEASE_WAIT_MS: Joi.number().min(0).default(15000),
   DEPLOYMENT_METADATA_PATH: Joi.string().optional(),
+  // Declares the network the contract IDs below were deployed to. Required
+  // whenever Stellar features are enabled so IDs cannot silently cross
+  // networks.
+  STELLAR_CONTRACT_NETWORK: Joi.string()
+    .valid(...STELLAR_NETWORKS)
+    .when('STELLAR_FEATURES_ENABLED', {
+      is: 'true',
+      then: Joi.required(),
+      otherwise: Joi.optional(),
+    })
+    .custom((value, helpers) => {
+      const { STELLAR_NETWORK } = helpers.state.ancestors[0] ?? {};
+      if (contractNetworkMismatch(value, STELLAR_NETWORK)) {
+        return helpers.error('stellar.network.contractMismatch', {
+          declared: value,
+          network: STELLAR_NETWORK,
+        });
+      }
+      return value;
+    })
+    .messages({
+      'any.required':
+        'STELLAR_CONTRACT_NETWORK is required when Stellar features are enabled - declare the network the contract IDs belong to.',
+      'any.only':
+        'STELLAR_CONTRACT_NETWORK must be one of: testnet, mainnet.',
+      'stellar.network.contractMismatch':
+        'STELLAR_CONTRACT_NETWORK ({{#declared}}) does not match STELLAR_NETWORK ({{#network}}); contract IDs must belong to the active network.',
+    }),
   CONFESSION_ANCHOR_CONTRACT_ID: Joi.string().when(
     'STELLAR_FEATURES_ENABLED',
     {
@@ -179,11 +280,26 @@ export const envValidationSchema = Joi.object({
       }),
       otherwise: Joi.optional(),
     })
+    .custom((value, helpers) => {
+      const ancestors = helpers.state.ancestors[0] ?? {};
+      const { NODE_ENV, STELLAR_NETWORK } = ancestors;
+      const productionDeployment =
+        NODE_ENV === 'production' || NODE_ENV === 'staging';
+      // A production/staging deployment must never hold a testnet signer.
+      if (productionDeployment && STELLAR_NETWORK === 'testnet') {
+        return helpers.error('stellar.network.signerMismatch', {
+          reason: 'production deployment configured with STELLAR_NETWORK=testnet',
+        });
+      }
+      return value;
+    })
     .messages({
       'string.pattern.base':
         'STELLAR_SERVER_SECRET must be a valid Stellar secret seed starting with S.',
       'any.required':
         'STELLAR_SERVER_SECRET is required when Stellar features are enabled in production.',
+      'stellar.network.signerMismatch':
+        'STELLAR_SERVER_SECRET cannot be used in a production/staging deployment: {{#reason}}. Use a mainnet signer or disable Stellar features.',
     }),
 
   // â”€â”€ Tipping SLA â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -388,4 +504,10 @@ export const envValidationSchema = Joi.object({
   SYNTHETIC_TX_CHECK_NETWORKS: Joi.string()
     .pattern(/^(testnet|mainnet)(,(testnet|mainnet))*$/)
     .default('testnet'),
+
+  // ── Cross-domain integrity checks ──────────────────────────────────────────
+  INTEGRITY_CHECK_DEFAULT_TIMEOUT_MS: Joi.number().min(100).max(30000).default(5000),
+  INTEGRITY_CHECK_MAX_TIMEOUT_MS: Joi.number().min(100).max(60000).default(30000),
+  INTEGRITY_CHECK_DEFAULT_LIMIT: Joi.number().min(1).max(200).default(50),
+  INTEGRITY_CHECK_MAX_LIMIT: Joi.number().min(1).max(1000).default(200),
 }).options({ allowUnknown: true, abortEarly: false });

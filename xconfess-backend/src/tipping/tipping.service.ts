@@ -331,6 +331,27 @@ export class TippingService {
       txHash: dto.txId,
     });
 
+    // ── 0. Duplicate-delivery guard (issue #282) ──────────────────────────
+    //
+    // Queue-backed verification jobs can be delivered more than once when a
+    // Redis partition forces a consumer to replay its backlog. The DB-level
+    // idempotency key below is the ultimate single-credit gate, but we also
+    // short-circuit obvious replays here so a replayed job never re-enters
+    // the chain-verification path (and never re-emits side effects).
+    const replayKey = this.generateIdempotencyKey(confessionId, dto.txId);
+    const replayTip = await this.findTipByIdempotencyKey(replayKey);
+    if (replayTip) {
+      this.logger.debug({
+        message: 'Duplicate tip verification delivery detected',
+        requestId,
+        confessionId,
+        txHash: dto.txId,
+        tipId: replayTip.id,
+        status: replayTip.verificationStatus,
+      });
+      return this.resolveIdempotentOutcome(replayTip);
+    }
+
     // ── 1. Confession must exist ──────────────────────────────────────────
     const confession = await this.confessionRepository.findOne({
       where: { id: confessionId },
@@ -1443,6 +1464,44 @@ export class TippingService {
     idempotencyKey: string,
   ): Promise<Tip | null> {
     return this.tipRepository.findOne({ where: { idempotencyKey } });
+  }
+
+  /**
+   * Replay-safe entry point for queue-backed tip verification jobs
+   * (issue #282).
+   *
+   * A Redis partition can cause the same job to be delivered multiple times.
+   * This wrapper guarantees that a replayed delivery resolves to the canonical
+   * outcome of the original settlement instead of re-running chain verification
+   * or emitting duplicate side effects. Any non-idempotent failure is
+   * propagated so the queue can retry with its normal backoff.
+   */
+  async processTipVerificationJob(
+    confessionId: string,
+    dto: VerifyTipDto,
+    requestId?: string,
+  ): Promise<TipVerificationResult> {
+    try {
+      return await this.verifyAndRecordTip(confessionId, dto, requestId);
+    } catch (error) {
+      if (
+        error instanceof ConflictException ||
+        error instanceof BadRequestException ||
+        error instanceof NotFoundException
+      ) {
+        // Terminal or already-in-flight outcomes are safe to surface to the
+        // queue as a resolved (non-retryable) result.
+        throw error;
+      }
+      this.logger.warn({
+        message: 'Tip verification job failed; eligible for queue retry',
+        requestId,
+        confessionId,
+        txHash: dto.txId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 
   /**

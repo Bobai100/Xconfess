@@ -175,6 +175,11 @@ export class ContractService {
         invocation.sourceAccount,
         [operation],
       );
+
+      // Simulate first and bind the result to the network and operation inputs.
+      // Submission re-validates freshness and rejects if ledger state has aged
+      // or changed since simulation (see TransactionBuilderService).
+      const simulation = await this.txBuilder.simulateTransaction(tx);
       const signedTx = this.txBuilder.signTransaction(tx, signerSecret);
       const timeoutMs = this.stellarConfig.getConfig().rpcTimeoutMs;
       let timeoutId: NodeJS.Timeout | undefined;
@@ -187,7 +192,7 @@ export class ContractService {
       let result: ITransactionResult;
       try {
         result = await Promise.race([
-          this.txBuilder.submitTransaction(signedTx),
+          this.txBuilder.submitTransaction(signedTx, simulation),
           timeout,
         ]);
       } finally {

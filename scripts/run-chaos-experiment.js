@@ -58,6 +58,30 @@ const EXPERIMENT_CATALOGUE = [
     target: 'stellar-rpc',
     durationSecs: 120,
   },
+  {
+    id: 'exp-06-redis-export-queue-recovery',
+    title: 'Redis connection loss and recovery for the export queue',
+    target: 'redis:export-queue',
+    durationSecs: 90,
+  },
+  {
+    id: 'exp-07-redis-notification-queue-recovery',
+    title: 'Redis connection loss and recovery for the notification queue',
+    target: 'redis:notification-queue',
+    durationSecs: 90,
+  },
+  {
+    id: 'exp-08-redis-queue-backlog-growth',
+    title: 'Redis outage causes backlog growth across queue-backed workers',
+    target: 'redis:all-queues',
+    durationSecs: 120,
+  },
+  {
+    id: 'exp-09-redis-duplicate-delivery',
+    title: 'Duplicate delivery after Redis partition recovery is idempotent',
+    target: 'queue-worker:all-queues',
+    durationSecs: 60,
+  },
 ];
 
 function assertNotProduction() {

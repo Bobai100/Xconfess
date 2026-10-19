@@ -278,6 +278,130 @@ function collectSchema() {
   };
 }
 
+function readApplicationVersion(relativePath) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(REPO_ROOT, relativePath), 'utf8')).version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function createReproductionBundle({ runtime, appVersions, serviceHealth, configKeys, generatedAt }) {
+  return {
+    schemaVersion: 1,
+    generatedAt,
+    runtime: {
+      node: runtime.node,
+      npm: runtime.npm,
+      platform: runtime.platform,
+      arch: runtime.arch,
+    },
+    applicationVersions: appVersions,
+    serviceHealth,
+    configKeys,
+  };
+}
+
+function scanReproductionBundle(bundle) {
+  const findings = [];
+  const exactKeys = (value, expected) =>
+    value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).sort().join(',') === expected.slice().sort().join(',');
+
+  if (!exactKeys(bundle, ['schemaVersion', 'generatedAt', 'runtime', 'applicationVersions', 'serviceHealth', 'configKeys'])) {
+    findings.push('unexpected-or-missing-fields');
+    return findings;
+  }
+  if (bundle.schemaVersion !== 1 || !/^\d{4}-\d\d-\d\dT/.test(bundle.generatedAt)) {
+    findings.push('invalid-metadata');
+  }
+  if (!exactKeys(bundle.runtime, ['node', 'npm', 'platform', 'arch']) ||
+      !/^v?\d+\.\d+\.\d+/.test(bundle.runtime.node) ||
+      !/^\d+\.\d+\.\d+/.test(bundle.runtime.npm) ||
+      !/^[a-z]+$/.test(bundle.runtime.platform) ||
+      !/^[A-Za-z0-9_-]+$/.test(bundle.runtime.arch)) {
+    findings.push('invalid-runtime-metadata');
+  }
+  if (!exactKeys(bundle.applicationVersions, ['root', 'backend', 'frontend']) ||
+      Object.values(bundle.applicationVersions).some((version) => typeof version !== 'string' || !/^[\w.+-]+$/.test(version))) {
+    findings.push('invalid-application-versions');
+  }
+  if (!exactKeys(bundle.serviceHealth, ['postgres', 'redis']) ||
+      Object.values(bundle.serviceHealth).some((status) => !['reachable', 'unreachable'].includes(status))) {
+    findings.push('invalid-health-data');
+  }
+  if (!exactKeys(bundle.configKeys, ['backend', 'frontend']) ||
+      Object.values(bundle.configKeys).some((keys) => !Array.isArray(keys) || keys.some((key) => !/^[A-Z][A-Z0-9_]{0,127}$/.test(key)))) {
+    findings.push('invalid-config-names');
+  }
+
+  const serialized = JSON.stringify(bundle);
+  if (/-----BEGIN [A-Z ]*PRIVATE KEY-----|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/i.test(serialized)) {
+    findings.push('credential-pattern');
+  }
+  if (/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(serialized)) {
+    findings.push('personal-identifier-pattern');
+  }
+  return findings;
+}
+
+async function collectReproductionBundle() {
+  const [runtime, services] = await Promise.all([collectRuntime(), collectServices()]);
+  const backendEnv = path.join(REPO_ROOT, 'xconfess-backend', '.env');
+  const frontendEnv = path.join(REPO_ROOT, 'xconfess-frontend', '.env.local');
+  return createReproductionBundle({
+    runtime,
+    appVersions: {
+      root: readApplicationVersion('package.json'),
+      backend: readApplicationVersion('xconfess-backend/package.json'),
+      frontend: readApplicationVersion('xconfess-frontend/package.json'),
+    },
+    serviceHealth: {
+      postgres: services.postgres.reachable ? 'reachable' : 'unreachable',
+      redis: services.redis.reachable ? 'reachable' : 'unreachable',
+    },
+    configKeys: {
+      backend: envKeys(backendEnv),
+      frontend: envKeys(frontendEnv),
+    },
+    generatedAt: new Date().toISOString(),
+  });
+}
+
+function writeReproductionBundle(outputPath, bundle) {
+  const target = path.resolve(outputPath);
+  const findings = scanReproductionBundle(bundle);
+  if (findings.length > 0) {
+    throw new Error(`Reproduction bundle rejected by privacy scan: ${findings.join(', ')}`);
+  }
+
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const temporaryPath = `${target}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(bundle, null, 2)}\n`, { mode: 0o600 });
+    const written = JSON.parse(fs.readFileSync(temporaryPath, 'utf8'));
+    const outputFindings = scanReproductionBundle(written);
+    if (outputFindings.length > 0) {
+      throw new Error(`Reproduction bundle output rejected by privacy scan: ${outputFindings.join(', ')}`);
+    }
+    fs.renameSync(temporaryPath, target);
+  } catch (error) {
+    fs.rmSync(temporaryPath, { force: true });
+    throw error;
+  }
+  return target;
+}
+
+function parseBundlePath(argv) {
+  const optionIndex = argv.indexOf('--bundle');
+  if (optionIndex === -1) return null;
+  const outputPath = argv[optionIndex + 1];
+  if (!outputPath || outputPath.startsWith('--')) {
+    throw new Error('Usage: node scripts/diagnose.js --bundle <output-file>');
+  }
+  return outputPath;
+}
+
 // ── Render helpers ────────────────────────────────────────────────────────────
 
 function badge(ok) {
@@ -303,6 +427,15 @@ function printSection(title, data) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
+  const bundlePath = parseBundlePath(process.argv.slice(2));
+  if (bundlePath) {
+    const bundle = await collectReproductionBundle();
+    const writtenPath = writeReproductionBundle(bundlePath, bundle);
+    console.log(`Safe reproduction bundle written: ${path.relative(process.cwd(), writtenPath)}`);
+    console.log('Privacy scan passed; no tokens, user content, or identifiers are included.');
+    return;
+  }
+
   if (!JSON_MODE) {
     console.log('xConfess environment diagnostics');
     console.log(`Generated: ${new Date().toISOString()}`);
@@ -421,7 +554,17 @@ async function main() {
   process.exit(allOk ? 0 : 1);
 }
 
-main().catch((err) => {
-  console.error('Diagnostics failed unexpectedly:', err.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Diagnostics failed unexpectedly:', err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  createReproductionBundle,
+  envKeys,
+  envPresence,
+  scanReproductionBundle,
+  writeReproductionBundle,
+};

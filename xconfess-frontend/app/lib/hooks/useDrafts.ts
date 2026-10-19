@@ -22,15 +22,23 @@ import {
 } from "@/app/lib/api/drafts";
 import { enqueueWrite } from "@/app/lib/utils/syncQueue";
 
-export type ConflictResolution = "keep-local" | "keep-remote" | "discard-local";
+export type ConflictResolution =
+  | "keep-local"
+  | "keep-remote"
+  | "discard-local"
+  | "save-as-copy";
 
 const REMOTE_UPDATED_MSG =
   "This draft was changed elsewhere while you were offline. Your local copy is kept.";
 const REMOTE_DELETED_MSG =
   "This draft was deleted remotely while you were offline. Your local copy is kept.";
+const TAB_CONFLICT_MSG =
+  "This draft was changed in another browser tab. Your local copy is kept.";
 
 function conflictMessage(reason: DraftConflictReason): string {
-  return reason === "remote_deleted" ? REMOTE_DELETED_MSG : REMOTE_UPDATED_MSG;
+  if (reason === "remote_deleted") return REMOTE_DELETED_MSG;
+  if (reason === "tab_conflict") return TAB_CONFLICT_MSG;
+  return REMOTE_UPDATED_MSG;
 }
 
 const STORAGE_KEY = "xconfess-drafts";
@@ -268,10 +276,12 @@ export function useDrafts() {
         id: crypto.randomUUID(),
         savedAt: Date.now(),
         characterCount: (draft.title?.length || 0) + draft.body.length,
+        version: 1,
       };
+      const currentStored = readLocalDrafts();
       const updated = [
         newDraft,
-        ...draftsRef.current.filter((d) => d.id !== newDraft.id),
+        ...currentStored.filter((d) => d.id !== newDraft.id),
       ];
       const success = persistLocal(updated);
       return success ? newDraft.id : null;
@@ -343,19 +353,63 @@ export function useDrafts() {
         }
       }
 
-      const updated = draftsRef.current.map((draft) =>
-        draft.id === id
-          ? {
-              ...draft,
-              ...updates,
-              savedAt: Date.now(),
-              characterCount:
-                (updates.title?.length ?? draft.title?.length ?? 0) +
-                (updates.body?.length ?? draft.body.length),
-            }
-          : draft,
-      );
-      return persistLocal(updated);
+      const existing = draftsRef.current.find((d) => d.id === id);
+      const baseVersion = updates.version ?? existing?.version ?? 1;
+      const currentStored = readLocalDrafts();
+      const storedDraft = currentStored.find((d) => d.id === id);
+
+      // Stale write check across tabs:
+      // If the stored draft in localStorage has advanced past baseVersion
+      // or has a newer timestamp with different content:
+      const isStaleTabWrite =
+        storedDraft &&
+        ((storedDraft.version !== undefined && storedDraft.version > baseVersion) ||
+          (storedDraft.savedAt > (existing?.savedAt ?? 0) &&
+            ((updates.body !== undefined && storedDraft.body !== updates.body) ||
+              (updates.title !== undefined && storedDraft.title !== updates.title))));
+
+      if (isStaleTabWrite) {
+        const localSnapshot = {
+          body: updates.body ?? existing?.body ?? "",
+          title: updates.title ?? existing?.title,
+          gender: updates.gender ?? existing?.gender,
+        };
+
+        setConflicts((prev) => [
+          ...prev.filter((c) => c.draftId !== id),
+          {
+            draftId: id,
+            reason: "tab_conflict",
+            detectedAt: Date.now(),
+            local: localSnapshot,
+            baseVersion,
+            remote: storedDraft,
+          },
+        ]);
+        setError(conflictMessage("tab_conflict"));
+        return false;
+      }
+
+      const nextVersion = (storedDraft?.version ?? baseVersion) + 1;
+      const updatedDraft: Draft = {
+        ...(storedDraft ?? existing ?? { id, body: "" }),
+        ...updates,
+        savedAt: Date.now(),
+        characterCount:
+          (updates.title?.length ?? existing?.title?.length ?? 0) +
+          (updates.body?.length ?? existing?.body?.length ?? 0),
+        version: nextVersion,
+      };
+
+      const updated = [
+        updatedDraft,
+        ...currentStored.filter((d) => d.id !== id),
+      ];
+      const success = persistLocal(updated);
+      if (success) {
+        clearConflict(id);
+      }
+      return success;
     },
     [isAuthenticated, token, persistLocal, clearConflict, recordConflict],
   );
@@ -397,11 +451,80 @@ export function useDrafts() {
       const conflict = conflictsRef.current.find((c) => c.draftId === draftId);
       if (!conflict) return false;
 
-      if (resolution === "discard-local" || !isAuthenticated || !token) {
+      if (resolution === "discard-local") {
         clearConflict(draftId);
-        if (resolution === "keep-remote" && conflict.reason === "remote_deleted") {
-          setDrafts((prev) => prev.filter((d) => d.id !== draftId));
+        setError(null);
+        return true;
+      }
+
+      if (resolution === "save-as-copy") {
+        if (isAuthenticated && token) {
+          try {
+            const created = await createDraft(token, {
+              body: conflict.local.body,
+              title: conflict.local.title ? `${conflict.local.title} (Copy)` : undefined,
+              gender: conflict.local.gender,
+            });
+            setDrafts((prev) =>
+              [created, ...prev.filter((d) => d.id !== created.id)]
+                .sort((a, b) => b.savedAt - a.savedAt)
+                .slice(0, MAX_DRAFTS),
+            );
+            clearConflict(draftId);
+            setError(null);
+            return true;
+          } catch (err) {
+            setError(
+              err instanceof DraftApiError
+                ? err.message
+                : "Failed to save copy.",
+            );
+            return false;
+          }
+        } else {
+          const newId = crypto.randomUUID();
+          const copyDraft: Draft = {
+            id: newId,
+            body: conflict.local.body,
+            title: conflict.local.title ? `${conflict.local.title} (Copy)` : undefined,
+            gender: conflict.local.gender,
+            savedAt: Date.now(),
+            characterCount:
+              (conflict.local.title?.length || 0) + conflict.local.body.length,
+            version: 1,
+          };
+          const currentStored = readLocalDrafts();
+          persistLocal([copyDraft, ...currentStored]);
+          clearConflict(draftId);
+          setError(null);
+          return true;
         }
+      }
+
+      if (!isAuthenticated || !token) {
+        if (resolution === "keep-remote") {
+          const currentStored = readLocalDrafts();
+          setDrafts(currentStored);
+          clearConflict(draftId);
+          setError(null);
+          return true;
+        }
+
+        // keep-local in guest mode
+        const currentStored = readLocalDrafts();
+        const storedMatch = currentStored.find((d) => d.id === draftId);
+        const forcedDraft: Draft = {
+          ...(storedMatch ?? { id: draftId, body: "" }),
+          body: conflict.local.body,
+          title: conflict.local.title,
+          gender: conflict.local.gender,
+          savedAt: Date.now(),
+          characterCount:
+            (conflict.local.title?.length || 0) + conflict.local.body.length,
+          version: (storedMatch?.version ?? conflict.baseVersion ?? 1) + 1,
+        };
+        persistLocal([forcedDraft, ...currentStored.filter((d) => d.id !== draftId)]);
+        clearConflict(draftId);
         setError(null);
         return true;
       }

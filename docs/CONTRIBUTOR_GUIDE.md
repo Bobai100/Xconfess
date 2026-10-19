@@ -113,7 +113,86 @@ If a full check cannot run locally because a dependency, Docker service, or
 platform tool is unavailable, document the failed command and the exact blocker
 in the pull request body.
 
-## Reviewer Guidelines And Calibration
+## Advanced Search Query Grammar
+
+Advanced search is parsed and enforced by the backend at the owning boundary
+(`backend/src/search`). The parser accepts only the documented grammar below;
+anything outside it is rejected with a stable validation error rather than
+being silently interpreted or forwarded to the database.
+
+### Allowlisted Fields
+
+Only these fields may appear on the left of an operator:
+
+- `author` — message author handle
+- `conversation` — conversation id
+- `tag` — message tag
+- `before` / `after` — ISO-8601 date bounds
+- `has` — attachment presence (`has:attachment`)
+
+Any other field name is rejected with `SEARCH_UNKNOWN_FIELD`.
+
+### Allowlisted Operators
+
+- `field:value` — equality match
+- `field:"quoted value"` — equality match with spaces
+- `-field:value` — negation
+- Bare terms (no operator) are treated as full-text terms
+
+Operators outside this set (for example `field>value`, `field~value`, or
+wildcards like `field:*`) are rejected with `SEARCH_UNSUPPORTED_OPERATOR`.
+
+### Complexity Limits
+
+The parser caps query complexity so a single request cannot trigger an
+expensive scan. Exceeding any limit is rejected with `SEARCH_QUERY_TOO_COMPLEX`:
+
+- Maximum of 32 tokens per query
+- Maximum of 16 clauses (field matches plus bare terms)
+- Maximum nesting depth of 2 (one level of parentheses)
+- Maximum of 256 characters per quoted value
+
+### Validation Error Codes
+
+Malformed or disallowed expressions return a stable error code and message so
+clients can render consistent feedback:
+
+| Code | Meaning |
+| --- | --- |
+| `SEARCH_EMPTY_QUERY` | Query is empty or whitespace only |
+| `SEARCH_UNKNOWN_FIELD` | Field is not in the allowlist |
+| `SEARCH_UNSUPPORTED_OPERATOR` | Operator is not in the allowlist |
+| `SEARCH_UNBALANCED_QUOTES` | Quoted value is not terminated |
+| `SEARCH_UNBALANCED_PARENS` | Parentheses are unbalanced |
+| `SEARCH_QUERY_TOO_COMPLEX` | A complexity limit was exceeded |
+
+### Failure Semantics
+
+- Invalid queries are rejected before any database access; they never reach
+the query builder.
+- Rejections return `400 Bad Request` with the error code above and a
+  human-readable message; they are not retried automatically.
+- Authorization is checked before parsing, so unauthorized callers receive
+  `403` regardless of query validity.
+
+### Testing Expectations
+
+Backend tests for this area must cover the expected path plus adversarial
+inputs (unknown fields, unsupported operators, unbalanced quotes/parens, and
+queries that exceed the complexity caps) and the regression risk of a
+malformed query reaching the database. Run them with:
+
+```bash
+npm run backend:test
+```
+
+## Message Retention And Expiry
+
+Private messages have an explicit, enforceable lifecycle. Retention is chosen
+per conversation and enforced by the backend at the ownership boundary; clients
+must not assume messages live forever or that local copies outlive the server.
+
+### Supported Retention Choices And Defaults
 
 Moderation reviewers interpret ambiguous policy cases. To keep decisions
 consistent without letting consensus replace policy review, reviewer guidance is
@@ -215,45 +294,24 @@ Users can opt in or out of seeing sensitive content categories. These are
 
 ### Supported Categories
 
-- `violence`, `nudity`, `profanity`, and `self_harm` are the supported
-  sensitive content categories.
-- Each category has an explicit per-user preference: `show` (opt in) or `hide`
-  (opt out). Categories without a stored preference fall back to the default
-  (`hide` for `self_harm`, `show` for the rest).
+- **Join** — a user may join only via an accepted invite or an explicit
+  self-join policy enabled for the conversation. Direct joins without either
+  are rejected with `403`.
+- **Leave** — any active member may leave. Leaving removes the member from
+  future fanout but preserves their historical access per the history rules
+  below.
+- **Remove** — only the conversation owner or an authorized moderator may
+  remove another member. Removing a non-member is a no-op success; removing
+yourself must go through the leave path.
+- Every transition is idempotent and records the actor, target, and reason so
+  audit trails stay consistent.
 
 ### Where Preferences Are Applied
 
-- Preferences are stored and validated at the owning backend boundary; unknown
-  categories or values are rejected with `422`.
-- The same filter is applied consistently to both feed and search results so a
-  category hidden in one surface is hidden in the other.
-- Filtering happens at read time on the server; clients never receive content
-  the user opted out of.
-
-### Moderation Is Independent Of Display Preference
-
-- Opting in to a category only affects display; it never bypasses moderation.
-  Content that violates policy is still removed or restricted regardless of the
-  user's filter settings.
-- Opting out of a category hides content but does not report, flag, or otherwise
-  affect the author's moderation status.
-
-### Testing Expectations
-
-Backend tests for this area must cover the expected path (preferences applied to
-feed and search), rejection cases (unknown category or value), and the
-regression risk that a display preference weakens moderation enforcement. Run
-them with:
-
-```bash
-npm run backend:test && npm run frontend:test
-```
-
-## Message Retention And Expiry
-
-Private messages have an explicit, enforceable lifecycle. Retention is chosen
-per conversation and enforced by the backend at the ownership boundary; clients
-must not assume messages live forever or that local copies outlive the server.
+- Only active members with the `invite` capability (owner, moderators, or
+  members when the conversation allows member invites) may create invites.
+- Invites are scoped to a single conversation and a single invitee, expire, and
+  
 
 ### Supported Retention Choices And Defaults
 
@@ -277,6 +335,44 @@ must not assume messages live forever or that local copies outlive the server.
 
 ### Deletion Completion Records
 
-- When a message is purged, the backend records a deletion completion marker
-  (message id, conversation id, timestamp, reason) **without** the message body.
-- These markers support audit and 
+```bash
+npm run backend:test
+```
+
+## Cross-Domain Data Integrity Verification (#218)
+
+Independent table-level constraints can leave subtle orphan references across boundaries.
+The platform provides a read-only integrity report endpoint at `GET /api/admin/integrity/report` with:
+- **Domains covered**: `identity` (links between users and anonymous identities), `content` (confessions, comments), `export` (export requests, chunks), and `moderation` (reports, evidence).
+- **Stable Error Codes**: Canonical `ERR_INTEGRITY_*` codes for predictable log parsing and alert routing.
+- **Bounded Execution**: Configurable timeout budgets (`timeoutMs`, default 5s, max 30s) and per-check row limits (`limit`, default 50, max 200). If execution exceeds time bounds, the report returns truncated without crashing.
+- **Repair Guidance**: Each violation includes an actionable SQL query or remediation step for operators.
+- **Authorization**: Strictly restricted to administrators via `JwtAuthGuard` and `AdminGuard`.
+
+## Locale-Aware Message Catalogues with Typed Coverage (#219)
+
+User-facing strings are decoupled from presentation components into typed message catalogues under `xconfess-frontend/app/lib/i18n/`.
+- **Catalogue Structure**: Canonical keys are defined in `types.ts` (`REQUIRED_MESSAGE_KEYS`) and implemented in locale files (`locales/en.ts`, `locales/es.ts`).
+- **Typed Coverage**: The TypeScript types enforce that all catalogues provide every required key. `assertCompleteCatalog` verifies runtime completeness and fails checks if any key is missing.
+- **Fallback Behavior**: When a localized string is missing in the user's active locale, the `useTranslation` hook automatically falls back to the default English (`en`) catalogue. If missing in all catalogues, the key itself is returned.
+
+## Localized Formatting for Dates, Numbers, and Relative Time (#220)
+
+Shared formatters live in `xconfess-frontend/app/lib/i18n/formatters.ts` and wrap standard `Intl` APIs:
+- **Relative vs Absolute Time**: `formatRelativeTime` formats recent intervals into relative units (seconds, minutes, hours, days) and automatically transitions to absolute dates (`formatAbsoluteDate`) beyond configurable thresholds.
+- **Daylight Saving Time (DST)**: Relative durations use monotonic UTC millisecond math to avoid hour-boundary distortion during spring-forward or fall-back transitions.
+- **Safe Fallbacks**: Missing, null, undefined, or non-parseable inputs return safe fallback tokens (default `"—"`) rather than throwing runtime exceptions.
+- **Numbers and Pluralization**: `formatNumber` and `formatCount` format counts, compact abbreviations (`1.2K`), and locale-appropriate plural nouns.
+
+## Cross-Tab Draft Conflict Resolution (#221)
+
+When users edit confession drafts across multiple browser tabs:
+- **Revision Tracking**: Drafts maintain monotonic integer `version` numbers across saves.
+- **Stale Write Detection**: `useDrafts` inspects storage state prior to persisting. If another tab has committed a higher version, the local write is rejected and flagged as a `tab_conflict`.
+- **Dual-Version Preservation**: Unsaved local content and the newer conflicting version from storage are both captured in memory without data loss.
+- **Accessible Decision Flow**: `DraftManager` presents an accessible alert (`role="alert"`, `aria-live="assertive"`) offering choices to:
+  1. *Keep my version*: Rebase and persist local content with an incremented revision.
+  2. *Use other tab's version*: Overwrite the local editor with the newer copy.
+  3. *Save as separate draft*: Store the local content as a new draft, preserving both versions.
+  4. *Dismiss*: Dismiss the notice without altering editor state.
+

@@ -10,6 +10,7 @@ import { useAuth } from '@/app/lib/hooks/useAuth';
 import { isSafeAuthRedirect } from '@/app/lib/utils/auth-redirect';
 import { extractRequestId } from '@/app/lib/utils/errorHandler';
 import { RequestIdNotice } from '@/app/components/auth/RequestIdNotice';
+import { useTranslation } from '@/app/lib/i18n';
 import {
   validateLoginForm,
   parseLoginForm,
@@ -23,6 +24,7 @@ const showDevMockAdminLogin =
 export default function LoginPage() {
   const router = useRouter();
   const { login } = useAuth();
+  const { t } = useTranslation();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [errors, setErrors] = useState<ValidationErrors>({});
@@ -134,7 +136,7 @@ export default function LoginPage() {
                   htmlFor="login-email"
                   className="mb-2 block text-sm font-medium text-[var(--foreground)]"
                 >
-                  Email
+                  {t('auth.login.emailLabel')}
                 </label>
                 <Input
                   id="login-email"
@@ -156,7 +158,7 @@ export default function LoginPage() {
                   htmlFor="login-password"
                   className="mb-2 block text-sm font-medium text-[var(--foreground)]"
                 >
-                  Password
+                  {t('auth.login.passwordLabel')}
                 </label>
                 <Input
                   id="login-password"
@@ -178,7 +180,7 @@ export default function LoginPage() {
                   href="/forgot-password"
                   className="text-[var(--primary-deep)] hover:text-[var(--primary)]"
                 >
-                  Forgot password?
+                  {t('auth.login.forgotPasswordLink')}
                 </Link>
               </div>
 
@@ -188,7 +190,7 @@ export default function LoginPage() {
                 disabled={loading}
                 className="w-full"
               >
-                {loading ? 'Signing in...' : 'Sign in'}
+                {loading ? t('auth.login.submitting') : t('auth.login.submitButton')}
               </Button>
 
               <Button

@@ -99,6 +99,10 @@ This starts backend and frontend concurrently. Once ready:
 
 ## Troubleshooting
 
+For a step-by-step diagnosis of Docker startup, unhealthy services, port
+conflicts, and safe cleanup, see the
+[local service troubleshooting decision tree](docs/local-service-troubleshooting.md).
+
 **Backend won't start** — check that Postgres and Redis containers are healthy (`docker compose -f compose.yaml ps`) and that `.env` has all required keys set. A container can be running before it is ready to accept connections.
 
 **Frontend auth loop** — add `NEXT_PUBLIC_DEV_BYPASS_AUTH=true` to `xconfess-frontend/.env.local` to skip the auth flow during UI-only development.

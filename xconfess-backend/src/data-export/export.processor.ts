@@ -40,6 +40,16 @@ export class ExportProcessor extends WorkerHost {
     try {
       this.logger.log(`Starting chunked export for user ${userId}...`);
 
+      // Idempotency guard: a duplicate delivery (e.g. after a Redis reconnect
+      // or backlog replay) must not re-run an export that already finished.
+      const existing = await this.exportRepository.findOneBy({ id: requestId });
+      if (existing && existing.status === 'READY') {
+        this.logger.log(
+          `Export ${requestId} already completed; skipping duplicate delivery.`,
+        );
+        return;
+      }
+
       // Stamp processingAt and flip status to PROCESSING
       await this.dataExportService.markExportProcessing(requestId);
 
@@ -56,6 +66,10 @@ export class ExportProcessor extends WorkerHost {
         this.logger.log(`Export ${requestId} cancelled after data compilation.`);
         return;
       }
+
+      // Clear any partial chunks left behind by a previous failed attempt so
+      // retries after a Redis outage do not accumulate duplicate chunk rows.
+      await this.chunkRepository.delete({ exportRequestId: requestId });
 
       const result = await this.generateChunkedZip(requestId, data);
 
@@ -89,6 +103,9 @@ export class ExportProcessor extends WorkerHost {
       this.logger.error(`Export ${requestId} failed: ${message}`);
       // Use the service helper so retryCount and lastFailureReason are persisted
       await this.dataExportService.markExportFailed(requestId, message);
+      // Rethrow so BullMQ records the failure and applies its retry/backoff
+      // policy; swallowing it would silently drop the job on Redis recovery.
+      throw error;
     }
   }
 

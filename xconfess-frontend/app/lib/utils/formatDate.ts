@@ -1,27 +1,29 @@
-export function formatDate(date: Date): string {
-  const now = new Date();
-  const diff = now.getTime() - date.getTime();
-  const seconds = Math.floor(diff / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
+import {
+  formatRelativeTime,
+  formatAbsoluteDate,
+  formatNumber,
+  formatCount,
+  RelativeTimeOptions,
+  AbsoluteDateOptions,
+} from '../i18n/formatters';
 
-  if (seconds < 60) {
-    return "just now";
-  }
-  if (minutes < 60) {
-    return `${minutes}m ago`;
-  }
-  if (hours < 24) {
-    return `${hours}h ago`;
-  }
-  if (days < 7) {
-    return `${days}d ago`;
-  }
+export {
+  formatRelativeTime,
+  formatAbsoluteDate,
+  formatNumber,
+  formatCount,
+};
 
-  return date.toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-    year: date.getFullYear() !== now.getFullYear() ? "numeric" : undefined,
-  });
+/**
+ * Format date consistently across the application with locale awareness
+ * and safe handling of missing, null, or invalid dates.
+ */
+export function formatDate(
+  date: Date | string | number | null | undefined,
+  options?: RelativeTimeOptions,
+): string {
+  if (!date) {
+    return '—';
+  }
+  return formatRelativeTime(date, options);
 }

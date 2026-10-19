@@ -6,6 +6,7 @@ import { NotificationItem } from "./NotificationItem";
 import { NotificationPreferences } from "./NotificationPreference";
 import { NotificationType } from "@/app/types/notifications";
 import { useNotifications } from "@/app/lib/hooks/useNotifications";
+import { useTranslation } from "@/app/lib/i18n";
 
 interface NotificationCenterProps {
   onClose?: () => void;
@@ -29,6 +30,7 @@ export function NotificationCenter({ onClose }: NotificationCenterProps) {
     fetchNotifications,
     deleteNotification,
   } = useNotifications(userId);
+  const { t } = useTranslation();
 
   // Fetch notifications on mount
   useEffect(() => {
@@ -69,7 +71,7 @@ export function NotificationCenter({ onClose }: NotificationCenterProps) {
       {/* Header */}
       <div className="p-4 border-b border-gray-200 bg-gradient-to-r from-blue-500 to-purple-600">
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-lg font-semibold text-white">Notifications</h2>
+          <h2 className="text-lg font-semibold text-white">{t('notifications.title')}</h2>
           <div className="flex items-center gap-2">
             {/* Connection Status */}
             <div className="flex items-center gap-1">
@@ -116,7 +118,7 @@ export function NotificationCenter({ onClose }: NotificationCenterProps) {
               className="flex items-center gap-1 px-3 py-1 text-xs font-medium text-white bg-white/20 hover:bg-white/30 rounded-full transition-colors"
             >
               <CheckCheck className="w-3 h-3" />
-              Mark all read
+              {t('notifications.markAllAsRead')}
             </button>
           </div>
         )}
@@ -139,7 +141,7 @@ export function NotificationCenter({ onClose }: NotificationCenterProps) {
               className={`px-3 py-1 text-xs font-medium rounded-full transition-colors ${
                 filterType === type.value
                   ? "bg-blue-600 text-white"
-                  : "bg-white text-gray-700 hover:bg-gray-100 border border-gray-300"
+                  : "bg-white text-gray-700 hover:bg-gray-100 border border-gray-200"
               }`}
             >
               {type.label}
@@ -170,7 +172,7 @@ export function NotificationCenter({ onClose }: NotificationCenterProps) {
               <Filter className="w-6 h-6 text-gray-400" />
             </div>
             <p className="text-sm font-medium text-gray-700 mb-1">
-              {showUnreadOnly ? "All caught up!" : "No notifications yet"}
+              {showUnreadOnly ? "All caught up!" : t('notifications.empty')}
             </p>
             <p className="text-xs text-gray-500">
               {showUnreadOnly

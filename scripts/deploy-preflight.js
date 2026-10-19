@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const validateRepositoryGovernance = require('./repository-governance-audit');
 
 const ROOT = path.resolve(__dirname, '..');
 const HEX_32 = /^[a-fA-F0-9]{64}$/;
@@ -207,6 +208,7 @@ function validateRenderPrestartBaseline() {
 }
 
 const failures = [];
+failures.push(...validateRepositoryGovernance());
 validateWorkspaceDependencies();
 validateRenderYaml();
 validateRenderPrestartBaseline();

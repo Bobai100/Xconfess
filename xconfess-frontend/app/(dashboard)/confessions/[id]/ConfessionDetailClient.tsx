@@ -32,6 +32,7 @@ import { queryKeys } from "@/app/lib/api/queryKeys";
 import { useAuth } from "@/app/lib/hooks/useAuth";
 import { getConfessionById } from "@/app/lib/api/confessions";
 import { createConfessionReport } from "@/app/lib/api/reports";
+import { useTranslation } from "@/app/lib/i18n";
 
 interface ConfessionDetailClientProps {
   initialConfession: {
@@ -55,6 +56,7 @@ export function ConfessionDetailClient({
 }: ConfessionDetailClientProps) {
   const router = useRouter();
   const { user } = useAuth();
+  const { t } = useTranslation();
   const [reportStatus, setReportStatus] = useState<
     "idle" | "pending" | "success" | "error"
   >("idle");
@@ -387,10 +389,10 @@ export function ConfessionDetailClient({
             >
               <AlertCircle className="h-4 w-4 mr-1" />
               {reportStatus === "pending"
-                ? "Reporting..."
+                ? t("moderation.reporting")
                 : reportStatus === "success"
-                  ? "Reported"
-                  : "Report"}
+                  ? t("moderation.reported")
+                  : t("moderation.reportButton")}
             </Button>
 
             {reportStatus === "pending" && (
@@ -398,12 +400,12 @@ export function ConfessionDetailClient({
             )}
             {reportStatus === "success" && (
               <p className="mt-2 text-xs text-emerald-600 dark:text-emerald-400">
-                Report submitted. Thank you!
+                {t("moderation.reportSuccess")}
               </p>
             )}
             {reportStatus === "error" && (
               <p className="mt-2 text-xs text-red-600 dark:text-red-400">
-                {reportError || "Report submission failed."}
+                {reportError || t("moderation.reportFailed")}
               </p>
             )}
           </div>

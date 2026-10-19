@@ -25,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -33,6 +35,16 @@ jobs:
       - run: npm install --global npm@10.9.3
       - run: npm ci --include=optional --no-audit --no-fund
       - run: npm run audit:ci
+      - name: Enforce dependency license and change policy
+        run: npm run dependency:policy -- --base "${{ github.event.before || 'HEAD^' }}"
+      - name: Retain dependency policy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-policy-report
+          path: dependency-policy-report.json
+          if-no-files-found: warn
+          retention-days: 90
 
   sbom:
     name: Security / SBOM & provenance
@@ -170,6 +182,16 @@ jobs:
       - run: npm run ci:apps
       - name: Check OpenAPI artifact drift
         run: bash scripts/check-openapi-drift.sh
+      - name: Check release compatibility evidence
+        run: npm run check:release-compatibility
+      - name: Retain release compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-compatibility-report
+          path: release-compatibility-report.json
+          if-no-files-found: warn
+          retention-days: 90
 
   backend-test-coverage:
     # Issue #117: Run backend unit tests with risk-domain coverage thresholds.
@@ -277,6 +299,106 @@ jobs:
             frontend-budget-report.json
           if-no-files-found: ignore
           retention-days: 7
+
+  browser-compatibility:
+    name: Frontend / critical browser and timezone coverage
+    needs: [audit, sbom, secret-scan]
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      NEXT_TELEMETRY_DISABLED: '1'
+      NEXT_PUBLIC_API_URL: http://localhost:4001/api
+      NEXT_PUBLIC_WS_URL: ws://localhost:4001
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      NEXT_PUBLIC_STELLAR_NETWORK: testnet
+      NEXT_PUBLIC_STELLAR_CONTRACT_ID: CBFR2MDZBQPTNBIJCT32MTDDQLW2AQNDWNO777F3QT6ANYKTHETQZWD3
+      NEXT_PUBLIC_DEV_BYPASS_AUTH: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm install --global npm@10.9.3
+      - run: npm ci --include=optional --no-audit --no-fund
+      - name: Validate flaky-test quarantine policy
+        run: node scripts/check-test-quarantine.js
+      - name: Install pinned Playwright browser revisions
+        run: npx playwright install --with-deps chromium firefox webkit
+      - name: Check date formatting across daylight-saving boundaries
+        run: npx jest --config xconfess-frontend/jest.config.ts --runInBand --runTestsByPath xconfess-frontend/app/lib/utils/__tests__/formatDate.timezone.test.ts
+      - name: Run critical public-page flows across browsers
+        working-directory: xconfess-frontend
+        run: npm run test:e2e -- --project=critical-chromium --project=critical-firefox --project=critical-webkit
+      - name: Upload browser retry and failure reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-compatibility-report
+          path: |
+            xconfess-frontend/playwright-report/**
+            xconfess-frontend/test-results/playwright-results.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  backend-concurrency:
+    name: Backend / concurrent mutation invariants
+    needs: [audit, sbom, secret-scan]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: xconfess
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d xconfess"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NODE_ENV: test
+      APP_ENV: ci
+      PORT: 5000
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: xconfess
+      TYPEORM_SYNCHRONIZE: true
+      TYPEORM_MIGRATIONS_RUN: false
+      JWT_SECRET: ci-jwt-secret-with-more-than-32-characters
+      APP_SECRET: ci-app-secret-with-more-than-32-characters
+      CONFESSION_ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      ENABLE_BACKGROUND_JOBS: false
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      STELLAR_FEATURES_ENABLED: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm install --global npm@10.9.3
+      - run: npm ci --include=optional --no-audit --no-fund
+      - name: Stress idempotent reaction creation against PostgreSQL
+        working-directory: xconfess-backend
+        run: npx jest --config test/jest-e2e.json --runInBand --runTestsByPath test/reaction-contention.e2e-spec.ts
 
   accessibility:
     name: Frontend / WCAG 2.2 AA gates

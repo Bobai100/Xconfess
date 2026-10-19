@@ -217,7 +217,16 @@ npm run migration:revert
 
 When running locally, Swagger docs are available at `/api/api-docs`.
 
-For route inventory, DTO examples, and the **`GET /api/health`** contract (including schema readiness for `anonymous_confessions`), see [API_DOCUMENTATION.md](./API_DOCUMENTATION.md).
+## Cross-Domain Integrity Checks
+
+The backend provides a read-only cross-domain integrity verification report accessible to administrators via `GET /api/admin/integrity/report`.
+It executes bounded, read-only queries across identity, content, export, and moderation domains, returning stable error codes (`ERR_INTEGRITY_*`), severity levels, and automated repair guidance for detected invariant violations.
+
+Configuration environment variables:
+- `INTEGRITY_CHECK_DEFAULT_TIMEOUT_MS`: Default timeout budget per report run (default: 5000).
+- `INTEGRITY_CHECK_MAX_TIMEOUT_MS`: Maximum timeout budget allowable (default: 30000).
+- `INTEGRITY_CHECK_DEFAULT_LIMIT`: Default sample limit per invariant check (default: 50).
+- `INTEGRITY_CHECK_MAX_LIMIT`: Maximum violation sample limit (default: 200).
 
 ## 📄 License
 
