@@ -8,6 +8,15 @@ const runMutation = process.env.SMOKE_RUN_MUTATION === 'true';
 const timeoutMs = Number(process.env.SMOKE_TIMEOUT_MS || 45000);
 const maxAttempts = Math.max(1, Number(process.env.SMOKE_MAX_ATTEMPTS || process.env.SMOKE_RETRIES || 5));
 const retryDelayMs = Math.max(0, Number(process.env.SMOKE_RETRY_DELAY_MS || 5000));
+const smokeUsername = process.env.SMOKE_USERNAME || '';
+const smokePassword = process.env.SMOKE_PASSWORD || '';
+const runJourney = process.env.SMOKE_RUN_JOURNEY !== 'false';
+const sessionCookieName = process.env.SMOKE_SESSION_COOKIE_NAME || 'xconfess_session';
+const journeyPath = process.env.SMOKE_JOURNEY_PATH || '/api/auth/me';
+const signInPath = process.env.SMOKE_SIGN_IN_PATH || '/api/auth/login';
+const signOutPath = process.env.SMOKE_SIGN_OUT_PATH || '/api/auth/logout';
+const expectedOrigin = process.env.SMOKE_EXPECTED_ORIGIN || frontendUrl;
+=======
 
 // Regional synthetic checks. Each region label is bounded to a small allowlist so
 // metrics stay low-cardinality and never carry user data or free-form input.
@@ -175,7 +184,59 @@ function assertObject(name, value) {
   }
 }
 
+function parseSetCookieHeaders(response) {
+  const raw = typeof response.headers.getSetCookie === 'function' ? response.headers.getSetCookie() : [];
+  if (raw.length > 0) return raw;
+  const combined = response.headers.get('set-cookie');
+  return combined ? [combined] : [];
+}
+
+function findSessionCookie(response) {
+  const cookies = parseSetCookieHeaders(response);
+  for (const cookie of cookies) {
+    const [pair] = cookie.split(';');
+    const eqIndex = pair.indexOf('=');
+    if (eqIndex === -1) continue;
+    const name = pair.slice(0, eqIndex).trim();
+    const value = pair.slice(eqIndex + 1).trim();
+    if (name === sessionCookieName && value) {
+      return { name, value, raw: cookie };
+    }
+  }
+  return null;
+}
+
+function assertSessionCookieAttributes(name, cookie) {
+  const lower = cookie.toLowerCase();
+  if (!/httponly/.test(lower)) {
+    throw new Error(`${name} session cookie is missing HttpOnly`);
+  }
+  if (!/samesite=(lax|strict|none)/.test(lower)) {
+    throw new Error(`${name} session cookie is missing SameSite`);
+  }
+  if (frontendUrl.startsWith('https://') && !/;\s*secure/.test(lower)) {
+    throw new Error(`${name} session cookie is missing Secure on an https deployment`);
+  }
+}
+
+function assertCorsHeaders(name, response) {
+  const allowOrigin = response.headers.get('access-control-allow-origin');
+  if (!allowOrigin) {
+    throw new Error(`${name} response is missing Access-Control-Allow-Origin`);
+  }
+  if (allowOrigin !== '*' && allowOrigin !== expectedOrigin) {
+    throw new Error(`${name} Access-Control-Allow-Origin ${allowOrigin} does not match expected origin ${expectedOrigin}`);
+  }
+  if (allowOrigin !== '*') {
+    const allowCredentials = response.headers.get('access-control-allow-credentials');
+    if (allowCredentials !== 'true') {
+      throw new Error(`${name} response is missing Access-Control-Allow-Credentials for a credentialed origin`);
+    }
+  }
+}
+
 function assertNoSensitiveKeys(name, value, path = '') {
+=======
   if (!value || typeof value !== 'object') return;
 
   const sensitiveKeys = new Set([
@@ -255,6 +316,12 @@ async function runRegionJourney(region) {
   await reporter.run(STEP_LABELS.frontendRegisterGuard, () =>
     request('frontend register method guard', joinUrl(bases.frontendUrl, '/api/users/register'), {}, [405]),
   );
+
+  if (runJourney) {
+    await verifyUserJourney();
+  } else {
+    console.log('user journey skipped; set SMOKE_RUN_JOURNEY=false only when credentials are unavailable');
+  }
 
   if (runMutation) {
     // Synthetic-only identity: disposable, non-routable example.com address and

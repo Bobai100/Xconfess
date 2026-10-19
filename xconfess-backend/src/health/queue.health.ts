@@ -14,6 +14,16 @@ interface QueueDetail {
   counts?: Record<string, number>;
   error?: string;
   latencyMs?: number;
+  /** Total jobs waiting to be processed (waiting + delayed + active). */
+  backlog?: number;
+  /** True when the queue has at least one worker attached. */
+  hasWorkers?: boolean;
+  /** True when the queue is expected to have workers but has none. */
+  missingWorkers?: boolean;
+  /** True when the queue is currently reporting a healthy state. */
+  recovered?: boolean;
+  /** True when the queue is in a degraded (high latency) state. */
+  degraded?: boolean;
 }
 
 /**
@@ -98,6 +108,9 @@ export class QueueHealthIndicator extends HealthIndicator {
     const latencyThreshold =
       this.configService.get<number>('REDIS_QUEUE_LATENCY_THRESHOLD_MS') || 250;
 
+    const backlogThreshold =
+      this.configService.get<number>('REDIS_QUEUE_BACKLOG_THRESHOLD') || 1000;
+
     const details: Record<string, QueueDetail> = {};
     let allHealthy = true;
 
@@ -114,19 +127,36 @@ export class QueueHealthIndicator extends HealthIndicator {
         const latencyMs = Date.now() - start;
 
         const workerCount = workers.length;
-        const hasWorkers = !requiresWorkers || workerCount > 0;
+        const hasWorkers = workerCount > 0;
+        const missingWorkers = requiresWorkers && !hasWorkers;
         const isDegraded = latencyMs >= latencyThreshold;
-        const healthy = hasWorkers && !isDegraded;
+
+        const backlog =
+          (counts.active ?? 0) +
+          (counts.waiting ?? 0) +
+          (counts.delayed ?? 0);
+        const backlogExceeded = backlog >= backlogThreshold;
+
+        const healthy = !missingWorkers && !isDegraded && !backlogExceeded;
 
         if (!healthy) {
           allHealthy = false;
         }
 
         details[name] = {
-          status: hasWorkers ? (isDegraded ? 'degraded' : 'up') : 'down',
+          status: missingWorkers
+            ? 'down'
+            : isDegraded || backlogExceeded
+              ? 'degraded'
+              : 'up',
           workers: workerCount,
+          hasWorkers,
+          missingWorkers,
           counts,
+          backlog,
           latencyMs,
+          degraded: isDegraded || backlogExceeded,
+          recovered: healthy,
         };
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
@@ -134,7 +164,13 @@ export class QueueHealthIndicator extends HealthIndicator {
           `Queue health check failed for "${name}": ${message}`,
         );
         allHealthy = false;
-        details[name] = { status: 'down', error: message };
+        details[name] = {
+          status: 'down',
+          error: message,
+          hasWorkers: false,
+          missingWorkers: requiresWorkers,
+          recovered: false,
+        };
       }
     }
 

@@ -261,6 +261,11 @@ function buildChecks({ mode, includeFullTests, includeSmoke }) {
     ],
     ['frontend build', 'npm', ['run', 'frontend:build']],
     ['contract env verification', 'npm', ['run', 'contracts:verify-env']],
+    [
+      'network isolation verification',
+      'npm',
+      ['run', 'contracts:verify-network-isolation'],
+    ],
     ['secret scanner self-test', 'npm', ['run', 'secret-scan:self-test']],
   ];
 
