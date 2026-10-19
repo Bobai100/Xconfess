@@ -118,44 +118,37 @@ export class ReactionService {
           anonymousUser,
         });
 
-        try {
-          const savedReaction = await reactionRepo.save(reaction);
+        const savedReaction = await reactionRepo.save(reaction);
 
-          await this.createOutboxEvent(
-            outboxRepo,
-            confession,
-            savedReaction,
-            'reaction_notification',
+        await this.createOutboxEvent(
+          outboxRepo,
+          confession,
+          savedReaction,
+          'reaction_notification',
+        );
+
+        return { reaction: savedReaction, isNew: true, isUpdate: false };
+      })
+      .catch(async (err) => {
+        // PostgreSQL marks a transaction as failed after a unique violation.
+        // Re-fetch only after TypeORM has rolled that transaction back.
+        if (err instanceof QueryFailedError && this.isUniqueViolation(err)) {
+          this.logger.debug(
+            `Race-condition duplicate detected for reaction ` +
+              `(confession=${dto.confessionId}, user=${anonymousUserId})`,
           );
+          const raceExisting = await this.reactionRepo.findOne({
+            where: {
+              confession: { id: dto.confessionId },
+              anonymousUser: { id: anonymousUserId },
+            },
+          });
 
-          return { reaction: savedReaction, isNew: true, isUpdate: false };
-        } catch (err) {
-          // Handle race condition: a concurrent request may have inserted the
-          // same reaction between our findOne and save. The DB unique
-          // constraint on (confession_id, anonymous_user_id) will reject the
-          // duplicate insert. In that case, re-fetch the existing row so the
-          // caller receives a stable idempotent response.
-          if (
-            err instanceof QueryFailedError &&
-            this.isUniqueViolation(err)
-          ) {
-            this.logger.debug(
-              `Race-condition duplicate detected for reaction ` +
-                `(confession=${dto.confessionId}, user=${anonymousUserId})`,
-            );
-            const raceExisting = await reactionRepo.findOne({
-              where: {
-                confession: { id: dto.confessionId },
-                anonymousUser: { id: anonymousUserId },
-              },
-            });
-
-            if (raceExisting) {
-              return { reaction: raceExisting, isNew: false, isUpdate: false };
-            }
+          if (raceExisting) {
+            return { reaction: raceExisting, isNew: false, isUpdate: false };
           }
-          throw err;
         }
+        throw err;
       })
       .then(async (result) => {
         // Invalidate analytics segments that are affected by a reaction change.
