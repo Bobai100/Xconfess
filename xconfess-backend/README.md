@@ -71,6 +71,15 @@ Concurrent transaction workers serialize sequence allocation per Stellar account
 - **Failure semantics**: if a lease cannot be acquired within the wait budget the submit is rejected with a retryable error rather than reusing a stale sequence.
 - **Tests**: `npm run backend:test && npm run contract:test:integration` cover multi-worker concurrency and recovery after process failure.
 
+## Language-aware moderation evaluation
+
+Admins can run the synthetic multilingual evaluation with `POST /api/admin/moderation/language-evaluation`. The route requires a valid JWT and the admin role. Its optional `languages`, `categories`, and `disparityThreshold` filters select a subset of supported evaluation data; omitted filters use the full corpus.
+
+- **Privacy**: the built-in corpus contains synthetic text only, with positive and negative samples for every supported language and moderation category. The response contains aggregate confusion-matrix metrics, including false-positive and false-negative rates by language and language/category pair; it does not include sample text or persist it.
+- **Provider use**: evaluation submits only the built-in synthetic samples through the configured moderation service. A run may issue one moderation request per selected sample and follows the moderation service's existing provider/fallback behavior.
+- **Failure behavior**: unsupported filters or filters with no matching samples return `400`. A thrown moderation error fails the request and does not cache a partial report.
+- **Configuration**: no additional environment variables are required. The disparity threshold defaults to `0.15` and can be set between `0` and `1`.
+
 <p align="center">
   <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
 </p>

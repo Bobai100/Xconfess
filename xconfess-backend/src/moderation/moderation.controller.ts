@@ -27,6 +27,8 @@ import { AiModerationService, ModerationStatus } from './ai-moderation.service';
 import { ModerationRepositoryService } from './moderation-repository.service';
 import { InvalidModerationTransitionError } from './moderation-state-machine';
 import { TransitionModerationDto } from './dtos/transition-moderation.dto';
+import { RunEvaluationDto } from './dtos/run-evaluation.dto';
+import { LanguageEvaluationService } from './language-evaluation.service';
 
 class TestModerationDto {
   content!: string;
@@ -50,7 +52,22 @@ export class ModerationController {
   constructor(
     private readonly aiModerationService: AiModerationService,
     private readonly moderationRepoService: ModerationRepositoryService,
+    private readonly languageEvaluationService: LanguageEvaluationService,
   ) {}
+
+  @Post('language-evaluation')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Run privacy-safe multilingual moderation evaluation (Admin only)',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Aggregate false-positive and false-negative metrics.',
+  })
+  @ApiResponse({ status: 400, description: 'Invalid evaluation filters.' })
+  async runLanguageEvaluation(@Body() dto: RunEvaluationDto) {
+    return this.languageEvaluationService.runEvaluation(dto);
+  }
 
   @Get('pending')
   @ApiOperation({ summary: 'Get pending moderation reviews (Admin only)' })

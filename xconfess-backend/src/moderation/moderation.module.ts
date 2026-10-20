@@ -14,6 +14,7 @@ import { ModerationEvidenceService } from './moderation-evidence.service';
 import { AnonymousConfession } from '../confession/entities/confession.entity';
 import { NotificationsModule as InAppNotificationModule } from '../notifications/notifications.module';
 import { AuditLogModule } from '../audit-log/audit-log.module';
+import { LanguageEvaluationService } from './language-evaluation.service';
 
 @Module({
   imports: [
@@ -28,8 +29,8 @@ import { AuditLogModule } from '../audit-log/audit-log.module';
     ModerationRepositoryService,
     ModerationEventsListener,
     ModerationEvidenceService,
+    LanguageEvaluationService,
   ],
   exports: [AiModerationService, ModerationRepositoryService, ModerationEvidenceService],
 })
 export class ModerationModule {}
-
