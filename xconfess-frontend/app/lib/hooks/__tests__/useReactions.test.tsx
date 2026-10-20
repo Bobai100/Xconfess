@@ -285,6 +285,136 @@ describe("useReactions", () => {
     expect(result.current.error?.message).toBe("Server error");
   });
 
+  it("refreshes authoritative counts after a conflict and does not retry the mutation", async () => {
+    const { queryClient, wrapper } = createTestHarness();
+    const { listKey, detailKey } = seedConfessionCache(queryClient);
+
+    mockAddReaction.mockResolvedValue({
+      ok: false,
+      error: { message: "Reaction changed elsewhere", code: "CONFLICT", status: 409 },
+    });
+    mockGetConfessionById.mockResolvedValue({
+      ok: true,
+      data: buildConfession({ like: 8, love: 4 }),
+    });
+
+    const { result } = renderHook(
+      () => useReactions({ initialCounts: { like: 2, love: 1 } }),
+      { wrapper },
+    );
+
+    let response: Awaited<ReturnType<typeof result.current.addReaction>> | undefined;
+    await act(async () => {
+      response = await result.current.addReaction("confession-1", "like");
+    });
+
+    expect(response?.ok).toBe(false);
+    expect(mockAddReaction).toHaveBeenCalledTimes(1);
+    expect(mockGetConfessionById).toHaveBeenCalledWith("confession-1");
+    expect(
+      queryClient.getQueryData<InfiniteData<GetConfessionsResult>>(listKey)
+        ?.pages[0].confessions[0].reactions,
+    ).toEqual({ like: 8, love: 4 });
+    expect(queryClient.getQueryData<GetConfessionByIdResult>(detailKey)?.reactions).toEqual({
+      like: 8,
+      love: 4,
+    });
+  });
+
+  it("does not refresh authoritative reaction state after an authorization failure", async () => {
+    const { wrapper } = createTestHarness();
+    mockAddReaction.mockResolvedValue({
+      ok: false,
+      error: { message: "Not authorized", code: "AUTH_ERROR", status: 403 },
+    });
+
+    const { result } = renderHook(
+      () => useReactions({ initialCounts: { like: 2, love: 1 } }),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.addReaction("confession-1", "like");
+    });
+
+    expect(mockGetConfessionById).not.toHaveBeenCalled();
+    expect(mockAddReaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes a conflict for an already-present reaction", async () => {
+    const { queryClient, wrapper } = createTestHarness();
+    const { detailKey } = seedConfessionCache(queryClient);
+    mockAddReaction.mockResolvedValue({
+      ok: false,
+      error: { message: "Reaction changed elsewhere", code: "CONFLICT", status: 409 },
+    });
+    mockGetConfessionById.mockResolvedValue({
+      ok: true,
+      data: buildConfession({ like: 6, love: 3 }),
+    });
+
+    const { result } = renderHook(
+      () => useReactions({
+        initialCounts: { like: 2, love: 1 },
+        initialUserReaction: "like",
+      }),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.addReaction("confession-1", "like");
+    });
+
+    expect(mockAddReaction).toHaveBeenCalledTimes(1);
+    expect(mockGetConfessionById).toHaveBeenCalledWith("confession-1");
+    expect(queryClient.getQueryData<GetConfessionByIdResult>(detailKey)?.reactions).toEqual({
+      like: 6,
+      love: 3,
+    });
+  });
+
+  it("rejects overlapping reaction submissions", async () => {
+    const { wrapper } = createTestHarness();
+    let resolveReaction:
+      | ((value: Awaited<ReturnType<typeof addReaction>>) => void)
+      | undefined;
+    mockAddReaction.mockReturnValue(
+      new Promise((resolve) => {
+        resolveReaction = resolve;
+      }),
+    );
+
+    const { result } = renderHook(
+      () => useReactions({ initialCounts: { like: 2, love: 1 } }),
+      { wrapper },
+    );
+    let firstSubmission!: Promise<Awaited<ReturnType<typeof result.current.addReaction>>>;
+
+    await act(async () => {
+      firstSubmission = result.current.addReaction("confession-1", "like");
+      await waitFor(() => expect(mockAddReaction).toHaveBeenCalledTimes(1));
+    });
+
+    let secondResponse: Awaited<ReturnType<typeof result.current.addReaction>> | undefined;
+    await act(async () => {
+      secondResponse = await result.current.addReaction("confession-1", "love");
+    });
+
+    expect(secondResponse).toEqual({
+      ok: false,
+      error: {
+        message: "A reaction is already being submitted.",
+        code: "MUTATION_IN_PROGRESS",
+      },
+    });
+    expect(mockAddReaction).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveReaction?.({ ok: true, data: { success: true, reactions: { like: 3, love: 1 } } });
+      await firstSubmission;
+    });
+  });
+
   it("shows rate limit error with retryAfter seconds available", async () => {
     const { queryClient, wrapper } = createTestHarness();
     const { listKey } = seedConfessionCache(queryClient);

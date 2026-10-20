@@ -246,6 +246,7 @@ export function useReactions(options: UseReactionsOptions = {}): UseReactionsRet
     useState<ReactionConnectionState>("disconnected");
   const hasConnectedRef = useRef(false);
   const localEventKeysRef = useRef(new Set<string>());
+  const requestInFlightRef = useRef(false);
 
   const initialLike = initialCounts?.like ?? 0;
   const initialLove = initialCounts?.love ?? 0;
@@ -263,20 +264,20 @@ export function useReactions(options: UseReactionsOptions = {}): UseReactionsRet
     [queryClient],
   );
 
-  const refreshReactionCounts = useCallback(async () => {
-    if (!confessionId) {
+  const refreshReactionCounts = useCallback(async (targetConfessionId = confessionId) => {
+    if (!targetConfessionId) {
       return;
     }
-    const response = await getConfessionById(confessionId);
+    const response = await getConfessionById(targetConfessionId);
     if (!response.ok) {
       // We don't know what the current counts are — fall back to a broad
       // invalidation so any visible surfaces refetch from the server.
-      queryClient.invalidateQueries({ queryKey: queryKeys.confessions.all });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.confessions.all });
       return;
     }
     const serverCounts = normalizeCounts(response.data.reactions);
     setLiveCounts(serverCounts);
-    patchReactionCounts(confessionId, serverCounts);
+    patchReactionCounts(targetConfessionId, serverCounts);
   }, [confessionId, patchReactionCounts, queryClient]);
 
   const applyGatewayEvent = useCallback(
@@ -447,7 +448,7 @@ export function useReactions(options: UseReactionsOptions = {}): UseReactionsRet
     },
 
     // Called if mutation fails
-    onError: (error, _variables, context) => {
+    onError: async (error, variables, context) => {
       // Set error state
       setLocalError(error as Error);
 
@@ -457,6 +458,10 @@ export function useReactions(options: UseReactionsOptions = {}): UseReactionsRet
       // Clear optimistic state
       setOptimisticState(null);
       setLiveCounts(normalizeCounts(initialCounts));
+
+      if ((error as ReactionMutationError).apiError?.status === 409) {
+        await refreshReactionCounts(variables.confessionId);
+      }
 
       // Call error callback
       if (onError) {
@@ -503,11 +508,27 @@ export function useReactions(options: UseReactionsOptions = {}): UseReactionsRet
     confessionId: string,
     type: ReactionType
   ): Promise<AddReactionResponse> => {
+    if (requestInFlightRef.current) {
+      return {
+        ok: false,
+        error: {
+          message: "A reaction is already being submitted.",
+          code: "MUTATION_IN_PROGRESS",
+        },
+      };
+    }
+    requestInFlightRef.current = true;
+
+    try {
     // If user already has this reaction, skip optimistic update (no count change expected)
     const alreadyReacted = initialUserReaction === type;
     if (alreadyReacted) {
       // Still call the API to get the latest state, but don't optimistically update
       const result = await addReaction(confessionId, type);
+
+      if (!result.ok && result.error.status === 409) {
+        await refreshReactionCounts(confessionId);
+      }
 
       // Backend returns success with existing reaction (no change)
       // We don't need to do anything special here - the UI already shows the correct state
@@ -524,7 +545,6 @@ export function useReactions(options: UseReactionsOptions = {}): UseReactionsRet
       return result;
     }
 
-    try {
       const result = await mutation.mutateAsync({ confessionId, type });
 
       if (onSuccess) {
@@ -545,8 +565,10 @@ export function useReactions(options: UseReactionsOptions = {}): UseReactionsRet
           code: "MUTATION_ERROR",
         },
       };
+    } finally {
+      requestInFlightRef.current = false;
     }
-  }, [mutation, onSuccess, initialUserReaction, patchReactionCounts]);
+  }, [mutation, onSuccess, initialUserReaction, patchReactionCounts, refreshReactionCounts]);
 
   const handleRemoveReaction = useCallback(async (
     _confessionId: string,

@@ -214,4 +214,118 @@ describe("useCreateCommentMutation", () => {
     expect(rolledBackDetail?.commentCount).toBe(2);
     expect(rolledBackList?.pages[0].confessions[0].commentCount).toBe(2);
   });
+
+  it("invalidates authoritative comment and confession state after a conflict", async () => {
+    const { queryClient, wrapper } = createTestHarness();
+    const { commentsKey, listKey, detailKey } = seedCache(queryClient);
+    const invalidateSpy = jest.spyOn(queryClient, "invalidateQueries");
+
+    mockCreateComment.mockResolvedValue({
+      ok: false,
+      error: { message: "Comments changed elsewhere", code: "CONFLICT", status: 409 },
+    });
+
+    const { result } = renderHook(
+      () => useCreateCommentMutation("confession-1"),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await expect(
+        result.current.mutateAsync({ content: "Keep this draft", parentId: null }),
+      ).rejects.toThrow("Comments changed elsewhere");
+    });
+
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: commentsKey,
+      exact: true,
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.confessions.all });
+    expect(
+      queryClient.getQueryData<InfiniteData<GetCommentsResult>>(commentsKey)
+        ?.pages[0].comments,
+    ).toHaveLength(1);
+    expect(
+      queryClient.getQueryData<{ commentCount: number }>(detailKey)?.commentCount,
+    ).toBe(2);
+    expect(
+      queryClient.getQueryData<InfiniteData<GetConfessionsResult>>(listKey)
+        ?.pages[0].confessions[0].commentCount,
+    ).toBe(2);
+  });
+
+  it("does not refresh comments after an authorization failure", async () => {
+    const { queryClient, wrapper } = createTestHarness();
+    const { commentsKey } = seedCache(queryClient);
+    const invalidateSpy = jest.spyOn(queryClient, "invalidateQueries");
+
+    mockCreateComment.mockResolvedValue({
+      ok: false,
+      error: { message: "Not authorized", code: "AUTH_ERROR", status: 403 },
+    });
+
+    const { result } = renderHook(
+      () => useCreateCommentMutation("confession-1"),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await expect(
+        result.current.mutateAsync({ content: "Preserve this draft", parentId: null }),
+      ).rejects.toThrow("Not authorized");
+    });
+
+    expect(invalidateSpy).not.toHaveBeenCalled();
+    expect(
+      queryClient.getQueryData<InfiniteData<GetCommentsResult>>(commentsKey)
+        ?.pages[0].comments,
+    ).toHaveLength(1);
+  });
+
+  it("rejects duplicate comment submissions while the first request is pending", async () => {
+    const { wrapper } = createTestHarness();
+    let resolveComment:
+      | ((value: Awaited<ReturnType<typeof createComment>>) => void)
+      | undefined;
+    mockCreateComment.mockReturnValue(
+      new Promise((resolve) => {
+        resolveComment = resolve;
+      }),
+    );
+
+    const { result } = renderHook(
+      () => useCreateCommentMutation("confession-1"),
+      { wrapper },
+    );
+    let firstSubmission!: Promise<unknown>;
+
+    await act(async () => {
+      firstSubmission = result.current.mutateAsync({ content: "First", parentId: null });
+      await waitFor(() => expect(mockCreateComment).toHaveBeenCalledTimes(1));
+    });
+
+    await act(async () => {
+      await expect(
+        result.current.mutateAsync({ content: "Second", parentId: null }),
+      ).rejects.toThrow("A comment is already being submitted.");
+    });
+
+    expect(mockCreateComment).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveComment?.({
+        ok: true,
+        data: {
+          id: 100,
+          content: "First",
+          createdAt: "2026-04-23T01:00:00.000Z",
+          author: "Anonymous",
+          confessionId: "confession-1",
+          parentId: null,
+          replies: [],
+        },
+      });
+      await firstSubmission;
+    });
+  });
 });

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import type { InfiniteData } from "@tanstack/react-query";
 import {
   useInfiniteQuery,
@@ -19,9 +19,11 @@ import {
   updateConfessionQueries,
 } from "@/app/lib/api/confessionCache";
 import { queryKeys } from "@/app/lib/api/queryKeys";
+import type { ApiError } from "@/app/lib/api/errors";
 import type { Comment } from "@/app/lib/types/confession";
 
 const DEFAULT_LIMIT = 10;
+type CommentMutationError = Error & { apiError?: ApiError };
 
 function ensureCommentPages(
   data: InfiniteData<GetCommentsResult> | undefined,
@@ -130,60 +132,86 @@ export function useCommentsQuery(confessionId: string, limit = DEFAULT_LIMIT) {
 
 export function useCreateCommentMutation(confessionId: string) {
   const queryClient = useQueryClient();
+  const requestInFlightRef = useRef(false);
 
   return useMutation({
     mutationFn: async (variables: CreateCommentParams) => {
       const result = await createComment(confessionId, variables);
 
       if (!result.ok) {
-        throw new Error(result.error.message);
+        const error = new Error(result.error.message) as CommentMutationError;
+        error.apiError = result.error;
+        throw error;
       }
 
       return result.data;
     },
     onMutate: async (variables) => {
-      await queryClient.cancelQueries({
-        queryKey: queryKeys.comments.byConfession(confessionId),
-      });
+      if (requestInFlightRef.current) {
+        throw new Error("A comment is already being submitted.");
+      }
+      requestInFlightRef.current = true;
 
-      const previousComments = queryClient.getQueryData<
-        InfiniteData<GetCommentsResult>
-      >(queryKeys.comments.byConfession(confessionId));
-      const previousConfessionQueries = snapshotConfessionQueries(queryClient);
+      try {
+        await queryClient.cancelQueries({
+          queryKey: queryKeys.comments.byConfession(confessionId),
+        });
 
-      const optimisticComment: Comment = {
-        id: -Date.now(),
-        content: variables.content.trim(),
-        createdAt: new Date().toISOString(),
-        author: "You",
-        confessionId,
-        parentId: variables.parentId ?? null,
-        replies: [],
-        isOptimistic: true,
-      };
+        const previousComments = queryClient.getQueryData<
+          InfiniteData<GetCommentsResult>
+        >(queryKeys.comments.byConfession(confessionId));
+        const previousConfessionQueries = snapshotConfessionQueries(queryClient);
 
-      queryClient.setQueryData<InfiniteData<GetCommentsResult>>(
-        queryKeys.comments.byConfession(confessionId),
-        (current) => upsertOptimisticComment(current, optimisticComment),
-      );
+        const optimisticComment: Comment = {
+          id: -Date.now(),
+          content: variables.content.trim(),
+          createdAt: new Date().toISOString(),
+          author: "You",
+          confessionId,
+          parentId: variables.parentId ?? null,
+          replies: [],
+          isOptimistic: true,
+        };
 
-      updateConfessionQueries(queryClient, confessionId, (confession) => ({
-        ...confession,
-        commentCount: (confession.commentCount ?? 0) + 1,
-      }));
+        queryClient.setQueryData<InfiniteData<GetCommentsResult>>(
+          queryKeys.comments.byConfession(confessionId),
+          (current) => upsertOptimisticComment(current, optimisticComment),
+        );
 
-      return {
-        optimisticCommentId: optimisticComment.id,
-        previousComments,
-        previousConfessionQueries,
-      };
+        updateConfessionQueries(queryClient, confessionId, (confession) => ({
+          ...confession,
+          commentCount: (confession.commentCount ?? 0) + 1,
+        }));
+
+        return {
+          ownsInFlight: true,
+          optimisticCommentId: optimisticComment.id,
+          previousComments,
+          previousConfessionQueries,
+        };
+      } catch (error) {
+        requestInFlightRef.current = false;
+        throw error;
+      }
     },
-    onError: (_error, _variables, context) => {
+    onError: async (error, _variables, context) => {
       queryClient.setQueryData(
         queryKeys.comments.byConfession(confessionId),
         context?.previousComments,
       );
       restoreQuerySnapshots(queryClient, context?.previousConfessionQueries);
+
+      if ((error as CommentMutationError).apiError?.status === 409) {
+        await Promise.all([
+          queryClient.invalidateQueries({
+            queryKey: queryKeys.comments.byConfession(confessionId),
+            exact: true,
+          }),
+          queryClient.invalidateQueries({
+            queryKey: queryKeys.confessions.all,
+          }),
+        ]);
+      }
     },
     onSuccess: (comment, _variables, context) => {
       queryClient.setQueryData<InfiniteData<GetCommentsResult>>(
@@ -196,6 +224,11 @@ export function useCreateCommentMutation(confessionId: string) {
         queryKey: queryKeys.comments.byConfession(confessionId),
         exact: true,
       });
+    },
+    onSettled: (_comment, _error, _variables, context) => {
+      if (context?.ownsInFlight) {
+        requestInFlightRef.current = false;
+      }
     },
   });
 }
