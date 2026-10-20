@@ -1,3 +1,4 @@
+import { BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   AiModerationService,
@@ -41,5 +42,22 @@ describe('AiModerationService', () => {
 
     expect(result.status).toBe(ModerationStatus.APPROVED);
     expect(result.requiresReview).toBe(false);
+  });
+
+  it('applies only valid runtime thresholds', () => {
+    const service = createService();
+    service.updateThresholds(0.9, 0.7);
+
+    expect(service.getConfiguration()).toMatchObject({
+      highThreshold: 0.9,
+      mediumThreshold: 0.7,
+    });
+    expect(() => service.updateThresholds(0.6, 0.7)).toThrow(
+      BadRequestException,
+    );
+    expect(service.getConfiguration()).toMatchObject({
+      highThreshold: 0.9,
+      mediumThreshold: 0.7,
+    });
   });
 });

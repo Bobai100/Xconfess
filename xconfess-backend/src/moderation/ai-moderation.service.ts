@@ -1,5 +1,5 @@
 // src/moderation/ai-moderation.service.ts
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
 
@@ -35,8 +35,8 @@ export class AiModerationService {
   private readonly logger = new Logger(AiModerationService.name);
   private readonly openAiApiKey: string;
   private readonly perspectiveApiKey: string;
-  private readonly highThreshold: number;
-  private readonly mediumThreshold: number;
+  private highThreshold: number;
+  private mediumThreshold: number;
   private readonly enabledCategories: ModerationCategory[];
   private readonly autoActionEnabled: boolean;
   private requestCount = 0;
@@ -277,6 +277,14 @@ export class AiModerationService {
       score = Math.max(score, hateScore);
     }
 
+    /**
+     * Score a synthetic fixture with the local rule-based evaluator only.
+     * This deliberately avoids provider calls and moderation side effects.
+     */
+    scoreOffline(content: string): number {
+      return this.fallbackModeration(content).score;
+    }
+
     const selfHarmPatterns = [
       'kill myself',
       'suicide',
@@ -364,9 +372,22 @@ export class AiModerationService {
   }
 
   updateThresholds(high: number, medium: number): void {
-    if (high > 0 && high <= 1 && medium > 0 && medium <= 1 && medium < high) {
-      this.logger.log(`Thresholds updated: high=${high}, medium=${medium}`);
+    if (
+      !Number.isFinite(high) ||
+      !Number.isFinite(medium) ||
+      high <= 0 ||
+      high > 1 ||
+      medium <= 0 ||
+      medium >= high
+    ) {
+      throw new BadRequestException(
+        'Thresholds must satisfy 0 < medium < high <= 1.',
+      );
     }
+
+    this.highThreshold = high;
+    this.mediumThreshold = medium;
+    this.logger.log(`Thresholds updated: high=${high}, medium=${medium}`);
   }
 
   getConfiguration() {

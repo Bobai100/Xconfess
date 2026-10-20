@@ -1,8 +1,15 @@
 // src/moderation/language-evaluation.service.ts
-import { BadRequestException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+} from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import {
   AiModerationService,
   ModerationCategory,
+  ModerationStatus,
 } from './ai-moderation.service';
 import {
   EvaluationCorpusItem,
@@ -23,11 +30,171 @@ export interface RunEvaluationOptions {
   customCorpus?: EvaluationCorpusItem[];
 }
 
+export interface ModerationThresholds {
+  highThreshold: number;
+  mediumThreshold: number;
+}
+
+export interface PolicyImpactPreview {
+  previewId: string;
+  evaluatedAt: string;
+  fixtureCount: number;
+  changedCount: number;
+  unchangedCount: number;
+  transitions: Record<string, number>;
+  baselineThresholds: ModerationThresholds;
+  proposedThresholds: ModerationThresholds;
+}
+
+interface PendingPolicyPreview {
+  previewId: string;
+  baselineThresholds: ModerationThresholds;
+  proposedThresholds: ModerationThresholds;
+  expiresAt: number;
+}
+
 @Injectable()
 export class LanguageEvaluationService {
   private cachedReport: MultilingualEvaluationReport | null = null;
+  private pendingPolicyPreview: PendingPolicyPreview | null = null;
 
   constructor(private readonly aiModerationService: AiModerationService) {}
+
+  /**
+   * Compare current and proposed thresholds against the checked-in synthetic
+   * corpus using local scoring only. The preview contains aggregate outcomes.
+   */
+  previewPolicyImpact(
+    proposedThresholds: ModerationThresholds,
+  ): PolicyImpactPreview {
+    this.validateThresholds(proposedThresholds);
+    const configuration = this.aiModerationService.getConfiguration();
+    const baselineThresholds = {
+      highThreshold: configuration.highThreshold,
+      mediumThreshold: configuration.mediumThreshold,
+    };
+    this.validateThresholds(baselineThresholds);
+    const transitions: Record<string, number> = {};
+    let changedCount = 0;
+
+    for (const fixture of DEFAULT_MULTILINGUAL_CORPUS) {
+      const score = this.aiModerationService.scoreOffline(fixture.text);
+      const before = this.classifyOfflineScore(
+        score,
+        baselineThresholds,
+        configuration.autoActionEnabled,
+      );
+      const after = this.classifyOfflineScore(
+        score,
+        proposedThresholds,
+        configuration.autoActionEnabled,
+      );
+      if (before !== after) {
+        changedCount += 1;
+        const key = `${before}->${after}`;
+        transitions[key] = (transitions[key] ?? 0) + 1;
+      }
+    }
+
+    const previewId = randomUUID();
+    this.pendingPolicyPreview = {
+      previewId,
+      baselineThresholds,
+      proposedThresholds: { ...proposedThresholds },
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    };
+
+    return {
+      previewId,
+      evaluatedAt: new Date().toISOString(),
+      fixtureCount: DEFAULT_MULTILINGUAL_CORPUS.length,
+      changedCount,
+      unchangedCount: DEFAULT_MULTILINGUAL_CORPUS.length - changedCount,
+      transitions,
+      baselineThresholds,
+      proposedThresholds: { ...proposedThresholds },
+    };
+  }
+
+  /**
+   * Apply only the exact, unexpired preview that an admin explicitly approved.
+   */
+  approvePolicyImpact(options: {
+    previewId: string;
+    approved: boolean;
+    proposedThresholds: ModerationThresholds;
+  }): ModerationThresholds {
+    if (options.approved !== true) {
+      throw new ForbiddenException('Policy rollout requires explicit approval.');
+    }
+    this.validateThresholds(options.proposedThresholds);
+
+    const pending = this.pendingPolicyPreview;
+    if (!pending || pending.previewId !== options.previewId) {
+      throw new ConflictException('No matching policy impact preview is pending.');
+    }
+    if (pending.expiresAt <= Date.now()) {
+      this.pendingPolicyPreview = null;
+      throw new ConflictException(
+        'Policy impact preview has expired; run a new preview.',
+      );
+    }
+    if (
+      pending.proposedThresholds.highThreshold !==
+        options.proposedThresholds.highThreshold ||
+      pending.proposedThresholds.mediumThreshold !==
+        options.proposedThresholds.mediumThreshold
+    ) {
+      throw new ConflictException(
+        'Approved thresholds do not match the previewed policy.',
+      );
+    }
+
+    const current = this.aiModerationService.getConfiguration();
+    if (
+      current.highThreshold !== pending.baselineThresholds.highThreshold ||
+      current.mediumThreshold !== pending.baselineThresholds.mediumThreshold
+    ) {
+      this.pendingPolicyPreview = null;
+      throw new ConflictException(
+        'The active policy changed after preview; run a new preview.',
+      );
+    }
+
+    this.aiModerationService.updateThresholds(
+      pending.proposedThresholds.highThreshold,
+      pending.proposedThresholds.mediumThreshold,
+    );
+    this.pendingPolicyPreview = null;
+    return pending.proposedThresholds;
+  }
+
+  private validateThresholds(thresholds: ModerationThresholds): void {
+    if (
+      !thresholds ||
+      !Number.isFinite(thresholds.highThreshold) ||
+      !Number.isFinite(thresholds.mediumThreshold) ||
+      thresholds.highThreshold <= 0 ||
+      thresholds.highThreshold > 1 ||
+      thresholds.mediumThreshold <= 0 ||
+      thresholds.mediumThreshold >= thresholds.highThreshold
+    ) {
+      throw new BadRequestException(
+        'Thresholds must satisfy 0 < medium < high <= 1.',
+      );
+    }
+  }
+
+  private classifyOfflineScore(
+    score: number,
+    thresholds: ModerationThresholds,
+    autoActionEnabled: boolean,
+  ): ModerationStatus {
+    if (!autoActionEnabled) return ModerationStatus.PENDING;
+    if (score >= thresholds.highThreshold) return ModerationStatus.REJECTED;
+    if (score >= thresholds.mediumThreshold) return ModerationStatus.FLAGGED;
+    return ModerationStatus.APPROVED;
+  }
 
   /**
    * Run privacy-safe multilingual evaluation across specified languages and categories.

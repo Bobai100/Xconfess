@@ -16,9 +16,16 @@ import { RunEvaluationDto } from './dtos/run-evaluation.dto';
 describe('ModerationController language evaluation', () => {
   let controller: ModerationController;
   let runEvaluation: jest.Mock;
+  let previewPolicyImpact: jest.Mock;
+  let approvePolicyImpact: jest.Mock;
 
   beforeEach(async () => {
     runEvaluation = jest.fn().mockResolvedValue({ totalSamples: 1 });
+    previewPolicyImpact = jest.fn().mockReturnValue({ fixtureCount: 1 });
+    approvePolicyImpact = jest.fn().mockReturnValue({
+      highThreshold: 0.9,
+      mediumThreshold: 0.7,
+    });
     const module: TestingModule = await Test.createTestingModule({
       controllers: [ModerationController],
       providers: [
@@ -26,12 +33,37 @@ describe('ModerationController language evaluation', () => {
         { provide: ModerationRepositoryService, useValue: {} },
         {
           provide: LanguageEvaluationService,
-          useValue: { runEvaluation },
+          useValue: { runEvaluation, previewPolicyImpact, approvePolicyImpact },
         },
       ],
     }).compile();
 
     controller = module.get(ModerationController);
+  });
+
+  it('routes threshold previews and explicit approvals through the evaluation service', () => {
+    const proposal = { highThreshold: 0.9, mediumThreshold: 0.7 };
+    const preview = controller.previewPolicyImpact(proposal);
+
+    expect(previewPolicyImpact).toHaveBeenCalledWith(proposal);
+    expect(
+      Reflect.getMetadata(
+        PATH_METADATA,
+        ModerationController.prototype.previewPolicyImpact,
+      ),
+    ).toBe('policy-impact-preview');
+    expect(
+      controller.updateThresholds({
+        ...proposal,
+        approved: true,
+        previewId: '8c0af69e-4ed3-47aa-9df5-0bd49f51e084',
+      }),
+    ).toMatchObject({ thresholds: proposal });
+    expect(approvePolicyImpact).toHaveBeenCalledWith({
+      previewId: '8c0af69e-4ed3-47aa-9df5-0bd49f51e084',
+      approved: true,
+      proposedThresholds: proposal,
+    });
   });
 
   it('exposes evaluation only on the authenticated admin moderation controller', async () => {

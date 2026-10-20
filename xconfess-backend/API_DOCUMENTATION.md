@@ -348,6 +348,7 @@ The following list matches active `@Controller(...)` + method decorators.
 | GET | `/api/admin/moderation/stats` |
 | GET | `/api/admin/moderation/accuracy` |
 | GET | `/api/admin/moderation/config` |
+| POST | `/api/admin/moderation/policy-impact-preview` |
 | POST | `/api/admin/moderation/config/thresholds` |
 | POST | `/api/admin/moderation/test` |
 | GET | `/api/admin/moderation/confession/:confessionId` |
@@ -382,6 +383,10 @@ The following list matches active `@Controller(...)` + method decorators.
 | GET | `/api/confessions/:id/tips/stats` |
 | POST | `/api/confessions/:id/tips/verify` |
 | GET | `/api/data-export/download/:id` |
+
+### Moderation policy impact approval
+
+`POST /api/admin/moderation/policy-impact-preview` accepts `highThreshold` and `mediumThreshold` and returns an aggregate-only preview with a one-time `previewId`. The preview uses the local scorer and synthetic fixture corpus. To apply it, `POST /api/admin/moderation/config/thresholds` must include the same thresholds, that `previewId`, and `"approved": true`. The approval is valid for 10 minutes and fails if the active thresholds changed or another preview replaced it. Both routes require an admin JWT.
 
 ## Removed legacy assumptions from older docs
 

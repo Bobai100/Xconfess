@@ -40,6 +40,13 @@ describe('LanguageEvaluationService', () => {
           requiresReview: false,
         });
       }),
+      getConfiguration: jest.fn().mockReturnValue({
+        highThreshold: 0.8,
+        mediumThreshold: 0.5,
+        autoActionEnabled: true,
+      }),
+      scoreOffline: jest.fn().mockReturnValue(0.6),
+      updateThresholds: jest.fn(),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -54,6 +61,121 @@ describe('LanguageEvaluationService', () => {
 
     service = module.get<LanguageEvaluationService>(LanguageEvaluationService);
     aiModerationService = module.get(AiModerationService);
+  });
+
+  describe('policy impact preview and approval', () => {
+    it('compares aggregate outcomes locally without calling moderation providers', () => {
+      const report = service.previewPolicyImpact({
+        highThreshold: 0.9,
+        mediumThreshold: 0.7,
+      });
+
+      expect(report.fixtureCount).toBe(DEFAULT_MULTILINGUAL_CORPUS.length);
+      expect(report.changedCount).toBe(report.fixtureCount);
+      expect(report.unchangedCount).toBe(0);
+      expect(report.transitions).toEqual({
+        [`${ModerationStatus.FLAGGED}->${ModerationStatus.APPROVED}`]:
+          report.fixtureCount,
+      });
+      expect(aiModerationService.scoreOffline).toHaveBeenCalledTimes(
+        report.fixtureCount,
+      );
+      expect(aiModerationService.moderateContent).not.toHaveBeenCalled();
+      expect(JSON.stringify(report)).not.toContain(
+        DEFAULT_MULTILINGUAL_CORPUS[0].text,
+      );
+    });
+
+    it('rejects rollout without explicit approval and leaves thresholds unchanged', () => {
+      const preview = service.previewPolicyImpact({
+        highThreshold: 0.9,
+        mediumThreshold: 0.7,
+      });
+
+      expect(() =>
+        service.approvePolicyImpact({
+          previewId: preview.previewId,
+          approved: false,
+          proposedThresholds: {
+            highThreshold: 0.9,
+            mediumThreshold: 0.7,
+          },
+        }),
+      ).toThrow('Policy rollout requires explicit approval.');
+      expect(aiModerationService.updateThresholds).not.toHaveBeenCalled();
+    });
+
+    it('applies only matching approval once', () => {
+      const proposedThresholds = {
+        highThreshold: 0.9,
+        mediumThreshold: 0.7,
+      };
+      const preview = service.previewPolicyImpact(proposedThresholds);
+
+      expect(
+        service.approvePolicyImpact({
+          previewId: preview.previewId,
+          approved: true,
+          proposedThresholds,
+        }),
+      ).toEqual(proposedThresholds);
+      expect(aiModerationService.updateThresholds).toHaveBeenCalledWith(0.9, 0.7);
+      expect(() =>
+        service.approvePolicyImpact({
+          previewId: preview.previewId,
+          approved: true,
+          proposedThresholds,
+        }),
+      ).toThrow('No matching policy impact preview is pending.');
+    });
+
+    it('rejects changed proposals and invalid thresholds', () => {
+      const preview = service.previewPolicyImpact({
+        highThreshold: 0.9,
+        mediumThreshold: 0.7,
+      });
+
+      expect(() =>
+        service.approvePolicyImpact({
+          previewId: preview.previewId,
+          approved: true,
+          proposedThresholds: {
+            highThreshold: 0.95,
+            mediumThreshold: 0.7,
+          },
+        }),
+      ).toThrow('Approved thresholds do not match the previewed policy.');
+      expect(() =>
+        service.previewPolicyImpact({
+          highThreshold: 0.4,
+          mediumThreshold: 0.5,
+        }),
+      ).toThrow(BadRequestException);
+      expect(aiModerationService.updateThresholds).not.toHaveBeenCalled();
+    });
+
+    it('rejects approval when the active policy changed after preview', () => {
+      const proposedThresholds = {
+        highThreshold: 0.9,
+        mediumThreshold: 0.7,
+      };
+      const preview = service.previewPolicyImpact(proposedThresholds);
+      aiModerationService.getConfiguration
+        .mockReturnValueOnce({
+          highThreshold: 0.85,
+          mediumThreshold: 0.5,
+          autoActionEnabled: true,
+        });
+
+      expect(() =>
+        service.approvePolicyImpact({
+          previewId: preview.previewId,
+          approved: true,
+          proposedThresholds,
+        }),
+      ).toThrow('The active policy changed after preview; run a new preview.');
+      expect(aiModerationService.updateThresholds).not.toHaveBeenCalled();
+    });
   });
 
   describe('runEvaluation (expected path)', () => {

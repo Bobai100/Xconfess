@@ -80,6 +80,14 @@ Admins can run the synthetic multilingual evaluation with `POST /api/admin/moder
 - **Failure behavior**: unsupported filters or filters with no matching samples return `400`. A thrown moderation error fails the request and does not cache a partial report.
 - **Configuration**: no additional environment variables are required. The disparity threshold defaults to `0.15` and can be set between `0` and `1`.
 
+## Moderation policy impact preview and rollout
+
+An admin can preview threshold changes with `POST /api/admin/moderation/policy-impact-preview`, sending `highThreshold` and `mediumThreshold` values. The preview compares current and proposed decisions against the checked-in synthetic moderation corpus and returns aggregate decision-transition counts only. It uses the local rule-based scorer; it does not call moderation providers, read existing user content, or persist fixture text. Thresholds must satisfy `0 < mediumThreshold < highThreshold <= 1`.
+
+Applying a change uses `POST /api/admin/moderation/config/thresholds` with the same thresholds, the returned `previewId`, and `"approved": true`. The admin JWT and role guard protects both endpoints. The preview ID is one-time, expires after 10 minutes, and is invalidated if another preview is created or the active thresholds change. A missing, expired, stale, or mismatched preview fails rather than applying the proposal.
+
+Approved thresholds take effect in memory for the current backend process. `MODERATION_HIGH_THRESHOLD` and `MODERATION_MEDIUM_THRESHOLD` remain the startup baseline, so a process restart restores the configured values. In multi-instance deployments, route preview and approval to the same instance; otherwise approval fails closed if that instance has no matching preview.
+
 <p align="center">
   <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
 </p>
