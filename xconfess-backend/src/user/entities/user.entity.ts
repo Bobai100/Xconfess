@@ -30,6 +30,8 @@ export interface PrivacySettings {
   showReactions: boolean;
   /** GDPR-style flag; defaults true when absent in stored JSON */
   dataProcessingConsent?: boolean;
+  /** Start sensitive-content warnings collapsed; defaults true. */
+  contentWarningsCollapsed?: boolean;
   blockedUserIds?: number[];
   mutedUserIds?: number[];
 }

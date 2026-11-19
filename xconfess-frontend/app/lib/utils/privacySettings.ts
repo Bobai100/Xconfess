@@ -3,6 +3,7 @@ export interface PrivacySettings {
   canReceiveReplies: boolean;
   showReactions: boolean;
   dataProcessingConsent: boolean;
+  contentWarningsCollapsed?: boolean;
 }
 
 export const PRIVACY_SETTING_KEYS: (keyof PrivacySettings)[] = [
@@ -10,6 +11,7 @@ export const PRIVACY_SETTING_KEYS: (keyof PrivacySettings)[] = [
   'canReceiveReplies',
   'showReactions',
   'dataProcessingConsent',
+  'contentWarningsCollapsed',
 ];
 
 export function mergePrivacySettingsAfterConflict(

@@ -17,6 +17,7 @@ import {
   RANKING_QUALITY_RETENTION_LIMITS,
   RankingQualityAggregate,
   RankingQualityRetentionViolation,
+  RetentionPolicyPreview,
 } from './retention-policy.types';
 
 @Injectable()
@@ -33,6 +34,93 @@ export class RetentionService {
 
   getPolicies(): RetentionPolicy[] {
     return Object.values(DOMAIN_RETENTION_POLICIES);
+  }
+
+  async simulateRetentionPolicy(
+    domain: RetentionDomain,
+    proposed: { ttlDays: number; action: 'delete' | 'anonymize' },
+    limit = 100,
+    executedBy = 'system',
+  ): Promise<RetentionPolicyPreview> {
+    if (!DOMAIN_RETENTION_POLICIES[domain]) {
+      throw new BadRequestException(`Unknown retention domain: ${domain}`);
+    }
+    if (
+      !Number.isInteger(proposed.ttlDays) ||
+      proposed.ttlDays < 1 ||
+      proposed.ttlDays > 3650
+    ) {
+      throw new BadRequestException('ttlDays must be an integer between 1 and 3650');
+    }
+    if (proposed.action !== 'delete' && proposed.action !== 'anonymize') {
+      throw new BadRequestException('action must be delete or anonymize');
+    }
+
+    const boundedLimit = Math.min(Math.max(Number(limit) || 100, 1), 1000);
+    const cutoffDate = new Date(
+      Date.now() - proposed.ttlDays * 24 * 60 * 60 * 1000,
+    );
+    const tableMap: Record<RetentionDomain, string> = {
+      messages: 'messages',
+      logs: 'audit_logs',
+      exports: 'export_requests',
+      analytics: 'analytics_events',
+      moderation_evidence: 'moderation_logs',
+    };
+    const table = tableMap[domain];
+    let affectedCount = 0;
+    let heldCount = 0;
+
+    try {
+      const rows: Array<{ id: string }> = await this.dataSource.query(
+        `SELECT id FROM "${table}" WHERE "created_at" < $1 LIMIT $2`,
+        [cutoffDate, boundedLimit + 1],
+      );
+      const heldEntityIds = new Set(
+        (await this.legalHoldRepo.find({ where: { domain } })).map((hold) =>
+          hold.entityId,
+        ),
+      );
+      heldCount = rows.filter((row) => heldEntityIds.has(String(row.id))).length;
+      affectedCount = rows.filter((row) => !heldEntityIds.has(String(row.id))).length;
+      if (affectedCount > boundedLimit) affectedCount = boundedLimit;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`Retention preview skipped on table ${table}: ${msg}`);
+    }
+
+    const preview: RetentionPolicyPreview = {
+      domain,
+      proposedTtlDays: proposed.ttlDays,
+      proposedAction: proposed.action,
+      cutoffDate: cutoffDate.toISOString(),
+      dryRun: true,
+      boundedLimit,
+      truncated: affectedCount >= boundedLimit,
+      recordClasses: [{ table, affectedCount }],
+      affectedRecordCount: affectedCount,
+      heldCount,
+      executedBy,
+      timestamp: new Date().toISOString(),
+    };
+
+    await this.auditLogRepo.save({
+      domain,
+      action: proposed.action === 'anonymize' ? 'anonymize' : 'purge',
+      isDryRun: true,
+      scannedCount: affectedCount + heldCount,
+      purgedCount: 0,
+      heldCount,
+      cutoffDate,
+      executedBy,
+      metadata: {
+        kind: 'retention_policy_preview',
+        proposedTtlDays: proposed.ttlDays,
+        boundedLimit,
+      },
+    });
+
+    return preview;
   }
 
   async placeLegalHold(

@@ -378,7 +378,6 @@ export class SorobanEventCheckpointService {
           state: 'reprocessed',
           fromLedger: options.fromLedger,
           toLedger: options.toLedger,
-          requestedBy: options.requestedBy,
           reprocessedEvents: events.length,
         },
       })

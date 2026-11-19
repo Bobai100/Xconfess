@@ -30,33 +30,38 @@ export function ShareButton({
     ? `${title} — xConfess`
     : "Check out this confession on xConfess";
 
+  const createScopedShareUrl = async () => {
+    const response = await fetch(`/api/confessions/${confessionId}/share`, {
+      method: "POST",
+      credentials: "include",
+    });
+    if (!response.ok) throw new Error("Unable to create an opt-in share link");
+    const data = await response.json();
+    return `${baseUrl}${data.sharePath}`;
+  };
+
   const copyLink = async () => {
     try {
-      await navigator.clipboard.writeText(shareUrl);
+      const scopedUrl = await createScopedShareUrl();
+      await navigator.clipboard.writeText(scopedUrl);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // fallback
-      const ta = document.createElement("textarea");
-      ta.value = shareUrl;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      setOpen(false);
     }
     setOpen(false);
   };
 
-  const shareViaEmail = () => {
-    const mailto = `mailto:?subject=${encodeURIComponent(shareText)}&body=${encodeURIComponent(shareUrl)}`;
+  const shareViaEmail = async () => {
+    const scopedUrl = await createScopedShareUrl();
+    const mailto = `mailto:?subject=${encodeURIComponent(shareText)}&body=${encodeURIComponent(scopedUrl)}`;
     window.open(mailto);
     setOpen(false);
   };
 
-  const shareToTwitter = () => {
-    const url = `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareText)}&url=${encodeURIComponent(shareUrl)}`;
+  const shareToTwitter = async () => {
+    const scopedUrl = await createScopedShareUrl();
+    const url = `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareText)}&url=${encodeURIComponent(scopedUrl)}`;
     window.open(url, "_blank", "noopener,noreferrer,width=550,height=420");
     setOpen(false);
   };
@@ -64,10 +69,11 @@ export function ShareButton({
   const shareNative = async () => {
     if (navigator.share) {
       try {
+        const scopedUrl = await createScopedShareUrl();
         await navigator.share({
           title: title || "xConfess",
           text: shareText,
-          url: shareUrl,
+          url: scopedUrl,
         });
       } catch (err) {
         if ((err as Error).name !== "AbortError") copyLink();

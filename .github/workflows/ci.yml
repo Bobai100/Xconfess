@@ -15,8 +15,22 @@ jobs:
         with:
           node-version: 20
           cache: npm
-      - run: npm ci
-      - run: npm run backend:test
+          cache-dependency-path: package-lock.json
+      - run: npm install --global npm@10.9.3
+      - run: npm ci --include=optional --no-audit --no-fund
+      - name: Validate route cache policy manifest
+        run: npm run validate:cache-policy --workspace=xconfess-frontend
+      - run: npm run audit:ci
+      - name: Enforce dependency license and change policy
+        run: npm run dependency:policy -- --base "${{ github.event.before || 'HEAD^' }}"
+      - name: Retain dependency policy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-policy-report
+          path: dependency-policy-report.json
+          if-no-files-found: warn
+          retention-days: 90
 
   frontend:
     name: Frontend tests
@@ -30,8 +44,53 @@ jobs:
       - run: npm ci
       - run: npm run frontend:test
 
-  visual-regression:
-    name: Visual regression (privacy-sensitive screens)
+  secret-scan:
+    name: Security / Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Run the scanner's self-test first: verifies the scanner itself catches
+      # the expected pattern categories before scanning the real repo.
+      - run: ./scripts/secret-scanning-preflight.sh --self-test
+      # Full repository scan. Exits non-zero and prints findings if any
+      # unredacted secrets are detected (see docs/TEST_DATA_PRIVACY.md).
+      - run: ./scripts/secret-scanning-preflight.sh
+
+  # ── Migration gate (issue #129) ──────────────────────────────────────────
+  # Validates migration ordering, up/down method presence, and flags
+  # destructive DDL that has not been explicitly acknowledged.
+  migration-gate:
+    name: Security / Migration gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm install --global npm@10.9.3
+      - run: npm ci --include=optional --no-audit --no-fund
+      - name: Run migration gate
+        run: node scripts/migration-gate.js
+      - name: Run data classification gate
+        run: npm run data-classification:gate
+      - name: Run privacy governance regression tests
+        working-directory: xconfess-backend
+        run: >-
+          npx jest --config jest.config.js --runInBand --runTestsByPath
+          src/analytics/analytics-event.service.spec.ts
+          src/analytics/analytics.constants.spec.ts
+          src/admin/services/admin.service.spec.ts
+          src/audit-log/audit-log.service.spec.ts
+          src/moderation/language-evaluation.service.spec.ts
+      - name: Test data classification gate
+        run: node --test scripts/__tests__/data-classification-gate.test.js
+
+  doc-link-audit:
+    name: Docs / link audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

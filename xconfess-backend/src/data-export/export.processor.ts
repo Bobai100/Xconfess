@@ -235,6 +235,14 @@ export class ExportProcessor extends WorkerHost {
       archive.append(JSON.stringify(data, null, 2), {
         name: 'complete_data.json',
       });
+      archive.append(
+        JSON.stringify(
+          this.dataExportService.buildExportManifest(),
+          null,
+          2,
+        ),
+        { name: 'export_manifest.json' },
+      );
       if (data.confessions) {
         const csvContent = this.dataExportService.convertToCsv(
           data.confessions,

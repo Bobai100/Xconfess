@@ -41,6 +41,25 @@ export class RetentionController {
     );
   }
 
+  @Post('simulate')
+  @ApiOperation({
+    summary: 'Preview a proposed retention policy using bounded read-only queries',
+  })
+  simulate(
+    @Req() req: any,
+    @Body('domain') domain: RetentionDomain,
+    @Body('ttlDays') ttlDays: number,
+    @Body('action') action: 'delete' | 'anonymize',
+    @Body('limit') limit = 100,
+  ) {
+    return this.retentionService.simulateRetentionPolicy(
+      domain,
+      { ttlDays: Number(ttlDays), action },
+      Number(limit) || 100,
+      `admin:${req.user?.id || 'unknown'}`,
+    );
+  }
+
   @Post('holds')
   @ApiOperation({ summary: 'Place a legal hold preserving entity data past retention window' })
   placeHold(

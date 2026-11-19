@@ -136,6 +136,19 @@ export class AnonymousConfession {
   @Column({ name: 'publish_at', type: 'timestamp', nullable: true })
   publishAt: Date | null;
 
+  @Column({ name: 'publish_timezone', type: 'varchar', length: 64, nullable: true })
+  publishTimezone: string | null;
+
+  @Index({ unique: true })
+  @Column({ name: 'share_token', type: 'varchar', length: 64, nullable: true })
+  shareToken: string | null;
+
+  @Column({ name: 'share_revoked', default: false })
+  shareRevoked: boolean;
+
+  @Column({ name: 'series_handle', type: 'varchar', length: 64, nullable: true })
+  seriesHandle: string | null;
+
   // Envelope encryption columns for key rotation
   @Column({ name: 'encrypted_content', type: 'text', nullable: true })
   encryptedContent: string | null;

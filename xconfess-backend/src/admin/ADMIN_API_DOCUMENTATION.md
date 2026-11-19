@@ -142,6 +142,23 @@ Search for users by username.
 #### GET /api/admin/users/:id/history
 Get user history including reports and confessions.
 
+#### POST /api/admin/users/:id/support-review
+Request a least-privilege, audited account snapshot for one of the supported
+support purposes. The purpose and scope must match. The endpoint fails closed
+if its access-decision audit record cannot be persisted.
+
+```json
+{
+  "purpose": "account_recovery",
+  "scope": "security_status"
+}
+```
+
+`account_status` returns the account ID, username, role, and active status.
+`security_status` returns only the account ID, active status, and whether
+two-factor authentication is enabled. Email addresses, message content,
+credentials, and other unrelated account fields are never returned.
+
 #### PATCH /api/admin/users/:id/ban
 Ban a user.
 

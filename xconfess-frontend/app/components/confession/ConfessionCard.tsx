@@ -24,8 +24,32 @@ export const ConfessionCard = memo(({ confession }: Props) => {
     confession.tipStats || null
   );
   const [showWarnedContent, setShowWarnedContent] = useState(false);
+  const [warningsCollapsed, setWarningsCollapsed] = useState(true);
   const [avatarError, setAvatarError] = useState(false);
   const [mediaError, setMediaError] = useState(false);
+
+  useEffect(() => {
+    const storedPreference = window.localStorage.getItem(
+      "contentWarningsCollapsed"
+    );
+    if (storedPreference !== null) {
+      setWarningsCollapsed(storedPreference !== "false");
+      return;
+    }
+
+    fetch("/api/users/privacy-settings", { credentials: "include" })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((settings) => {
+        if (settings && typeof settings.contentWarningsCollapsed === "boolean") {
+          setWarningsCollapsed(settings.contentWarningsCollapsed);
+          window.localStorage.setItem(
+            "contentWarningsCollapsed",
+            String(settings.contentWarningsCollapsed)
+          );
+        }
+      })
+      .catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     if (!tipStats) {
@@ -109,7 +133,7 @@ export const ConfessionCard = memo(({ confession }: Props) => {
         </div>
       </div>
 
-      {confession.contentWarning && !showWarnedContent ? (
+      {confession.contentWarning && warningsCollapsed && !showWarnedContent ? (
         <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-5">
           <div className="flex items-start gap-3">
             <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" aria-hidden="true" />

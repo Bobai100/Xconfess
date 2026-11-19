@@ -10,6 +10,7 @@ import {
   AnalyticsEventName,
   AnalyticsNetwork,
 } from './entities/analytics-event.entity';
+import { getEventRegistryEntry } from './analytics.constants';
 
 export interface RecordAnalyticsEventInput {
   eventName: AnalyticsEventName;
@@ -47,19 +48,6 @@ const SENSITIVE_KEYS = [
   'user_agent',
   'useragent',
 ];
-
-const ALLOWED_METADATA_KEYS = new Set([
-  'source',
-  'state',
-  'reason',
-  'requestId',
-  'confessionId',
-  'commentId',
-  'reactionId',
-  'messageId',
-  'tipId',
-  'anchorStatus',
-]);
 
 @Injectable()
 export class AnalyticsEventService {
@@ -130,6 +118,19 @@ export class AnalyticsEventService {
       metadata: input.metadata ?? undefined,
     };
     this.assertNoSensitiveKeys(payload);
+
+    const schema = getEventRegistryEntry(input.eventName);
+    if (!schema) {
+      throw new Error(`Analytics event schema is not registered: ${input.eventName}`);
+    }
+    const allowedMetadataFields = new Set(schema.allowedMetadataFields);
+    for (const key of Object.keys(input.metadata ?? {})) {
+      if (!allowedMetadataFields.has(key)) {
+        throw new Error(
+          `Analytics metadata field is not declared for ${input.eventName}: ${key}`,
+        );
+      }
+    }
   }
 
   private assertNoSensitiveKeys(value: unknown, path = ''): void {
@@ -159,9 +160,6 @@ export class AnalyticsEventService {
 
     const safe: Record<string, string | number | boolean | null> = {};
     for (const [key, value] of Object.entries(metadata)) {
-      if (!ALLOWED_METADATA_KEYS.has(key)) {
-        continue;
-      }
       if (
         typeof value === 'string' ||
         typeof value === 'number' ||
@@ -169,6 +167,8 @@ export class AnalyticsEventService {
         value === null
       ) {
         safe[key] = value;
+      } else {
+        throw new Error(`Analytics metadata field must be a scalar: ${key}`);
       }
     }
 

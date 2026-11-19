@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "entities": {
+    "xconfess-backend/src/audit-log/audit-log.entity.ts": {
+      "owner": "audit-log",
+      "fields": {}
+    },
+    "xconfess-backend/src/analytics/entities/analytics-event.entity.ts": {
+      "owner": "analytics",
+      "fields": {}
+    }
+  },
+  "migrations": {
+    "xconfess-backend/src/migrations/20261119000001-add-admin-support-access-audit-action.ts": {
+      "owner": "audit-log",
+      "classification": "operational",
+      "fields": {}
+    }
+  }
+}

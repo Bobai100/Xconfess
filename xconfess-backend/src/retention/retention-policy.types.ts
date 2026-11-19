@@ -26,6 +26,24 @@ export interface PurgeExecutionReport {
   timestamp: string;
 }
 
+export interface RetentionPolicyPreview {
+  domain: RetentionDomain;
+  proposedTtlDays: number;
+  proposedAction: 'delete' | 'anonymize';
+  cutoffDate: string;
+  dryRun: true;
+  boundedLimit: number;
+  truncated: boolean;
+  recordClasses: Array<{
+    table: string;
+    affectedCount: number;
+  }>;
+  affectedRecordCount: number;
+  heldCount: number;
+  executedBy: string;
+  timestamp: string;
+}
+
 export const DOMAIN_RETENTION_POLICIES: Record<RetentionDomain, RetentionPolicy> = {
   messages: {
     domain: 'messages',

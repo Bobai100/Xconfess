@@ -1,0 +1,30 @@
+{
+  "routes": {
+    "/": "public",
+    "/login": "public",
+    "/register": "public",
+    "/confessions/[id]": "public",
+    "/api/confessions": "public",
+    "/api/confessions/[id]": "public",
+    "/api/public/traction": "public",
+    "/api/trending": "public",
+    "/api/analytics/trending": "public",
+    "/api/auth/session": "private",
+    "/api/auth/step-up": "private",
+    "/api/comments/[confessionId]": "private",
+    "/api/comments/by-confession/[confessionId]": "private",
+    "/api/dm/[userId]": "private",
+    "/api/data-export/[id]/redownload": "private",
+    "/api/data-export/history": "private",
+    "/api/data-export/request": "private",
+    "/api/export/jobs/[userId]": "private",
+    "/api/notifications": "private",
+    "/api/notifications/[id]/read": "private",
+    "/api/notifications/preference": "private",
+    "/api/notifications/read-all": "private",
+    "/api/users/privacy-settings": "private",
+    "/api/users/profile": "private",
+    "/api/users/profile/summary": "private",
+    "/api/admin": "private"
+  }
+}

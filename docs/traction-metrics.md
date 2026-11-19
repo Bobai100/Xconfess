@@ -33,6 +33,11 @@ The analytics ingestion boundary rejects sensitive field names before persistenc
 - raw IP addresses or full user-agent strings;
 - Stellar private keys, secret seeds, or seed phrases.
 
+Each event is registered in `ANALYTICS_EVENT_REGISTRY` with its owner,
+purpose, retention period, allowed metadata fields, and supported aggregate.
+The ingestion boundary rejects undeclared fields instead of silently dropping
+them; additions must update the registry and its tests in the same change.
+
 Public responses include aggregates only. They do not expose user-level records, emails, wallet secrets, confession text, message text, or private moderation payloads.
 
 Do not configure exclusions with emails, names, wallet addresses, raw IPs, auth

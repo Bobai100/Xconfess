@@ -1,5 +1,5 @@
 // src/moderation/language-evaluation.service.spec.ts
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, GoneException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import {
   AiModerationService,
@@ -13,6 +13,7 @@ import {
   SUPPORTED_EVALUATION_LANGUAGES,
 } from './language-evaluation.types';
 import { DEFAULT_MULTILINGUAL_CORPUS } from './multilingual-corpus';
+import { CalibrationDecision } from './dtos/calibration.dto';
 
 describe('LanguageEvaluationService', () => {
   let service: LanguageEvaluationService;
@@ -175,6 +176,99 @@ describe('LanguageEvaluationService', () => {
         }),
       ).toThrow('The active policy changed after preview; run a new preview.');
       expect(aiModerationService.updateThresholds).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('moderator calibration sessions', () => {
+    it('compares reviewer decisions for selected synthetic cases without exposing identities or labels', () => {
+      const caseId = DEFAULT_MULTILINGUAL_CORPUS[0].id;
+      const session = service.createCalibrationSession([caseId]);
+
+      const cases = service.getCalibrationCases(session.sessionId);
+      expect(cases).toEqual([
+        expect.objectContaining({ id: caseId, text: expect.any(String) }),
+      ]);
+      expect(cases[0]).not.toHaveProperty('category');
+      expect(
+        JSON.stringify(cases),
+      ).not.toContain('expectedHarmful');
+
+      service.recordCalibrationDecision(
+        session.sessionId,
+        caseId,
+        10,
+        CalibrationDecision.APPROVE,
+      );
+      service.recordCalibrationDecision(
+        session.sessionId,
+        caseId,
+        11,
+        CalibrationDecision.APPROVE,
+      );
+      service.recordCalibrationDecision(
+        session.sessionId,
+        caseId,
+        12,
+        CalibrationDecision.REMOVE,
+      );
+
+      const result = service.getCalibrationResults(session.sessionId);
+      expect(result.cases[0]).toMatchObject({
+        reviewerCount: 3,
+        decisionCounts: { approve: 2, remove: 1 },
+        agreementRate: 0.6667,
+      });
+      expect(JSON.stringify(result)).not.toContain('reviewerId');
+      expect(JSON.stringify(result)).not.toContain('expectedHarmful');
+      expect(JSON.stringify(result)).not.toContain('"category"');
+    });
+
+    it('rejects live or unselected case IDs and duplicate reviewer submissions', () => {
+      expect(() =>
+        service.createCalibrationSession(['live-user-case']),
+      ).toThrow(BadRequestException);
+      const caseId = DEFAULT_MULTILINGUAL_CORPUS[0].id;
+      const session = service.createCalibrationSession([caseId]);
+      service.recordCalibrationDecision(
+        session.sessionId,
+        caseId,
+        10,
+        CalibrationDecision.FLAG,
+      );
+      expect(() =>
+        service.recordCalibrationDecision(
+          session.sessionId,
+          caseId,
+          10,
+          CalibrationDecision.REMOVE,
+        ),
+      ).toThrow('already assessed');
+      expect(() =>
+        service.recordCalibrationDecision(
+          session.sessionId,
+          DEFAULT_MULTILINGUAL_CORPUS[1].id,
+          11,
+          CalibrationDecision.FLAG,
+        ),
+      ).toThrow('not part of this calibration session');
+    });
+
+    it('expires calibration sessions after their bounded lifetime', () => {
+      const session = service.createCalibrationSession([
+        DEFAULT_MULTILINGUAL_CORPUS[0].id,
+      ]);
+      const now = Date.now();
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(
+        now + 2 * 60 * 60 * 1000 + 1,
+      );
+
+      try {
+        expect(() =>
+          service.getCalibrationCases(session.sessionId),
+        ).toThrow(GoneException);
+      } finally {
+        nowSpy.mockRestore();
+      }
     });
   });
 
