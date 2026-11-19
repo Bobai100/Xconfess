@@ -3,6 +3,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, LessThanOrEqual, DataSource } from 'typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { AnonymousConfession } from './entities/confession.entity';
+import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { DateTime } from 'luxon';
 
 @Injectable()
 export class ConfessionSchedulerService {
@@ -61,22 +63,45 @@ export class ConfessionSchedulerService {
 
   async scheduleConfession(
     confessionId: string,
-    publishAt: Date,
+    publishAt: string | Date,
+    timezone?: string,
+    userId?: number,
   ): Promise<AnonymousConfession> {
     const confession = await this.confessionRepository.findOne({
       where: { id: confessionId },
     });
 
     if (!confession) {
-      throw new Error('Confession not found');
+      throw new NotFoundException('Confession not found');
     }
 
-    if (publishAt <= new Date()) {
-      throw new Error('Publish date must be in the future');
+    if (userId !== undefined) {
+      const ownerLink = await this.confessionRepository
+        .createQueryBuilder('confession')
+        .innerJoin('confession.anonymousUser', 'anonymousUser')
+        .innerJoin('anonymousUser.userLinks', 'link')
+        .where('confession.id = :id', { id: confessionId })
+        .andWhere('link.userId = :userId', { userId })
+        .getOne();
+      if (!ownerLink) throw new ForbiddenException('Not authorized');
+    }
+
+    const instant = publishAt instanceof Date
+      ? DateTime.fromJSDate(publishAt)
+      : timezone
+        ? DateTime.fromISO(publishAt, { zone: timezone })
+        : DateTime.fromISO(publishAt, { setZone: true });
+    if (!instant.isValid) {
+      throw new BadRequestException('publishAt or timezone is invalid');
+    }
+    const publishDate = instant.toUTC().toJSDate();
+    if (publishDate <= new Date()) {
+      throw new BadRequestException('Publish date must be in the future');
     }
 
     confession.status = 'scheduled';
-    confession.publishAt = publishAt;
+    confession.publishAt = publishDate;
+    confession.publishTimezone = timezone ?? null;
 
     return this.confessionRepository.save(confession);
   }

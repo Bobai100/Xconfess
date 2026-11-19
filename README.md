@@ -389,5 +389,11 @@ When adding a new API endpoint, follow the [API endpoint contributor checklist](
 <!-- handsoff-issue-242 -->
 - #242: [Advanced] Separate reporter identity from evidence access permissions
 
-<!-- handsoff-issue-368 -->
-- #368: [Advanced] Guard navigation when a multi-step settings form is dirty
+<!-- handsoff-issue-350 -->
+- #350: [Advanced] Save and restore feed reading position across devices
+
+<!-- handsoff-issue-352 -->
+- #352: [Advanced] Offer reusable feed-filter presets with user-controlled names
+
+<!-- handsoff-issue-357 -->
+- #357: [Advanced] Add reader-side controls for sensitive-content categories

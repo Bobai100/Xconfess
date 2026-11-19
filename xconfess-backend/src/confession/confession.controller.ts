@@ -45,6 +45,7 @@ import { SearchDiscoveryService } from '../search-discovery/search-discovery.ser
 import { SparseFieldsetsInterceptor } from '../common/interceptors/sparse-fieldsets.interceptor';
 import { ConfessionSchedulerService } from './confession-scheduler.service';
 import { ConfessionIdempotencyService } from './confession-idempotency.service';
+import { ScheduleConfessionDto } from './dto/schedule-confession.dto';
 
 const flattenValidationErrors = (
   errors: ValidationError[],
@@ -304,9 +305,15 @@ export class ConfessionController {
   @ApiParam({ name: 'id', description: 'Confession UUID' })
   async scheduleConfession(
     @Param('id') id: string,
-    @Body('publishAt') publishAt: string,
+    @Body() dto: ScheduleConfessionDto,
+    @Req() req: Request,
   ) {
-    return this.schedulerService.scheduleConfession(id, new Date(publishAt));
+    return this.schedulerService.scheduleConfession(
+      id,
+      dto.publishAt,
+      dto.timezone,
+      (req as any)?.user?.id,
+    );
   }
 
   @Delete(':id/schedule')
@@ -326,6 +333,28 @@ export class ConfessionController {
       return [];
     }
     return this.schedulerService.getScheduledConfessions(String(userId));
+  }
+
+  @Post(':id/share')
+  @UseGuards(JwtAuthGuard)
+  createShareLink(@Param('id') id: string, @Req() req: Request) {
+    return this.service.createShareLink(id, (req as any).user.id);
+  }
+
+  @Delete(':id/share')
+  @UseGuards(JwtAuthGuard)
+  revokeShareLink(@Param('id') id: string, @Req() req: Request) {
+    return this.service.revokeShareLink(id, (req as any).user.id);
+  }
+
+  @Get('shared/:token')
+  getByShareToken(@Param('token') token: string) {
+    return this.service.getByShareToken(token);
+  }
+
+  @Get('series/:handle')
+  getSeries(@Param('handle') handle: string) {
+    return this.service.getSeries(handle);
   }
 
   /**
