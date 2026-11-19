@@ -33,6 +33,7 @@ import { useAuth } from "@/app/lib/hooks/useAuth";
 import { getConfessionById } from "@/app/lib/api/confessions";
 import { createConfessionReport } from "@/app/lib/api/reports";
 import { useTranslation } from "@/app/lib/i18n";
+import { getResourceState, RESOURCE_STATE_COPY } from "@/app/lib/resourceState";
 
 interface ConfessionDetailClientProps {
   initialConfession: {
@@ -75,17 +76,10 @@ export function ConfessionDetailClient({
     queryFn: async () => {
       const result = await getConfessionById(confessionId);
       // Explicit 404 check mapping using the error object parameters
-      if (
-        !result.ok &&
-        result.error &&
-        "status" in result.error &&
-        result.error.status === 404
-      ) {
-        throw new Error("NOT_FOUND");
-      }
-
       if (!result.ok) {
-        throw new Error("NETWORK_FAILURE");
+        throw new Error(
+          `RESOURCE_${getResourceState(result.error.status).toUpperCase()}`,
+        );
       }
       return result.data;
     },
@@ -177,7 +171,26 @@ export function ConfessionDetailClient({
   // ==========================================
   // STATE 2: DISTINCT NOT FOUND (404) BOUNDARY
   // ==========================================
-  if (isError && error?.message === "NOT_FOUND") {
+  if (isError && error?.message?.startsWith("RESOURCE_")) {
+    const stateName = error.message.replace("RESOURCE_", "").toLowerCase();
+    const state = getResourceState(
+      stateName === "missing"
+        ? 404
+        : stateName === "deleted"
+          ? 410
+          : stateName === "private"
+            ? 403
+            : stateName === "expired"
+              ? 419
+              : 500,
+    );
+    const copy =
+      state === "unavailable"
+        ? {
+            title: "Connection interrupted",
+            description: "We could not load this resource. Please try again.",
+          }
+        : RESOURCE_STATE_COPY[state];
     return (
       <div className="min-h-screen bg-gray-50 dark:bg-zinc-950 flex items-center justify-center p-4">
         <Card className="max-w-md w-full border border-zinc-200 dark:border-zinc-800 text-center p-6 shadow-xl">
@@ -185,11 +198,10 @@ export function ConfessionDetailClient({
             <FileQuestion className="h-6 w-6 text-amber-600 dark:text-amber-400" />
           </div>
           <h2 className="text-xl font-bold text-zinc-900 dark:text-zinc-50 mb-2">
-            Confession Missing
+            {copy.title}
           </h2>
           <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-6">
-            The record you are looking for does not exist in our cryptographic
-            memory database. It may have been retracted or modified.
+            {copy.description}
           </p>
           <div className="flex gap-3 justify-center">
             <Button

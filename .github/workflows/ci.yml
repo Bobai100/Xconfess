@@ -34,6 +34,8 @@ jobs:
           cache-dependency-path: package-lock.json
       - run: npm install --global npm@10.9.3
       - run: npm ci --include=optional --no-audit --no-fund
+      - name: Validate route cache policy manifest
+        run: npm run validate:cache-policy --workspace=xconfess-frontend
       - run: npm run audit:ci
       - name: Enforce dependency license and change policy
         run: npm run dependency:policy -- --base "${{ github.event.before || 'HEAD^' }}"

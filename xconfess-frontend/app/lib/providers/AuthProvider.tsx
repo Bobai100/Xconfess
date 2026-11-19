@@ -49,6 +49,25 @@ export function AuthProvider({ children }: AuthProviderProps) {
     isSessionExpired: false,
   });
 
+  const isolateAccountState = useCallback((accountId: string | null) => {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(
+      new CustomEvent("xconfess:account-change", {
+        detail: { accountId },
+      }),
+    );
+    const accountStateKeys = [
+      "xconfess_scroll_positions",
+      "xconfess_search_history",
+      "xconfess_drafts",
+      "xconfess.pendingConfession.v1",
+      "xconfess_account_settings",
+    ];
+    accountStateKeys.forEach((key) => window.localStorage.removeItem(key));
+    window.localStorage.removeItem("xconfess-auth");
+    window.sessionStorage.removeItem("xconfess_scroll_positions");
+  }, []);
+
   // Guard against concurrent checkAuth calls (race-condition fix)
   const checkInProgress = useRef(false);
 
@@ -61,6 +80,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     const normalized = (error.details as any)?.normalized as NormalizedAuthError | undefined;
     
     if (normalized?.type === "TERMINAL") {
+      isolateAccountState(null);
       setStoreUser(null);
       storeLogout();
       setState({
@@ -71,7 +91,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         isSessionExpired: true,
       });
     }
-  }, [setStoreUser, storeLogout]);
+  }, [setStoreUser, storeLogout, isolateAccountState]);
 
   /**
   * Check if user is authenticated by validating token with backend.
@@ -89,6 +109,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       };
 
       setStoreUser(mockUser as never);
+      isolateAccountState(mockUser.id);
       setState({
         user: mockUser as never,
         isAuthenticated: true,
@@ -107,6 +128,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
     try {
       const user = await authApi.getCurrentUser();
+      isolateAccountState(user.id);
       setStoreUser(user);
       setState({
         user,
@@ -121,6 +143,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         handleTerminalAuthError(error);
       } else {
         // Not authenticated or session expired
+        isolateAccountState(null);
         setStoreUser(null);
         setState({
           user: null,
@@ -133,7 +156,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     } finally {
       checkInProgress.current = false;
     }
-  }, [isDevBypassEnabled, setStoreUser, handleTerminalAuthError]);
+  }, [isDevBypassEnabled, setStoreUser, handleTerminalAuthError, isolateAccountState]);
 
   //   Check authentication status on mount
 
@@ -161,6 +184,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
       // User data is now managed in the store and state
       // Token is in the HttpOnly cookie
+      isolateAccountState(response.user.id);
       setStoreUser(response.user);
 
       setState({
@@ -219,6 +243,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     // Fire-and-forget the session cookie deletion, but clear local state
     // immediately so AuthGuard can react without waiting for the network.
     authApi.logout().catch(() => {});
+    isolateAccountState(null);
     storeLogout();
     setState({
       user: null,
