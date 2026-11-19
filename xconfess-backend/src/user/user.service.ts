@@ -720,6 +720,7 @@ export class UserService {
       canReceiveReplies: user.canReceiveReplies(),
       showReactions: user.shouldShowReactions(),
       dataProcessingConsent: ps?.dataProcessingConsent !== false,
+      contentWarningsCollapsed: ps?.contentWarningsCollapsed !== false,
     };
   }
 
@@ -747,6 +748,10 @@ export class UserService {
 
       dataProcessingConsent:
         dto.dataProcessingConsent ?? current.dataProcessingConsent ?? true,
+      contentWarningsCollapsed:
+        dto.contentWarningsCollapsed ??
+        current.contentWarningsCollapsed ??
+        true,
     };
 
     await this.userRepository.save(user);
@@ -763,6 +768,8 @@ export class UserService {
       showReactions: user.shouldShowReactions(),
       dataProcessingConsent:
         user.privacySettings?.dataProcessingConsent !== false,
+      contentWarningsCollapsed:
+        user.privacySettings?.contentWarningsCollapsed !== false,
     };
   }
 

@@ -18,6 +18,10 @@ export class UpdatePrivacySettingsDto {
   @IsOptional()
   @IsBoolean()
   dataProcessingConsent?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  contentWarningsCollapsed?: boolean;
 }
 
 export class PrivacySettingsResponseDto {
@@ -25,4 +29,5 @@ export class PrivacySettingsResponseDto {
   canReceiveReplies: boolean;
   showReactions: boolean;
   dataProcessingConsent: boolean;
+  contentWarningsCollapsed: boolean;
 }

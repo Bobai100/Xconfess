@@ -56,6 +56,7 @@ import { mapToSlimConfession } from './utils/confession-mapper';
 import { AnomalyDetectionService } from '../anomaly/anomaly-detection.service';
 import { ConfessionIdempotencyService } from './confession-idempotency.service';
 import { AnalyticsEventService } from '../analytics/analytics-event.service';
+import { randomBytes } from 'crypto';
 
 export interface ArchiveActor {
   id?: string | number | null;
@@ -252,6 +253,9 @@ export class ConfessionService {
         requiresReview: moderationResult.requiresReview,
         isHidden: moderationResult.status === ModerationStatus.REJECTED,
         moderationDetails: moderationResult.details,
+        seriesHandle: dto.seriesHandle
+          ? dto.seriesHandle.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 64)
+          : null,
         ...stellarData,
         ...(dto.idempotencyKey ? { idempotencyKey: dto.idempotencyKey } : {}),
       });
@@ -824,6 +828,70 @@ export class ConfessionService {
         searchType: 'fulltext',
       },
     };
+  }
+
+  private async requireConfessionOwner(
+    confessionId: string,
+    userId: number,
+  ): Promise<AnonymousConfession> {
+    const confession = await this.confessionRepo
+      .createQueryBuilder('confession')
+      .innerJoin('confession.anonymousUser', 'anonymousUser')
+      .innerJoin('anonymousUser.userLinks', 'link')
+      .where('confession.id = :confessionId', { confessionId })
+      .andWhere('link.userId = :userId', { userId })
+      .getOne();
+    if (!confession) throw new ForbiddenException('Not authorized');
+    return confession;
+  }
+
+  async createShareLink(confessionId: string, userId: number) {
+    await this.requireConfessionOwner(confessionId, userId);
+    const token = randomBytes(32).toString('base64url');
+    await this.confessionRepo.update(
+      { id: confessionId },
+      { shareToken: token, shareRevoked: false },
+    );
+    return { shareToken: token, sharePath: `/shared/confessions/${token}` };
+  }
+
+  async revokeShareLink(confessionId: string, userId: number) {
+    await this.requireConfessionOwner(confessionId, userId);
+    await this.confessionRepo.update(
+      { id: confessionId },
+      { shareRevoked: true },
+    );
+    return { revoked: true };
+  }
+
+  async getByShareToken(token: string) {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
+      throw new BadRequestException('Invalid share token');
+    }
+    const confession = await this.confessionRepo.findOne({
+      where: { shareToken: token, shareRevoked: false, isDeleted: false, isHidden: false },
+    });
+    if (!confession) throw new NotFoundException('Share link not found or revoked');
+    return {
+      id: confession.id,
+      message: safeDecryptConfession(confession.message, this.aesKey),
+      created_at: confession.created_at,
+      seriesHandle: confession.seriesHandle,
+    };
+  }
+
+  async getSeries(handle: string) {
+    const normalized = handle.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 64);
+    if (!normalized) throw new BadRequestException('Invalid series handle');
+    const confessions = await this.confessionRepo.find({
+      where: { seriesHandle: normalized, isDeleted: false, isHidden: false },
+      order: { created_at: 'ASC' },
+    });
+    return confessions.map((confession) => ({
+      id: confession.id,
+      message: safeDecryptConfession(confession.message, this.aesKey),
+      created_at: confession.created_at,
+    }));
   }
 
   async getConfessionByIdWithViewCount(id: string, req: Request) {

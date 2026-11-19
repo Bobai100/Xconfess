@@ -114,6 +114,18 @@ const TOGGLE_CONFIGS: PrivacyControlConfig[] = [
     iconOff: <BellOff className="h-5 w-5 text-gray-500" />,
   },
   {
+    key: 'contentWarningsCollapsed',
+    dataFlow: 'content',
+    flowTitle: 'Content & Interaction Data Flow',
+    label: 'Collapse Sensitive Content Warnings',
+    description: 'Choose whether posts with sensitive-content warnings start collapsed.',
+    effect: 'When on, warned posts stay hidden until you explicitly reveal them. When off, warned posts display normally.',
+    affectedProductSurface: 'Confession Feed (/)',
+    affectedProductHref: '/',
+    icon: <Shield className="h-5 w-5 text-amber-400" />,
+    iconOff: <Eye className="h-5 w-5 text-gray-500" />,
+  },
+  {
     key: 'dataProcessingConsent',
     dataFlow: 'analytics',
     flowTitle: 'Analytics & Service Telemetry Data Flow',
@@ -273,6 +285,12 @@ export default function PrivacySettingsPage() {
       }
 
       const updated: PrivacySettings = await response.json();
+      if (typeof updated.contentWarningsCollapsed === 'boolean') {
+        window.localStorage.setItem(
+          'contentWarningsCollapsed',
+          String(updated.contentWarningsCollapsed),
+        );
+      }
       savedSettingsRef.current = updated;
       setSettings(updated);
       setSavedSettings(updated);
