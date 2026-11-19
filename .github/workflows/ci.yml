@@ -93,6 +93,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -102,6 +104,19 @@ jobs:
       - run: npm ci --include=optional --no-audit --no-fund
       - name: Run migration gate
         run: node scripts/migration-gate.js
+      - name: Run data classification gate
+        run: npm run data-classification:gate
+      - name: Run privacy governance regression tests
+        working-directory: xconfess-backend
+        run: >-
+          npx jest --config jest.config.js --runInBand --runTestsByPath
+          src/analytics/analytics-event.service.spec.ts
+          src/analytics/analytics.constants.spec.ts
+          src/admin/services/admin.service.spec.ts
+          src/audit-log/audit-log.service.spec.ts
+          src/moderation/language-evaluation.service.spec.ts
+      - name: Test data classification gate
+        run: node --test scripts/__tests__/data-classification-gate.test.js
 
   doc-link-audit:
     name: Docs / link audit

@@ -3,7 +3,9 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  GoneException,
   Injectable,
+  NotFoundException,
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import {
@@ -22,6 +24,7 @@ import {
   SUPPORTED_EVALUATION_LANGUAGES,
 } from './language-evaluation.types';
 import { DEFAULT_MULTILINGUAL_CORPUS } from './multilingual-corpus';
+import { CalibrationDecision } from './dtos/calibration.dto';
 
 export interface RunEvaluationOptions {
   languages?: SupportedEvaluationLanguage[];
@@ -53,10 +56,24 @@ interface PendingPolicyPreview {
   expiresAt: number;
 }
 
+interface CalibrationSession {
+  id: string;
+  caseIds: string[];
+  expiresAt: number;
+  policySnapshot: ModerationThresholds;
+  decisions: Map<string, Map<number, CalibrationDecision>>;
+}
+
 @Injectable()
 export class LanguageEvaluationService {
   private cachedReport: MultilingualEvaluationReport | null = null;
   private pendingPolicyPreview: PendingPolicyPreview | null = null;
+  private readonly calibrationSessions = new Map<string, CalibrationSession>();
+  private readonly expiredCalibrationSessionIds = new Set<string>();
+
+  private static readonly CALIBRATION_TTL_MS = 2 * 60 * 60 * 1000;
+  private static readonly MAX_CALIBRATION_SESSIONS = 100;
+  private static readonly MAX_CALIBRATION_CASES = 50;
 
   constructor(private readonly aiModerationService: AiModerationService) {}
 
@@ -167,6 +184,183 @@ export class LanguageEvaluationService {
     );
     this.pendingPolicyPreview = null;
     return pending.proposedThresholds;
+  }
+
+  createCalibrationSession(caseIds: string[]) {
+    this.pruneExpiredCalibrationSessions();
+    if (
+      !Array.isArray(caseIds) ||
+      caseIds.length === 0 ||
+      caseIds.length > LanguageEvaluationService.MAX_CALIBRATION_CASES ||
+      caseIds.some((id) => typeof id !== 'string' || id.length === 0) ||
+      new Set(caseIds).size !== caseIds.length
+    ) {
+      throw new BadRequestException(
+        `Choose between 1 and ${LanguageEvaluationService.MAX_CALIBRATION_CASES} unique synthetic cases.`,
+      );
+    }
+
+    const availableIds = new Set(
+      DEFAULT_MULTILINGUAL_CORPUS.map((item) => item.id),
+    );
+    const unknownId = caseIds.find((id) => !availableIds.has(id));
+    if (unknownId) {
+      throw new BadRequestException(
+        `Unknown synthetic calibration case: ${unknownId}`,
+      );
+    }
+    if (
+      this.calibrationSessions.size >=
+      LanguageEvaluationService.MAX_CALIBRATION_SESSIONS
+    ) {
+      throw new ConflictException(
+        'Calibration session capacity is full; retry after an active session expires.',
+      );
+    }
+
+    const configuration = this.aiModerationService.getConfiguration();
+    const id = randomUUID();
+    const expiresAt = Date.now() + LanguageEvaluationService.CALIBRATION_TTL_MS;
+    this.calibrationSessions.set(id, {
+      id,
+      caseIds: [...caseIds],
+      expiresAt,
+      policySnapshot: {
+        highThreshold: configuration.highThreshold,
+        mediumThreshold: configuration.mediumThreshold,
+      },
+      decisions: new Map(),
+    });
+
+    return {
+      sessionId: id,
+      caseCount: caseIds.length,
+      expiresAt: new Date(expiresAt).toISOString(),
+    };
+  }
+
+  getCalibrationCases(sessionId: string) {
+    const session = this.getCalibrationSession(sessionId);
+    const cases = new Map(DEFAULT_MULTILINGUAL_CORPUS.map((item) => [item.id, item]));
+    return session.caseIds.map((id) => {
+      const item = cases.get(id);
+      if (!item) {
+        throw new NotFoundException(
+          `Synthetic calibration case is unavailable: ${id}`,
+        );
+      }
+      return {
+        id: item.id,
+        language: item.language,
+        text: item.text,
+      };
+    });
+  }
+
+  recordCalibrationDecision(
+    sessionId: string,
+    caseId: string,
+    reviewerId: number,
+    decision: CalibrationDecision,
+  ) {
+    if (!Number.isSafeInteger(reviewerId) || reviewerId < 1) {
+      throw new BadRequestException('A valid reviewer account is required.');
+    }
+    if (!Object.values(CalibrationDecision).includes(decision)) {
+      throw new BadRequestException('Unsupported calibration interpretation.');
+    }
+
+    const session = this.getCalibrationSession(sessionId);
+    if (!session.caseIds.includes(caseId)) {
+      throw new BadRequestException('Case is not part of this calibration session.');
+    }
+
+    let responses = session.decisions.get(caseId);
+    if (!responses) {
+      responses = new Map();
+      session.decisions.set(caseId, responses);
+    }
+    if (responses.has(reviewerId)) {
+      throw new ConflictException(
+        'This reviewer has already assessed the case in this session.',
+      );
+    }
+    responses.set(reviewerId, decision);
+    return { recorded: true };
+  }
+
+  getCalibrationResults(sessionId: string) {
+    const session = this.getCalibrationSession(sessionId);
+    const cases = new Map(DEFAULT_MULTILINGUAL_CORPUS.map((item) => [item.id, item]));
+
+    return {
+      sessionId: session.id,
+      expiresAt: new Date(session.expiresAt).toISOString(),
+      policySnapshot: session.policySnapshot,
+      cases: session.caseIds.map((caseId) => {
+        const responses = [...(session.decisions.get(caseId)?.values() ?? [])];
+        const decisionCounts: Partial<Record<CalibrationDecision, number>> = {};
+        for (const decision of responses) {
+          decisionCounts[decision] = (decisionCounts[decision] ?? 0) + 1;
+        }
+        const counts = Object.values(decisionCounts).filter(
+          (count): count is number => typeof count === 'number',
+        );
+        const majorityCount = Math.max(0, ...counts);
+        const item = cases.get(caseId);
+        if (!item) {
+          throw new NotFoundException(
+            `Synthetic calibration case is unavailable: ${caseId}`,
+          );
+        }
+        return {
+          caseId,
+          language: item.language,
+          reviewerCount: responses.length,
+          decisionCounts,
+          agreementRate:
+            responses.length > 0
+              ? Number((majorityCount / responses.length).toFixed(4))
+              : null,
+        };
+      }),
+    };
+  }
+
+  private getCalibrationSession(sessionId: string): CalibrationSession {
+    const session = this.calibrationSessions.get(sessionId);
+    if (!session) {
+      if (this.expiredCalibrationSessionIds.has(sessionId)) {
+        throw new GoneException(
+          'Calibration session has expired; create a new one.',
+        );
+      }
+      throw new NotFoundException('Calibration session not found.');
+    }
+    if (session.expiresAt <= Date.now()) {
+      this.calibrationSessions.delete(sessionId);
+      this.markCalibrationSessionExpired(sessionId);
+      throw new GoneException('Calibration session has expired; create a new one.');
+    }
+    return session;
+  }
+
+  private pruneExpiredCalibrationSessions(): void {
+    const now = Date.now();
+    for (const [id, session] of this.calibrationSessions) {
+      if (session.expiresAt <= now) {
+        this.calibrationSessions.delete(id);
+        this.markCalibrationSessionExpired(id);
+      }
+    }
+  }
+
+  private markCalibrationSessionExpired(sessionId: string): void {
+    this.expiredCalibrationSessionIds.add(sessionId);
+    if (this.expiredCalibrationSessionIds.size > 1000) {
+      const oldest = this.expiredCalibrationSessionIds.values().next().value;
+      if (oldest) this.expiredCalibrationSessionIds.delete(oldest);
+    }
   }
 
   private validateThresholds(thresholds: ModerationThresholds): void {
