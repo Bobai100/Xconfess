@@ -303,201 +303,192 @@ export function resolvePublicTopic(topics: Topic[], identifier: string): TopicDi
   return { id: match.id, slug: match.slug, label: match.label, aliases: [...match.aliases] };
 }
 
+export const COLLECTION_MAX_NAME_LENGTH = 80;
+export const COLLECTION_MAX_ITEMS = 500;
+
+export interface BookmarkCollection {
+  id: string;
+  ownerId: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CollectionItem {
+  collectionId: string;
+  confessionId: string;
+  addedAt: string;
+}
+
+export interface CreateCollectionInput {
+  ownerId: string;
+  name: string;
+  now?: Date;
+}
+
+export interface AddCollectionItemInput {
+  collection: BookmarkCollection;
+  items: CollectionItem[];
+  actorId: string;
+  confessionId: string;
+  now?: Date;
+}
+
+export interface RemoveCollectionItemInput {
+  collection: BookmarkCollection;
+  items: CollectionItem[];
+  actorId: string;
+  confessionId: string;
+}
+
+export interface RemoveSavedConfessionInput {
+  collections: BookmarkCollection[];
+  items: CollectionItem[];
+  ownerId: string;
+  confessionId: string;
+}
+
+export type CollectionErrorCode =
+  | "invalid_name"
+  | "unauthorized"
+  | "unknown_collection"
+  | "duplicate_item"
+  | "collection_full"
+  | "item_not_found";
+
+export class CollectionError extends Error {
+  readonly code: CollectionErrorCode;
+
+  constructor(code: CollectionErrorCode, message: string) {
+    super(message);
+    this.name = "CollectionError";
+    this.code = code;
+  }
+}
+
+function normalizeCollectionName(name: string): string {
+  const normalized = typeof name === "string" ? name.trim() : "";
+  if (!normalized || normalized.length > COLLECTION_MAX_NAME_LENGTH) {
+    throw new CollectionError("invalid_name", "Collection name is empty or too long");
+  }
+  return normalized;
+}
+
+function assertCollectionOwner(collection: BookmarkCollection, actorId: string): void {
+  if (!collection || collection.ownerId !== actorId) {
+    throw new CollectionError("unauthorized", "Unauthorized: collection is owner-only");
+  }
+}
+
+/**
+ * Create an owner-only named collection. Names are unique per owner
+ * (case-insensitive) so collections stay deterministic and unambiguous.
+ */
+export function createCollection(
+  input: CreateCollectionInput,
+  existing: BookmarkCollection[] = [],
+): BookmarkCollection {
+  const now = input.now ?? new Date();
+  const name = normalizeCollectionName(input.name);
+  const key = name.toLowerCase();
+  const clash = existing.some(
+    (collection) => collection.ownerId === input.ownerId && collection.name.toLowerCase() === key,
+  );
+  if (clash) {
+    throw new CollectionError("invalid_name", "Collection name is already in use");
+  }
+  return {
+    id: `collection_${input.ownerId}_${key.replace(/[^a-z0-9]+/g, "-")}`,
+    ownerId: input.ownerId,
+    name,
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+  };
+}
+
+/**
+ * List a single owner's collections in deterministic order (name, then id).
+ * Never returns collections owned by other users.
+ */
+export function listCollections(
+  collections: BookmarkCollection[],
+  ownerId: string,
+): BookmarkCollection[] {
+  return collections
+    .filter((collection) => collection.ownerId === ownerId)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+}
+
+/**
+ * List items in a collection in deterministic order (addedAt, then
+ * confessionId). Requires the caller to be the collection owner.
+ */
+export function listCollectionItems(
+  collection: BookmarkCollection,
+  items: CollectionItem[],
+  actorId: string,
+): CollectionItem[] {
+  assertCollectionOwner(collection, actorId);
+  return items
+    .filter((item) => item.collectionId === collection.id)
+    .sort((a, b) => a.addedAt.localeCompare(b.addedAt) || a.confessionId.localeCompare(b.confessionId));
+}
+
+/**
+ * Add a saved confession to a collection. Rejects duplicates within the same
+ * collection and enforces a per-collection cap. Requires owner authorization.
+ */
+export function addCollectionItem(input: AddCollectionItemInput): CollectionItem {
+  const { collection, items, actorId, confessionId } = input;
+  const now = input.now ?? new Date();
+  assertCollectionOwner(collection, actorId);
+  if (typeof confessionId !== "string" || !confessionId.trim()) {
+    throw new CollectionError("item_not_found", "Confession id is required");
+  }
+  const scoped = items.filter((item) => item.collectionId === collection.id);
+  if (scoped.some((item) => item.confessionId === confessionId)) {
+    throw new CollectionError("duplicate_item", "Confession is already in this collection");
+  }
+  if (scoped.length >= COLLECTION_MAX_ITEMS) {
+    throw new CollectionError("collection_full", "Collection has reached its item limit");
+  }
+  return { collectionId: collection.id, confessionId, addedAt: now.toISOString() };
+}
+
+/**
+ * Remove a saved confession from a collection. Requires owner authorization and
+ * fails explicitly when the item is not present.
+ */
+export function removeCollectionItem(input: RemoveCollectionItemInput): CollectionItem[] {
+  const { collection, items, actorId, confessionId } = input;
+  assertCollectionOwner(collection, actorId);
+  const scoped = items.filter((item) => item.collectionId === collection.id);
+  if (!scoped.some((item) => item.confessionId === confessionId)) {
+    throw new CollectionError("item_not_found", "Confession is not in this collection");
+  }
+  return items.filter(
+    (item) => !(item.collectionId === collection.id && item.confessionId === confessionId),
+  );
+}
+
+/**
+ * Clean up collection items when a saved confession is removed. Only the
+ * owner's collections are touched; other users' collections are left intact.
+ * Returns the remaining items after cascade removal.
+ */
+export function removeSavedConfession(input: RemoveSavedConfessionInput): CollectionItem[] {
+  const { collections, items, ownerId, confessionId } = input;
+  const ownedIds = new Set(
+    collections.filter((collection) => collection.ownerId === ownerId).map((c) => c.id),
+  );
+  return items.filter(
+    (item) => !(ownedIds.has(item.collectionId) && item.confessionId === confessionId),
+  );
+}
+
 const REDACTED = "[redacted]";
 
 function redactId(value: string): string {
-  if (!value) return REDACTED;
-  return `${value.slice(0, 2)}***`;
-}
+  if (!v
 
-/**
- * Redact identifiers and content from a moderation case so replay inputs and
- * outputs never expose live user data.
- */
-export function redactCase(moderationCase: ModerationCase): RedactedCase {
-  return {
-    id: redactId(moderationCase.id),
-    userId: redactId(moderationCase.userId),
-    content: REDACTED,
-    policyVersion: moderationCase.policyVersion,
-    decision: moderationCase.decision,
-  };
-}
-
-/**
- * Replay moderation decisions against a new policy version in isolation.
- *
- * This function is pure: it never mutates the supplied cases, never writes to
- * production decision records, and never triggers notifications. It only
- * returns a redacted diff report. Callers must be explicitly authorized.
- */
-export function replayModerationDecisions(options: ReplayOptions): ReplayDiffReport {
-  const { cases, targetPolicy, authorize } = options;
-
-  if (!authorize("replay")) {
-    throw new Error("Unauthorized: replay requires explicit authorization");
-  }
-
-  if (!targetPolicy || typeof targetPolicy.evaluate !== "function") {
-    throw new Error("Invalid target policy: evaluate() is required");
-  }
-
-  const deltas: ReplayCaseDelta[] = [];
-  let changed = 0;
-
-  for (const moderationCase of cases) {
-    const redacted = redactCase(moderationCase);
-    const nextDecision = targetPolicy.evaluate({ content: moderationCase.content });
-    const isChanged = nextDecision !== redacted.decision;
-    if (isChanged) changed += 1;
-    deltas.push({
-      caseId: redacted.id,
-      from: redacted.decision,
-      to: nextDecision,
-      changed: isChanged,
-    });
-  }
-
-  const fromPolicyVersion = cases.length > 0 ? cases[0].policyVersion : "unknown";
-
-  return {
-    fromPolicyVersion,
-    toPolicyVersion: targetPolicy.version,
-    total: cases.length,
-    changed,
-    unchanged: cases.length - changed,
-    deltas,
-  };
-}
-
-/**
- * Validate and normalize poll options for a confession thread. Enforces a
- * bounded option count, non-empty unique labels, and a bounded label length.
- */
-export function normalizePollOptions(options: string[]): PollOption[] {
-  if (!Array.isArray(options)) {
-    throw new PollError("invalid_options", "Poll options must be an array");
-  }
-
-  const trimmed = options.map((option) => (typeof option === "string" ? option.trim() : ""));
-
-  if (trimmed.length < POLL_MIN_OPTIONS || trimmed.length > POLL_MAX_OPTIONS) {
-    throw new PollError(
-      "invalid_options",
-      `Poll requires between ${POLL_MIN_OPTIONS} and ${POLL_MAX_OPTIONS} options`,
-    );
-  }
-
-  const seen = new Set<string>();
-  return trimmed.map((label, index) => {
-    if (!label) {
-      throw new PollError("invalid_options", "Poll options must not be empty");
-    }
-    if (label.length > POLL_MAX_OPTION_LENGTH) {
-      throw new PollError(
-        "invalid_options",
-        `Poll options must be at most ${POLL_MAX_OPTION_LENGTH} characters`,
-      );
-    }
-    const key = label.toLowerCase();
-    if (seen.has(key)) {
-      throw new PollError("invalid_options", "Poll options must be unique");
-    }
-    seen.add(key);
-    return { id: `opt_${index + 1}`, label };
-  });
-}
-
-/**
- * Create a poll for a confession thread with an explicit, bounded close time.
- * The close time must be in the future and within the maximum poll duration.
- */
-export function createPoll(input: CreatePollInput): Poll {
-  const now = input.now ?? new Date();
-  const options = normalizePollOptions(input.options);
-  const closesAt = new Date(input.closesAt);
-
-  if (Number.isNaN(closesAt.getTime())) {
-    throw new PollError("invalid_close_time", "Poll close time is invalid");
-  }
-  if (closesAt.getTime() <= now.getTime()) {
-    throw new PollError("invalid_close_time", "Poll close time must be in the future");
-  }
-  if (closesAt.getTime() - now.getTime() > POLL_MAX_DURATION_MS) {
-    throw new PollError("invalid_close_time", "Poll close time exceeds the maximum duration");
-  }
-
-  return {
-    id: `poll_${input.threadId}`,
-    threadId: input.threadId,
-    options,
-    closesAt: closesAt.toISOString(),
-    createdAt: now.toISOString(),
-  };
-}
-
-/**
- * Cast a vote with one-vote-per-user semantics. Rejects votes after the close
- * time, votes for unknown options, and repeat votes from the same user.
- */
-export function castPollVote(input: CastVoteInput): PollVote {
-  const now = input.now ?? new Date();
-  const { poll, existingVotes, userId, optionId } = input;
-
-  if (!userId) {
-    throw new PollError("already_voted", "A user identity is required to vote");
-  }
-  if (now.getTime() >= new Date(poll.closesAt).getTime()) {
-    throw new PollError("poll_closed", "Poll is closed");
-  }
-  if (!poll.options.some((option) => option.id === optionId)) {
-    throw new PollError("unknown_option", "Selected poll option does not exist");
-  }
-  if (existingVotes.some((vote) => vote.pollId === poll.id && vote.userId === userId)) {
-    throw new PollError("already_voted", "User has already voted in this poll");
-  }
-
-  return {
-    pollId: poll.id,
-    userId,
-    optionId,
-    createdAt: now.toISOString(),
-  };
-}
-
-/**
- * Aggregate poll results without exposing voter identity. Only counts are
- * returned; individual votes are never surfaced.
- */
-export function aggregatePollResults(
-  poll: Poll,
-  votes: PollVote[],
-  now: Date = new Date(),
-): PollResults {
-  const pollVotes = votes.filter((vote) => vote.pollId === poll.id);
-  const counts = new Map<string, number>();
-  for (const option of poll.options) counts.set(option.id, 0);
-  for (const vote of pollVotes) {
-    if (counts.has(vote.optionId)) {
-      counts.set(vote.optionId, (counts.get(vote.optionId) ?? 0) + 1);
-    }
-  }
-
-  const totalVotes = pollVotes.length;
-  const closed = now.getTime() >= new Date(poll.closesAt).getTime();
-
-  return {
-    pollId: poll.id,
-    totalVotes,
-    closed,
-    options: poll.options.map((option) => {
-      const votes = counts.get(option.id) ?? 0;
-      return {
-        optionId: option.id,
-        label: option.label,
-        votes,
-        percentage: totalVotes === 0 ? 0 : Math.round((votes / totalVotes) * 100),
-      };
-    }),
-  };
-}
+/* … truncated 6132 chars — edit only what you need near the top … */
