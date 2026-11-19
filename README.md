@@ -388,3 +388,6 @@ When adding a new API endpoint, follow the [API endpoint contributor checklist](
 
 <!-- handsoff-issue-242 -->
 - #242: [Advanced] Separate reporter identity from evidence access permissions
+
+<!-- handsoff-issue-370 -->
+- #370: [Advanced] Move eligible public routes to server-rendered data boundaries
