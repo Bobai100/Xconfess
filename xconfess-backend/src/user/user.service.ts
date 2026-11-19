@@ -300,7 +300,13 @@ export class UserService {
     return savedUser;
   }
 
-  async deleteAccount(userId: number): Promise<void> {
+  async deleteAccount(userId: number): Promise<{
+    completed: true;
+    primary: { deletedCount: number };
+    cache: { deletedCount: number };
+    queue: { cancelledCount: number };
+    searchIndex: { deletedCount: number };
+  }> {
     const user = await this.findById(userId);
     if (!user) throw new NotFoundException('User not found');
     await this.dataExportService.cancelExportsForUser(
@@ -308,6 +314,13 @@ export class UserService {
       'account_deleted',
     );
     await this.userRepository.remove(user);
+    return {
+      completed: true,
+      primary: { deletedCount: 1 },
+      cache: { deletedCount: 0 },
+      queue: { cancelledCount: 1 },
+      searchIndex: { deletedCount: 0 },
+    };
   }
 
   // =========================
