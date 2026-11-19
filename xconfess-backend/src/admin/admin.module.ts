@@ -36,6 +36,11 @@ import { SorobanEventCheckpoint } from '../stellar/entities/soroban-event-checkp
 import { DiagnosticsBundleService } from './services/diagnostics-bundle.service';
 import { CrossDomainIntegrityService } from './services/cross-domain-integrity.service';
 import { AdminActionApproval } from './entities/admin-action-approval.entity';
+import { ModerationAccessGrant } from './entities/moderation-access-grant.entity';
+import { ModerationPolicyRun } from './entities/moderation-policy-run.entity';
+import { ModerationGovernanceService } from './services/moderation-governance.service';
+import { ModerationGovernanceController } from './controllers/moderation-governance.controller';
+import { ModerationAccessGrantGuard } from '../auth/guards/moderation-access-grant.guard';
 
 @Module({
   imports: [
@@ -52,6 +57,8 @@ import { AdminActionApproval } from './entities/admin-action-approval.entity';
       StellarAnchor,
       SorobanEventCheckpoint,
       AdminActionApproval,
+      ModerationAccessGrant,
+      ModerationPolicyRun,
     ]),
     AuthModule,
     UserModule,
@@ -62,6 +69,7 @@ import { AdminActionApproval } from './entities/admin-action-approval.entity';
   controllers: [
     AdminController,
     NotificationTemplatesController, // Added
+    ModerationGovernanceController, // Added
   ],
   providers: [
     AdminService,
@@ -78,6 +86,8 @@ import { AdminActionApproval } from './entities/admin-action-approval.entity';
     TemplatesService, // Added
     DiagnosticsBundleService,
     CrossDomainIntegrityService,
+    ModerationGovernanceService,
+    ModerationAccessGrantGuard,
   ],
   exports: [
     AdminService, 

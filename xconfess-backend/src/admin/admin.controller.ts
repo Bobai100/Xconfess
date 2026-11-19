@@ -70,6 +70,8 @@ import {
   RequestActionApprovalDto,
 } from './dto/request-action-approval.dto';
 import { SupportAccessReviewDto } from './dto/support-access-review.dto';
+import { ModerationAccessGrantGuard } from '../auth/guards/moderation-access-grant.guard';
+import { RequireModerationAccessGrant } from '../auth/guards/moderation-access-grant.decorator';
 
 export class CreateTemplateDto {
   @IsNotEmpty({ message: 'Name is required' })
@@ -162,6 +164,8 @@ export class AdminController {
 
   // Reports
   @Get('reports')
+  @UseGuards(ModerationAccessGrantGuard)
+  @RequireModerationAccessGrant()
   @RequireCapability(CAPABILITY_MODERATE_CONTENT)
   @ResponseSizeBudget(1024 * 1024)
   @ApiOperation({ summary: 'List reports with optional filters and cursor pagination' })
@@ -233,6 +237,8 @@ export class AdminController {
   }
 
   @Get('reports/stats')
+  @UseGuards(ModerationAccessGrantGuard)
+  @RequireModerationAccessGrant()
   @RequireCapability(CAPABILITY_MODERATE_CONTENT)
   @ApiOperation({ summary: 'Get report queue health stats' })
   @ApiResponse({
@@ -251,6 +257,8 @@ export class AdminController {
   }
 
   @Get('reports/:id')
+  @UseGuards(ModerationAccessGrantGuard)
+  @RequireModerationAccessGrant()
   @RequireCapability(CAPABILITY_MODERATE_CONTENT)
   @ApiOperation({ summary: 'Get a single report by ID' })
   @ApiParam({ name: 'id', description: 'Report UUID' })
@@ -261,6 +269,8 @@ export class AdminController {
   }
 
   @Patch('reports/:id/resolve')
+  @UseGuards(ModerationAccessGrantGuard)
+  @RequireModerationAccessGrant()
   @HttpCode(HttpStatus.OK)
   @RequireCapability(CAPABILITY_MODERATE_CONTENT)
   @ApiOperation({ summary: 'Resolve a report (admin action)' })
@@ -290,6 +300,8 @@ export class AdminController {
   }
 
   @Patch('reports/:id/dismiss')
+  @UseGuards(ModerationAccessGrantGuard)
+  @RequireModerationAccessGrant()
   @HttpCode(HttpStatus.OK)
   @RequireCapability(CAPABILITY_MODERATE_CONTENT)
   @ApiOperation({ summary: 'Dismiss a report without taking action' })
@@ -310,6 +322,8 @@ export class AdminController {
   }
 
   @Patch('reports/bulk-resolve')
+  @UseGuards(ModerationAccessGrantGuard)
+  @RequireModerationAccessGrant()
   @HttpCode(HttpStatus.OK)
   @RequireCapability(CAPABILITY_MODERATE_CONTENT)
   @ApiOperation({ summary: 'Bulk-resolve multiple reports at once' })
