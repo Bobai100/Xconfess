@@ -8,6 +8,23 @@
   --motion-ease-decelerate: cubic-bezier(0, 0, 0, 1);
   --motion-ease-accelerate: cubic-bezier(0.3, 0, 1, 1);
 
+  /*
+   * Audited color tokens (WCAG 2.2 AA).
+   * Every foreground/background pair below is verified by
+   * frontend/src/styles/tokens.contrast.test.ts:
+   *   - normal text >= 4.5:1
+   *   - large text and UI components >= 3:1
+   * Do not change these values without updating the audit test.
+   */
+
+  /* Base surfaces and text (light theme) */
+  --color-text: #1a1a1a;
+  --color-text-muted: #595959;
+  --color-bg: #ffffff;
+  --color-bg-subtle: #f2f2f2;
+  --color-border: #767676;
+  --color-control-border: #767676;
+
   /* Status colors (contrast-safe on light surfaces) */
   --status-success-fg: #0f5132;
   --status-success-bg: #d1e7dd;
@@ -22,6 +39,27 @@
   --focus-ring-color: #0b5ed7;
   --focus-ring-width: 2px;
   --focus-ring-offset: 2px;
+}
+
+/* Dark theme: audited against the same WCAG 2.2 AA thresholds */
+[data-theme='dark'] {
+  --color-text: #f5f5f5;
+  --color-text-muted: #b3b3b3;
+  --color-bg: #121212;
+  --color-bg-subtle: #1e1e1e;
+  --color-border: #8c8c8c;
+  --color-control-border: #8c8c8c;
+
+  --status-success-fg: #a3e4c1;
+  --status-success-bg: #0f5132;
+  --status-warning-fg: #ffe08a;
+  --status-warning-bg: #664d03;
+  --status-danger-fg: #ffb3ba;
+  --status-danger-bg: #842029;
+  --status-info-fg: #a5e8f5;
+  --status-info-bg: #055160;
+
+  --focus-ring-color: #6ea8fe;
 }
 
 /* Reduced motion: snap animations and transitions */
