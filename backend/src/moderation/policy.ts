@@ -43,6 +43,44 @@ export interface ReplayOptions {
   authorize: (action: "replay") => boolean;
 }
 
+export type DraftStatus = "draft" | "published";
+
+export interface DraftRecord {
+  id: string;
+  ownerId: string;
+  status: DraftStatus;
+  content: string;
+  /** ISO-8601 timestamp of the retention deadline, or null when unset. */
+  expiresAt: string | null;
+}
+
+export interface SetDraftExpiryInput {
+  draft: DraftRecord;
+  requesterId: string;
+  /** ISO-8601 timestamp, or null to clear the deadline. */
+  expiresAt: string | null;
+  now?: Date;
+}
+
+export interface DraftExpiryResult {
+  draft: DraftRecord;
+  expiresAt: string | null;
+}
+
+export class DraftExpiryError extends Error {
+  constructor(
+    message: string,
+    readonly code:
+      | "not_found"
+      | "forbidden"
+      | "not_a_draft"
+      | "invalid_deadline",
+  ) {
+    super(message);
+    this.name = "DraftExpiryError";
+  }
+}
+
 const REDACTED = "[redacted]";
 
 function redactId(value: string): string {
@@ -108,4 +146,56 @@ export function replayModerationDecisions(options: ReplayOptions): ReplayDiffRep
     unchanged: cases.length - changed,
     deltas,
   };
+}
+
+/**
+ * Set or clear the retention deadline on a user-owned draft.
+ *
+ * Authorization: only the draft owner may set the deadline. Published content
+ * is never eligible for expiry. Deadlines must be valid ISO-8601 timestamps in
+ * the future; malformed or past values are rejected with a typed error so the
+ * API layer can map them to 4xx responses. The input draft is not mutated; a
+ * new record is returned so callers can persist it idempotently.
+ */
+export function setDraftExpiry(input: SetDraftExpiryInput): DraftExpiryResult {
+  const { draft, requesterId, expiresAt } = input;
+  const now = input.now ?? new Date();
+
+  if (!draft) {
+    throw new DraftExpiryError("Draft not found", "not_found");
+  }
+
+  if (draft.ownerId !== requesterId) {
+    throw new DraftExpiryError(
+      "Only the draft owner may set an expiry deadline",
+      "forbidden",
+    );
+  }
+
+  if (draft.status !== "draft") {
+    throw new DraftExpiryError(
+      "Published content cannot be scheduled for expiry",
+      "not_a_draft",
+    );
+  }
+
+  if (expiresAt === null) {
+    return { draft: { ...draft, expiresAt: null }, expiresAt: null };
+  }
+
+  if (typeof expiresAt !== "string" || expiresAt.trim() === "") {
+    throw new DraftExpiryError("Deadline must be an ISO-8601 timestamp", "invalid_deadline");
+  }
+
+  const parsed = new Date(expiresAt);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new DraftExpiryError("Deadline must be an ISO-8601 timestamp", "invalid_deadline");
+  }
+
+  if (parsed.getTime() <= now.getTime()) {
+    throw new DraftExpiryError("Deadline must be in the future", "invalid_deadline");
+  }
+
+  const normalized = parsed.toISOString();
+  return { draft: { ...draft, expiresAt: normalized }, expiresAt: normalized };
 }
