@@ -306,55 +306,39 @@ export function resolvePublicTopic(topics: Topic[], identifier: string): TopicDi
 export const COLLECTION_MAX_NAME_LENGTH = 80;
 export const COLLECTION_MAX_ITEMS = 500;
 
+export type CollectionVisibility = "private" | "public";
+
 export interface BookmarkCollection {
   id: string;
   ownerId: string;
   name: string;
+  visibility: CollectionVisibility;
+  itemIds: string[];
   createdAt: string;
   updatedAt: string;
-}
-
-export interface CollectionItem {
-  collectionId: string;
-  confessionId: string;
-  addedAt: string;
 }
 
 export interface CreateCollectionInput {
   ownerId: string;
   name: string;
+  visibility?: CollectionVisibility;
   now?: Date;
 }
 
 export interface AddCollectionItemInput {
   collection: BookmarkCollection;
-  items: CollectionItem[];
-  actorId: string;
-  confessionId: string;
-  now?: Date;
-}
-
-export interface RemoveCollectionItemInput {
-  collection: BookmarkCollection;
-  items: CollectionItem[];
-  actorId: string;
-  confessionId: string;
-}
-
-export interface RemoveSavedConfessionInput {
-  collections: BookmarkCollection[];
-  items: CollectionItem[];
   ownerId: string;
-  confessionId: string;
+  itemId: string;
+  now?: Date;
 }
 
 export type CollectionErrorCode =
   | "invalid_name"
-  | "unauthorized"
-  | "unknown_collection"
-  | "duplicate_item"
+  | "invalid_visibility"
+  | "invalid_item"
   | "collection_full"
-  | "item_not_found";
+  | "unauthorized"
+  | "duplicate_item";
 
 export class CollectionError extends Error {
   readonly code: CollectionErrorCode;
@@ -374,121 +358,233 @@ function normalizeCollectionName(name: string): string {
   return normalized;
 }
 
-function assertCollectionOwner(collection: BookmarkCollection, actorId: string): void {
-  if (!collection || collection.ownerId !== actorId) {
-    throw new CollectionError("unauthorized", "Unauthorized: collection is owner-only");
+function normalizeCollectionVisibility(
+  visibility: CollectionVisibility | undefined,
+): CollectionVisibility {
+  if (visibility === undefined) return "private";
+  if (visibility !== "private" && visibility !== "public") {
+    throw new CollectionError("invalid_visibility", "Collection visibility is invalid");
   }
+  return visibility;
 }
 
 /**
- * Create an owner-only named collection. Names are unique per owner
- * (case-insensitive) so collections stay deterministic and unambiguous.
+ * Create a bookmark collection owned by a single account. Collections default
+ * to private so they are never exposed publicly without an explicit opt-in.
  */
-export function createCollection(
-  input: CreateCollectionInput,
-  existing: BookmarkCollection[] = [],
-): BookmarkCollection {
+export function createCollection(input: CreateCollectionInput): BookmarkCollection {
   const now = input.now ?? new Date();
   const name = normalizeCollectionName(input.name);
-  const key = name.toLowerCase();
-  const clash = existing.some(
-    (collection) => collection.ownerId === input.ownerId && collection.name.toLowerCase() === key,
-  );
-  if (clash) {
-    throw new CollectionError("invalid_name", "Collection name is already in use");
-  }
+  const visibility = normalizeCollectionVisibility(input.visibility);
   return {
-    id: `collection_${input.ownerId}_${key.replace(/[^a-z0-9]+/g, "-")}`,
+    id: `collection_${input.ownerId}_${now.getTime()}`,
     ownerId: input.ownerId,
     name,
+    visibility,
+    itemIds: [],
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
   };
 }
 
 /**
- * List a single owner's collections in deterministic order (name, then id).
- * Never returns collections owned by other users.
+ * Add an item to a collection. Only the owning account may mutate the
+ * collection; items are de-duplicated and the collection is size-capped.
  */
-export function listCollections(
-  collections: BookmarkCollection[],
-  ownerId: string,
-): BookmarkCollection[] {
-  return collections
-    .filter((collection) => collection.ownerId === ownerId)
-    .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
-}
-
-/**
- * List items in a collection in deterministic order (addedAt, then
- * confessionId). Requires the caller to be the collection owner.
- */
-export function listCollectionItems(
-  collection: BookmarkCollection,
-  items: CollectionItem[],
-  actorId: string,
-): CollectionItem[] {
-  assertCollectionOwner(collection, actorId);
-  return items
-    .filter((item) => item.collectionId === collection.id)
-    .sort((a, b) => a.addedAt.localeCompare(b.addedAt) || a.confessionId.localeCompare(b.confessionId));
-}
-
-/**
- * Add a saved confession to a collection. Rejects duplicates within the same
- * collection and enforces a per-collection cap. Requires owner authorization.
- */
-export function addCollectionItem(input: AddCollectionItemInput): CollectionItem {
-  const { collection, items, actorId, confessionId } = input;
+export function addCollectionItem(input: AddCollectionItemInput): BookmarkCollection {
+  const { collection, ownerId, itemId } = input;
   const now = input.now ?? new Date();
-  assertCollectionOwner(collection, actorId);
-  if (typeof confessionId !== "string" || !confessionId.trim()) {
-    throw new CollectionError("item_not_found", "Confession id is required");
+
+  if (!collection || collection.ownerId !== ownerId) {
+    throw new CollectionError("unauthorized", "Unauthorized: only the owner may modify a collection");
   }
-  const scoped = items.filter((item) => item.collectionId === collection.id);
-  if (scoped.some((item) => item.confessionId === confessionId)) {
-    throw new CollectionError("duplicate_item", "Confession is already in this collection");
+  const normalizedItem = typeof itemId === "string" ? itemId.trim() : "";
+  if (!normalizedItem) {
+    throw new CollectionError("invalid_item", "Collection item id is empty");
   }
-  if (scoped.length >= COLLECTION_MAX_ITEMS) {
+  if (collection.itemIds.includes(normalizedItem)) {
+    throw new CollectionError("duplicate_item", "Item is already in the collection");
+  }
+  if (collection.itemIds.length >= COLLECTION_MAX_ITEMS) {
     throw new CollectionError("collection_full", "Collection has reached its item limit");
   }
-  return { collectionId: collection.id, confessionId, addedAt: now.toISOString() };
+
+  return {
+    ...collection,
+    itemIds: [...collection.itemIds, normalizedItem],
+    updatedAt: now.toISOString(),
+  };
 }
 
-/**
- * Remove a saved confession from a collection. Requires owner authorization and
- * fails explicitly when the item is not present.
- */
-export function removeCollectionItem(input: RemoveCollectionItemInput): CollectionItem[] {
-  const { collection, items, actorId, confessionId } = input;
-  assertCollectionOwner(collection, actorId);
-  const scoped = items.filter((item) => item.collectionId === collection.id);
-  if (!scoped.some((item) => item.confessionId === confessionId)) {
-    throw new CollectionError("item_not_found", "Confession is not in this collection");
+export const ANNOTATION_MAX_LENGTH = 2000;
+
+export interface ReaderAnnotation {
+  id: string;
+  ownerId: string;
+  confessionId: string;
+  ciphertext: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AnnotationCipher {
+  encrypt: (plaintext: string) => string;
+  decrypt: (ciphertext: string) => string;
+}
+
+export interface CreateAnnotationInput {
+  ownerId: string;
+  confessionId: string;
+  note: string;
+  cipher: AnnotationCipher;
+  now?: Date;
+}
+
+export interface UpdateAnnotationInput {
+  annotation: ReaderAnnotation;
+  ownerId: string;
+  note: string;
+  cipher: AnnotationCipher;
+  now?: Date;
+}
+
+export interface ReadAnnotationInput {
+  annotation: ReaderAnnotation;
+  ownerId: string;
+  cipher: AnnotationCipher;
+}
+
+export interface DeleteAnnotationInput {
+  annotation: ReaderAnnotation;
+  ownerId: string;
+}
+
+export interface AnnotationExportOptions {
+  includeAnnotations?: boolean;
+}
+
+export type AnnotationErrorCode =
+  | "invalid_note"
+  | "invalid_confession"
+  | "unauthorized"
+  | "encryption_failed"
+  | "decryption_failed";
+
+export class AnnotationError extends Error {
+  readonly code: AnnotationErrorCode;
+
+  constructor(code: AnnotationErrorCode, message: string) {
+    super(message);
+    this.name = "AnnotationError";
+    this.code = code;
   }
-  return items.filter(
-    (item) => !(item.collectionId === collection.id && item.confessionId === confessionId),
-  );
+}
+
+function normalizeAnnotationNote(note: string): string {
+  const normalized = typeof note === "string" ? note.trim() : "";
+  if (!normalized || normalized.length > ANNOTATION_MAX_LENGTH) {
+    throw new AnnotationError("invalid_note", "Annotation note is empty or too long");
+  }
+  return normalized;
+}
+
+function assertAnnotationOwner(annotation: ReaderAnnotation, ownerId: string): void {
+  if (!annotation || annotation.ownerId !== ownerId) {
+    throw new AnnotationError(
+      "unauthorized",
+      "Unauthorized: only the owning account may access this annotation",
+    );
+  }
 }
 
 /**
- * Clean up collection items when a saved confession is removed. Only the
- * owner's collections are touched; other users' collections are left intact.
- * Returns the remaining items after cascade removal.
+ * Create a private reader annotation attached to a saved confession. The note
+ * is encrypted at rest and stored only on the owning account; it is never
+ * written to public APIs, search indexes, analytics, notifications, or exports.
  */
-export function removeSavedConfession(input: RemoveSavedConfessionInput): CollectionItem[] {
-  const { collections, items, ownerId, confessionId } = input;
-  const ownedIds = new Set(
-    collections.filter((collection) => collection.ownerId === ownerId).map((c) => c.id),
-  );
-  return items.filter(
-    (item) => !(ownedIds.has(item.collectionId) && item.confessionId === confessionId),
-  );
+export function createAnnotation(input: CreateAnnotationInput): ReaderAnnotation {
+  const now = input.now ?? new Date();
+  const confessionId = typeof input.confessionId === "string" ? input.confessionId.trim() : "";
+  if (!confessionId) {
+    throw new AnnotationError("invalid_confession", "Annotation must reference a saved confession");
+  }
+  const note = normalizeAnnotationNote(input.note);
+
+  let ciphertext: string;
+  try {
+    ciphertext = input.cipher.encrypt(note);
+  } catch {
+    throw new AnnotationError("encryption_failed", "Failed to encrypt annotation note");
+  }
+  if (typeof ciphertext !== "string" || !ciphertext) {
+    throw new AnnotationError("encryption_failed", "Failed to encrypt annotation note");
+  }
+
+  return {
+    id: `annotation_${input.ownerId}_${now.getTime()}`,
+    ownerId: input.ownerId,
+    confessionId,
+    ciphertext,
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+  };
 }
 
-const REDACTED = "[redacted]";
+/**
+ * Update an existing annotation's note. Only the owning account may update it;
+ * the new note is re-encrypted before persistence.
+ */
+export function updateAnnotation(input: UpdateAnnotationInput): ReaderAnnotation {
+  const { annotation, ownerId, cipher } = input;
+  const now = input.now ?? new Date();
+  assertAnnotationOwner(annotation, ownerId);
+  const note = normalizeAnnotationNote(input.note);
 
-function redactId(value: string): string {
-  if (!v
+  let ciphertext: string;
+  try {
+    ciphertext = cipher.encrypt(note);
+  } catch {
+    throw new AnnotationError("encryption_failed", "Failed to encrypt annotation note");
+  }
+  if (typeof ciphertext !== "string" || !ciphertext) {
+    throw new AnnotationError("encryption_failed", "Failed to encrypt annotation note");
+  }
 
-/* … truncated 6132 chars — edit only what you need near the top … */
+  return { ...annotation, ciphertext, updatedAt: now.toISOString() };
+}
+
+/**
+ * Decrypt an annotation for the owning account only. Any other caller is
+ * rejected before decryption is attempted.
+ */
+export function readAnnotation(input: ReadAnnotationInput): string {
+  const { annotation, ownerId, cipher } = input;
+  assertAnnotationOwner(annotation, ownerId);
+  try {
+    return cipher.decrypt(annotation.ciphertext);
+  } catch {
+    throw new AnnotationError("decryption_failed", "Failed to decrypt annotation note");
+  }
+}
+
+/**
+ * Delete an annotation. Only the owning account may delete it.
+ */
+export function deleteAnnotation(input: DeleteAnnotationInput): void {
+  assertAnnotationOwner(input.annotation, input.ownerId);
+}
+
+/**
+ * Serialize annotations for export. Annotations are excluded by default and
+ * only included when the caller explicitly opts in.
+ */
+export function exportAnnotations(
+  annotations: ReaderAnnotation[],
+  ownerId: string,
+  options: AnnotationExportOptions = {},
+): ReaderAnnotation[] {
+  if (!options.includeAnnotations) return [];
+  return annotations
+    .filter((annotation) => annotation.ownerId === ownerId)
+    .map((annotation) => ({ ...annotation }));
+}
