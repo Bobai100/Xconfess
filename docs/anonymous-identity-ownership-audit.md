@@ -1,5 +1,28 @@
 # Anonymous Identity and Ownership Security Audit
 
+## Account and Preference Ownership Boundary
+
+Personalization and discovery preferences are account-owned state. They are
+persisted against the authenticated account and must not be written, read,
+cached, or exported as browser-local state belonging to another account.
+
+| Preference | Owner | Account-switch behavior |
+|---|---|---|
+| Personalization opt-out / enabled flag | Authenticated account | Load only for the active account; invalidate account discovery caches on change. |
+| Discovery diversity threshold | Authenticated account | Do not copy to a browser default or carry it into another account session. |
+| Excluded discovery categories | Authenticated account | Replace only the active account's value; clear session-derived views on logout. |
+| Saved searches and search history | Authenticated account | Bind reads and writes to `req.user.id`; never reuse another account's rows. |
+| Anonymous context / draft identity | Unlinked anonymous identity or linked account identity | Linked identities remain visible only to the owning account; account switches require re-resolution. |
+| Device-only transient UI state | Browser | Never treated as an account preference; discard when it contains owner-sensitive ranking signals. |
+
+Invalid or failed preference operations return `400` for validation failures,
+`401` for missing authentication, `403` for mismatched account ownership,
+and `404` for missing owner-bound records. Writes fail closed: the prior
+account preference remains authoritative when persistence or cache
+invalidation fails. On account switch or logout, in-memory personalized
+recommendations and account-bound caches are cleared or replaced before the
+next account request is served.
+
 Issue: #1694
 
 ## Threat Model

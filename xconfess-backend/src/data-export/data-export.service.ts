@@ -1031,6 +1031,7 @@ export class DataExportService {
       userId,
       exportedAt: new Date().toISOString(),
       userStatus: user.is_active ? 'active' : 'deactivated',
+      exportManifest: this.buildExportManifest(),
       confessions: redactedConfessions,
       comments: redactedComments,
       messages: redactedMessages,
@@ -1224,6 +1225,48 @@ export class DataExportService {
       reviewedBy: '[REDACTED]',
       _redacted: true,
       _reason: 'counterpart_privacy',
+    };
+  }
+
+  buildExportManifest(): {
+    schemaVersion: '1.0';
+    files: Array<{
+      name: string;
+      source: string;
+      fields: Array<{ name: string; type: string; nullable: boolean; description: string }>;
+    }>;
+  } {
+    return {
+      schemaVersion: '1.0',
+      files: [
+        {
+          name: 'complete_data.json',
+          source: 'user-owned application records',
+          fields: [
+            { name: 'userId', type: 'string', nullable: false, description: 'The account identifier for this export.' },
+            { name: 'exportedAt', type: 'string', nullable: false, description: 'UTC timestamp at which the snapshot was compiled.' },
+            { name: 'userStatus', type: 'string', nullable: false, description: 'Current account status at export time.' },
+            { name: 'confessions', type: 'array', nullable: false, description: 'Confessions linked to the authenticated account.' },
+            { name: 'comments', type: 'array', nullable: false, description: 'Comments linked to the authenticated account.' },
+            { name: 'messages', type: 'array', nullable: false, description: 'Messages linked to the authenticated account.' },
+            { name: 'tips', type: 'array', nullable: false, description: 'Tips linked to the authenticated account.' },
+            { name: 'reports', type: 'array', nullable: false, description: 'Reports submitted or linked to the account.' },
+            { name: 'moderationLogs', type: 'array', nullable: false, description: 'Moderation records where the account is the subject.' },
+            { name: 'reactions', type: 'array', nullable: false, description: 'User reactions included in the export.' },
+          ],
+        },
+        {
+          name: 'confessions.csv',
+          source: 'user-owned confession records',
+          fields: [
+            { name: 'id', type: 'string', nullable: false, description: 'Confession identifier.' },
+            { name: 'title', type: 'string', nullable: true, description: 'Confession title when available.' },
+            { name: 'body', type: 'string', nullable: true, description: 'Redacted or original confession body permitted by export policy.' },
+            { name: 'category', type: 'string', nullable: true, description: 'User-selected confession category.' },
+            { name: 'createdAt', type: 'string', nullable: false, description: 'Confession creation timestamp.' },
+          ],
+        },
+      ],
     };
   }
 

@@ -10,6 +10,14 @@ Reference for export job lifecycle, download token behaviour, and retention defa
 | Rate limit | 1 per 7 days per user | Hardcoded in `requestExport()` |
 | Token cleanup | Runs via `expireStaleDownloadTokens()` | `DATA_EXPORT_TTL_MS` env var |
 
+## Export Manifest
+
+Exports include `export_manifest.json` with `schemaVersion: "1.0"`. The manifest
+lists each exported file, its source, and each field's type and nullability.
+It does not include credentials, tokens, staff-only moderation annotations,
+internal secret names, or deleted content. The field descriptions are additive
+metadata and do not change the existing ZIP or JSON download contract.
+
 ## Export Statuses
 
 | Status | Meaning |

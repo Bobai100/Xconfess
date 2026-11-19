@@ -23,6 +23,8 @@ export class SearchDiscoveryService {
     private savedSearchRepo: Repository<SavedSearch>,
     @InjectRepository(SearchHistory)
     private searchHistoryRepo: Repository<SearchHistory>,
+    @InjectRepository(UserDiscoveryPreference)
+    private discoveryPreferenceRepo: Repository<UserDiscoveryPreference>,
     private readonly searchAbuseGuard: SearchAbuseGuard,
   ) {}
 
