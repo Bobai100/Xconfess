@@ -394,3 +394,6 @@ When adding a new API endpoint, follow the [API endpoint contributor checklist](
 
 <!-- handsoff-issue-352 -->
 - #352: [Advanced] Offer reusable feed-filter presets with user-controlled names
+
+<!-- handsoff-issue-357 -->
+- #357: [Advanced] Add reader-side controls for sensitive-content categories
