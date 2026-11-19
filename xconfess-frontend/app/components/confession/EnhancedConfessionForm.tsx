@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import axios from "axios";
+import { v4 as uuidv4 } from "uuid";
 import {
   Card,
   CardContent,
@@ -106,8 +107,11 @@ export const EnhancedConfessionForm: React.FC<EnhancedConfessionFormProps> = ({
   const [errors, setErrors] = useState<ValidationErrors>({});
   const [stellarTxHash, setStellarTxHash] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [canRetrySubmission, setCanRetrySubmission] = useState(false);
   const [submitSuccess, setSubmitSuccess] = useState(false);
 
+  const isSubmittingRef = useRef(false);
+  const submissionIdentityRef = useRef<{ fingerprint: string; key: string } | null>(null);
   const submitSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null
   );
@@ -131,9 +135,11 @@ export const EnhancedConfessionForm: React.FC<EnhancedConfessionFormProps> = ({
     setEnableStellarAnchor(false);
     setErrors({});
     setSubmitError(null);
+    setCanRetrySubmission(false);
     setSubmitSuccess(false);
     setStellarTxHash(null);
     setIsPreviewMode(false);
+    submissionIdentityRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -157,6 +163,7 @@ export const EnhancedConfessionForm: React.FC<EnhancedConfessionFormProps> = ({
 
   const handleLoadDraft = (draft: Draft) => {
     setTitle(draft.title || "");
+    if (draft.body !== body) setStellarTxHash(null);
     setBody(draft.body);
     setGender(draft.gender);
     setTimeout(() => {
@@ -165,6 +172,7 @@ export const EnhancedConfessionForm: React.FC<EnhancedConfessionFormProps> = ({
   };
 
   const handleTextChange = (newText: string, cursorPos: number) => {
+    if (newText !== body) setStellarTxHash(null);
     setBody(newText);
     requestAnimationFrame(() => {
       setTimeout(() => {
@@ -180,7 +188,9 @@ export const EnhancedConfessionForm: React.FC<EnhancedConfessionFormProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingRef.current) return;
     setSubmitError(null);
+    setCanRetrySubmission(false);
     setSubmitSuccess(false);
 
     if (hasValidationErrors) {
@@ -195,12 +205,29 @@ export const EnhancedConfessionForm: React.FC<EnhancedConfessionFormProps> = ({
       return;
     }
 
+    const fingerprint = JSON.stringify({
+      title: title || null,
+      body,
+      gender: gender ?? null,
+      enableStellarAnchor,
+      publicKey,
+    });
+    let submissionIdentity = submissionIdentityRef.current;
+    if (submissionIdentity?.fingerprint !== fingerprint) {
+      submissionIdentity = {
+        fingerprint,
+        key: uuidv4(),
+      };
+      submissionIdentityRef.current = submissionIdentity;
+    }
+    const submissionKey = submissionIdentity.key;
+
+    isSubmittingRef.current = true;
     setIsSubmitting(true);
+    let txHash = enableStellarAnchor ? stellarTxHash ?? undefined : undefined;
 
     try {
-      let txHash: string | undefined;
-
-      if (enableStellarAnchor) {
+      if (enableStellarAnchor && !txHash) {
         const anchorResult = await anchor(body);
         if (anchorResult.success && anchorResult.txHash) {
           txHash = anchorResult.txHash;
@@ -221,47 +248,61 @@ export const EnhancedConfessionForm: React.FC<EnhancedConfessionFormProps> = ({
           stellarTxHash: txHash,
         },
         {
-          headers: publicKey ? { "x-stellar-wallet": publicKey } : undefined,
+          headers: {
+            ...(publicKey ? { "x-stellar-wallet": publicKey } : {}),
+            "Idempotency-Key": submissionKey,
+          },
         },
       );
 
-      setSubmitSuccess(true);
-      toast.success("Confession submitted successfully!");
-
-      if (onSubmit) {
-        onSubmit({
-          title,
-          body,
-          gender,
-          enableStellarAnchor,
-          stellarTxHash: txHash,
-        });
-      }
-
-      setTitle("");
-      setBody("");
-      setGender(undefined);
-      setEnableStellarAnchor(false);
-      setErrors({});
-      setSubmitError(null);
-      setStellarTxHash(null);
-      setIsPreviewMode(false);
-      clearPendingConfession();
-
-      if (submitSuccessTimerRef.current) {
-        clearTimeout(submitSuccessTimerRef.current);
-      }
-
-      submitSuccessTimerRef.current = setTimeout(() => {
-        setSubmitSuccess(false);
-      }, 2000);
     } catch (error) {
       const errorMessage = getSafeSubmissionErrorMessage(error);
       setSubmitError(errorMessage);
+      setCanRetrySubmission(
+        axios.isAxiosError(error) &&
+          (!error.response ||
+            error.response.status === 408 ||
+            error.response.status === 425 ||
+            error.response.status === 429 ||
+            error.response.status >= 500),
+      );
       toast.error(errorMessage);
+      return;
     } finally {
+      isSubmittingRef.current = false;
       setIsSubmitting(false);
     }
+
+    setSubmitSuccess(true);
+    toast.success("Confession submitted successfully!");
+
+    setTitle("");
+    setBody("");
+    setGender(undefined);
+    setEnableStellarAnchor(false);
+    setErrors({});
+    setSubmitError(null);
+    setCanRetrySubmission(false);
+    setStellarTxHash(null);
+    setIsPreviewMode(false);
+    clearPendingConfession();
+    submissionIdentityRef.current = null;
+
+    if (submitSuccessTimerRef.current) {
+      clearTimeout(submitSuccessTimerRef.current);
+    }
+
+    submitSuccessTimerRef.current = setTimeout(() => {
+      setSubmitSuccess(false);
+    }, 2000);
+
+    onSubmit?.({
+      title,
+      body,
+      gender,
+      enableStellarAnchor,
+      stellarTxHash: txHash,
+    });
   };
 
   useEffect(() => {
@@ -414,7 +455,10 @@ export const EnhancedConfessionForm: React.FC<EnhancedConfessionFormProps> = ({
                   id="confession-body"
                   ref={textareaRef}
                   value={body}
-                  onChange={(e) => setBody(e.target.value)}
+                  onChange={(e) => {
+                    if (e.target.value !== body) setStellarTxHash(null);
+                    setBody(e.target.value);
+                  }}
                   onKeyDown={(e) => {
                     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
                       e.preventDefault();
@@ -550,7 +594,7 @@ export const EnhancedConfessionForm: React.FC<EnhancedConfessionFormProps> = ({
               ) : (
                 <>
                   <Send className="mr-2 h-4 w-4" aria-hidden="true" />
-                  Publish confession
+                  {canRetrySubmission ? "Retry publishing" : "Publish confession"}
                 </>
               )}
             </Button>

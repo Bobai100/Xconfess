@@ -8,6 +8,7 @@ import { ReactionButton } from "./ReactionButtons";
 import { AnchorButton } from "./AnchorButton";
 import { TipButton } from "./TipButton";
 import { ShareButton } from "./ShareButton";
+import { ResilientMediaImage } from "./ResilientMediaImage";
 import type { NormalizedConfession } from "../../lib/utils/normalizeConfession";
 import { getTipStats, type TipStats } from "@/lib/services/tipping.service";
 
@@ -25,7 +26,6 @@ export const ConfessionCard = memo(({ confession }: Props) => {
   );
   const [showWarnedContent, setShowWarnedContent] = useState(false);
   const [avatarError, setAvatarError] = useState(false);
-  const [mediaError, setMediaError] = useState(false);
 
   useEffect(() => {
     if (!tipStats) {
@@ -140,24 +140,13 @@ export const ConfessionCard = memo(({ confession }: Props) => {
             </p>
           </ScrollRestorationLink>
 
-          {confession.mediaUrl && !mediaError && (
-            <div
-              className="relative my-3 w-full overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]"
-              style={{
-                aspectRatio: `${confession.mediaAspectRatio || 16 / 9}`,
-              }}
-              data-testid="media-geometry-box"
-            >
-              <Image
-                src={confession.mediaUrl}
-                alt="Confession media attachment"
-                fill
-                sizes="(max-width: 768px) 100vw, 768px"
-                className="object-cover transition-opacity duration-200"
-                loading="lazy"
-                onError={() => setMediaError(true)}
-              />
-            </div>
+          {confession.mediaUrl && (
+            <ResilientMediaImage
+              src={confession.mediaUrl}
+              alt={`Image attached to confession by ${authorName}`}
+              sizes="(max-width: 768px) 100vw, 768px"
+              aspectRatio={confession.mediaAspectRatio}
+            />
           )}
         </div>
       )}

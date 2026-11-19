@@ -1,0 +1,18 @@
+[
+  {
+    "route": "/",
+    "maxGzipKB": 200
+  },
+  {
+    "route": "/confessions",
+    "maxGzipKB": 250
+  },
+  {
+    "route": "/confessions/[id]",
+    "maxGzipKB": 250
+  },
+  {
+    "route": "/admin",
+    "maxGzipKB": 350
+  }
+]

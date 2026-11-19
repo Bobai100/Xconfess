@@ -147,6 +147,15 @@ describe("EnhancedConfessionForm", () => {
   });
 
   it("shows a user-safe message for API failures", async () => {
+    (useStellarWallet as jest.Mock).mockReturnValue({
+      anchor: jest.fn(),
+      isAvailable: true,
+      isConnected: true,
+      publicKey: "GTESTWALLET",
+      isLoading: false,
+      error: null,
+      connect: jest.fn(),
+    });
     (apiClient.post as jest.Mock).mockRejectedValue({
       isAxiosError: true,
       response: {
@@ -170,6 +179,102 @@ describe("EnhancedConfessionForm", () => {
     expect(toast.error).toHaveBeenCalledWith(
       "We could not publish your confession right now. Please try again later."
     );
+  });
+
+  it("does not offer an automatic retry for terminal validation failures", async () => {
+    (useStellarWallet as jest.Mock).mockReturnValue({
+      anchor: jest.fn(),
+      isAvailable: true,
+      isConnected: true,
+      publicKey: "GTESTWALLET",
+      isLoading: false,
+      error: null,
+      connect: jest.fn(),
+    });
+    (apiClient.post as jest.Mock).mockRejectedValue({
+      isAxiosError: true,
+      response: { status: 422, data: {} },
+    });
+
+    const user = userEvent.setup();
+    renderComposer();
+    const body = screen.getByRole("textbox", { name: /^confession/i });
+    await user.type(body, "My validated confession is retained.");
+    await user.click(screen.getByRole("button", { name: /publish confession/i }));
+
+    expect(await screen.findByText("Please review the highlighted fields and try again.")).toBeInTheDocument();
+    expect(body).toHaveValue("My validated confession is retained.");
+    expect(screen.getByRole("button", { name: /publish confession/i })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /retry publishing/i })).not.toBeInTheDocument();
+  });
+
+  it("preserves validated input and reuses the idempotency key on transient retry", async () => {
+    (useStellarWallet as jest.Mock).mockReturnValue({
+      anchor: jest.fn(),
+      isAvailable: true,
+      isConnected: true,
+      publicKey: "GTESTWALLET",
+      isLoading: false,
+      error: null,
+      connect: jest.fn(),
+    });
+    (apiClient.post as jest.Mock)
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 503, data: {} },
+      })
+      .mockResolvedValueOnce({ data: {} });
+
+    const user = userEvent.setup();
+    renderComposer();
+    const title = screen.getByLabelText(/title/i);
+    const body = screen.getByRole("textbox", { name: /^confession/i });
+
+    await user.type(title, "Still here");
+    await user.type(body, "My validated confession remains available.");
+    await user.click(screen.getByRole("button", { name: /publish confession/i }));
+
+    expect(await screen.findByRole("button", { name: /retry publishing/i })).toBeEnabled();
+    expect(title).toHaveValue("Still here");
+    expect(body).toHaveValue("My validated confession remains available.");
+
+    const firstKey = (apiClient.post as jest.Mock).mock.calls[0][2].headers["Idempotency-Key"];
+    await user.click(screen.getByRole("button", { name: /retry publishing/i }));
+
+    expect((apiClient.post as jest.Mock).mock.calls[1][2].headers["Idempotency-Key"]).toBe(firstKey);
+    await waitFor(() =>
+      expect(screen.getByText("Confession submitted successfully!")).toBeInTheDocument(),
+    );
+  });
+
+  it("ignores duplicate submit events while a request is pending", async () => {
+    (useStellarWallet as jest.Mock).mockReturnValue({
+      anchor: jest.fn(),
+      isAvailable: true,
+      isConnected: true,
+      publicKey: "GTESTWALLET",
+      isLoading: false,
+      error: null,
+      connect: jest.fn(),
+    });
+    (apiClient.post as jest.Mock).mockReturnValue(
+      new Promise(() => {
+        // Keep the request pending while duplicate submit events are dispatched.
+      }),
+    );
+
+    const user = userEvent.setup();
+    const { container } = renderComposer();
+    await user.type(
+      screen.getByRole("textbox", { name: /^confession/i }),
+      "A valid confession body.",
+    );
+    const form = getForm(container);
+
+    fireEvent.submit(form);
+    fireEvent.submit(form);
+
+    expect(apiClient.post).toHaveBeenCalledTimes(1);
   });
 
   it("resets the composer after a successful submission", async () => {

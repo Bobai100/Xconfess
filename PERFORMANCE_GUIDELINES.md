@@ -231,14 +231,14 @@ ORDER BY seq_tup_read DESC;
 
 ## Per-Route Bundle & Hydration Budgets
 
-Budgets are enforced per representative route so a single heavy page cannot silently regress initial load or hydration. The values below are the source of truth for the CI budget check; keep them in sync with the budget config used by the build.
+Initial JavaScript budgets are enforced per representative route so a single heavy page cannot silently regress initial load. The values below are the source of truth for the CI budget check; keep them in sync with the budget config used by the build. Hydration thresholds remain profiling targets and are not measured by the bundle check.
 
 ### Representative Routes
 
 | Route | Initial JS (gzip) | Hydration (TBT) | Notes |
 |-------|-------------------|-----------------|-------|
 | `/` (home) | 200KB | 200ms | Marketing/landing surface |
-| `/feed` | 250KB | 300ms | Primary authenticated list |
+| `/confessions` | 250KB | 300ms | Primary confession list |
 | `/confessions/[id]` | 250KB | 300ms | Detail view |
 | `/admin` | 350KB | 400ms | Admin panel, heavy tables |
 
@@ -250,18 +250,18 @@ Budgets are enforced per representative route so a single heavy page cannot sile
 
 ### Enforcing Budgets in CI
 
-Budgets are checked on every pull request against the representative routes above. A violation fails the job and prints the offending route, the measured value, and the budget it exceeded so the fix is actionable.
+The frontend CI job measures each representative route's distinct JavaScript chunks from Next.js's app build manifest, gzip-compresses each output chunk, and enforces the initial-JS limits above. A violation fails the job and prints the route, measured total, configured limit, and largest contributing chunks. Hydration TBT and long-task limits require browser profiling; they are not inferred from bundle sizes.
 
 ```bash
-# Bundle + hydration budget check (runs in CI)
+# Per-route JavaScript budget check (runs in CI after the frontend build)
 npm run frontend:budget
 ```
 
-When a route exceeds its budget, the output must include:
+When a route exceeds its JavaScript budget, the output includes:
 - the route path,
-- the measured size/time,
-- the configured budget,
-- the largest contributing chunks or imports.
+- the measured gzip size,
+- the configured gzip budget,
+- the largest contributing chunks.
 
 ### Detecting Oversized Imports
 
