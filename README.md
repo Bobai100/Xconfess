@@ -391,3 +391,6 @@ When adding a new API endpoint, follow the [API endpoint contributor checklist](
 
 <!-- handsoff-issue-350 -->
 - #350: [Advanced] Save and restore feed reading position across devices
+
+<!-- handsoff-issue-352 -->
+- #352: [Advanced] Offer reusable feed-filter presets with user-controlled names
