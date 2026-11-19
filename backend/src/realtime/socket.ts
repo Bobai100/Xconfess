@@ -55,6 +55,51 @@ function resolveSafetyFilters(userId: string): Record<SensitiveCategory, boolean
   return resolved;
 }
 
+// Consent-based polls on confession threads. Options are bounded, each poll has
+// an explicit close time, and votes are one-per-user. Voter identity is never
+// exposed: only aggregate counts and the caller's own choice are returned.
+const MAX_POLL_OPTIONS = 6;
+const MIN_POLL_OPTIONS = 2;
+const MAX_POLL_OPTION_LENGTH = 120;
+const MAX_POLL_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
+const MIN_POLL_DURATION_MS = 60 * 1000;
+
+interface Poll {
+  id: string;
+  threadId: string;
+  authorId: string;
+  options: string[];
+  closesAt: number;
+  // userId -> option index. Kept private; never serialized to other clients.
+  votes: Map<string, number>;
+}
+
+const polls = new Map<string, Poll>();
+let pollSeq = 0;
+
+function isOpen(poll: Poll): boolean {
+  return Date.now() < poll.closesAt;
+}
+
+// Aggregate results without leaking voter identity. Only counts and the
+// requesting user's own selection are included.
+function pollResults(poll: Poll, viewerId: string) {
+  const counts = poll.options.map(() => 0);
+  for (const index of poll.votes.values()) {
+    if (index >= 0 && index < counts.length) counts[index] += 1;
+  }
+  const myVote = poll.votes.has(viewerId) ? poll.votes.get(viewerId)! : null;
+  return {
+    id: poll.id,
+    threadId: poll.threadId,
+    options: poll.options.map((label, index) => ({ index, label, count: counts[index] })),
+    totalVotes: poll.votes.size,
+    closesAt: poll.closesAt,
+    closed: !isOpen(poll),
+    myVote,
+  };
+}
+
 function clearTimers(userId: string): void {
   const p = presenceExpiry.get(userId);
   if (p) clearTimeout(p);
@@ -177,6 +222,109 @@ export function attachRealtime(server: HttpServer): Server {
         socket.emit('safety:filters:update', resolveSafetyFilters(userId));
       },
     );
+
+    // Create a consent-based poll on a confession thread. The author controls
+    // the bounded option set and an explicit close time.
+    socket.on(
+      'poll:create',
+      (
+        payload:
+          | { threadId?: unknown; options?: unknown; durationMs?: unknown }
+          | undefined,
+      ) => {
+        const threadId = payload?.threadId;
+        const rawOptions = payload?.options;
+        const durationMs = payload?.durationMs;
+        if (typeof threadId !== 'string' || threadId.length === 0) {
+          socket.emit('poll:error', { code: 'invalid_thread', message: 'threadId is required' });
+          return;
+        }
+        if (!Array.isArray(rawOptions)) {
+          socket.emit('poll:error', { code: 'invalid_options', message: 'options must be an array' });
+          return;
+        }
+        const options = rawOptions.map((o) => (typeof o === 'string' ? o.trim() : ''));
+        if (
+          options.length < MIN_POLL_OPTIONS ||
+          options.length > MAX_POLL_OPTIONS ||
+          options.some((o) => o.length === 0 || o.length > MAX_POLL_OPTION_LENGTH) ||
+          new Set(options).size !== options.length
+        ) {
+          socket.emit('poll:error', {
+            code: 'invalid_options',
+            message: `Provide ${MIN_POLL_OPTIONS}-${MAX_POLL_OPTIONS} unique non-empty options`,
+          });
+          return;
+        }
+        if (
+          typeof durationMs !== 'number' ||
+          !Number.isFinite(durationMs) ||
+          durationMs < MIN_POLL_DURATION_MS ||
+          durationMs > MAX_POLL_DURATION_MS
+        ) {
+          socket.emit('poll:error', {
+            code: 'invalid_duration',
+            message: 'durationMs must be within the allowed range',
+          });
+          return;
+        }
+        pollSeq += 1;
+        const poll: Poll = {
+          id: `poll_${pollSeq}`,
+          threadId,
+          authorId: userId,
+          options,
+          closesAt: Date.now() + durationMs,
+          votes: new Map(),
+        };
+        polls.set(poll.id, poll);
+        io.emit('poll:created', pollResults(poll, userId));
+      },
+    );
+
+    // Cast a single vote. Re-voting is rejected to preserve one-vote semantics.
+    socket.on(
+      'poll:vote',
+      (payload: { pollId?: unknown; optionIndex?: unknown } | undefined) => {
+        const pollId = payload?.pollId;
+        const optionIndex = payload?.optionIndex;
+        const poll = typeof pollId === 'string' ? polls.get(pollId) : undefined;
+        if (!poll) {
+          socket.emit('poll:error', { code: 'not_found', message: 'Poll not found' });
+          return;
+        }
+        if (!isOpen(poll)) {
+          socket.emit('poll:error', { code: 'closed', message: 'Poll is closed' });
+          return;
+        }
+        if (
+          typeof optionIndex !== 'number' ||
+          !Number.isInteger(optionIndex) ||
+          optionIndex < 0 ||
+          optionIndex >= poll.options.length
+        ) {
+          socket.emit('poll:error', { code: 'invalid_option', message: 'Invalid option index' });
+          return;
+        }
+        if (poll.votes.has(userId)) {
+          socket.emit('poll:error', { code: 'already_voted', message: 'You have already voted' });
+          return;
+        }
+        poll.votes.set(userId, optionIndex);
+        // Broadcast aggregate results only; voter identity stays private.
+        io.emit('poll:results', pollResults(poll, userId));
+      },
+    );
+
+    socket.on('poll:results', (payload: { pollId?: unknown } | undefined) => {
+      const pollId = payload?.pollId;
+      const poll = typeof pollId === 'string' ? polls.get(pollId) : undefined;
+      if (!poll) {
+        socket.emit('poll:error', { code: 'not_found', message: 'Poll not found' });
+        return;
+      }
+      socket.emit('poll:results', pollResults(poll, userId));
+    });
 
     // Reconnect cleanup: remove stale presence/typing state on disconnect.
     socket.on('disconnect', () => {
