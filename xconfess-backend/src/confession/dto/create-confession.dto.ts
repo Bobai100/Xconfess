@@ -57,4 +57,13 @@ export class CreateConfessionDto {
   @IsOptional()
   @IsString()
   idempotencyKey?: string;
+
+  @ApiPropertyOptional({
+    description: 'Optional pseudonymous series handle for grouping related confessions.',
+    example: 'night-thoughts',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  seriesHandle?: string;
 }
