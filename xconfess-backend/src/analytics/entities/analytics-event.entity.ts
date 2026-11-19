@@ -22,6 +22,7 @@ export const ANALYTICS_EVENT_NAMES = [
   'stellar_tx_failed',
   'tip_completed',
   'soroban_event_indexed',
+  'soroban_range_reprocessed',
 ] as const;
 
 export type AnalyticsEventName = (typeof ANALYTICS_EVENT_NAMES)[number];

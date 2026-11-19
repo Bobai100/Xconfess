@@ -30,6 +30,10 @@ export default function QueryProvider({ children }: { children: React.ReactNode 
   );
 
   useEffect(() => {
+    const handleAccountChange = () => {
+      client.clear();
+    };
+    window.addEventListener("xconfess:account-change", handleAccountChange);
     const handleVisibilityChange = () => {
       if (!document.hidden) {
         client.invalidateQueries({
@@ -44,6 +48,7 @@ export default function QueryProvider({ children }: { children: React.ReactNode 
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
+      window.removeEventListener("xconfess:account-change", handleAccountChange);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [client]);

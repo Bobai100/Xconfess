@@ -26,8 +26,23 @@ describe('AnalyticsEventService', () => {
       metadata: {
         source: 'confession_service',
         confessionId: 'confession-1',
-        ignored: 'not persisted',
       },
+    });
+
+    it('rejects undeclared metadata fields before persistence', async () => {
+      const repository = makeRepository();
+      const service = new AnalyticsEventService(
+        repository as any,
+        makeConfig(),
+      );
+
+      await expect(
+        service.record({
+          eventName: 'user_login',
+          metadata: { source: 'auth_service', requestId: 'request-1' },
+        }),
+      ).rejects.toThrow('not declared');
+      expect(repository.save).not.toHaveBeenCalled();
     });
 
     expect(event).toMatchObject({

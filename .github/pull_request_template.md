@@ -39,6 +39,7 @@ Closes #<!-- issue number -->
 - [ ] This PR touches only the files needed to resolve the linked issue
 - [ ] I have not included unrelated refactors, style fixes, or dependency upgrades
 - [ ] Changed lines ≤ 400 and files touched ≤ 8 (excluding lockfiles and generated files)
+- [ ] For frontend changes, I reviewed the [frontend state-model checklist](../docs/frontend-state-model-review-checklist.md) (or marked it N/A)
 
 If this PR is necessarily larger, explain why it cannot be split:
 

@@ -335,6 +335,23 @@ audit trails stay consistent.
 
 ### Deletion Completion Records
 
+Deletion completion returns aggregate counts only. It identifies the primary,
+cache, queue, and search-index record classes that were processed, but never
+includes deleted content or identifiers from the deleted records.
+
+```json
+{
+  "completed": true,
+  "primary": { "deletedCount": 1 },
+  "cache": { "deletedCount": 0 },
+  "queue": { "cancelledCount": 1 },
+  "searchIndex": { "deletedCount": 0 }
+}
+```
+
+A partial or failed operation must retain the failed state and retry semantics;
+the receipt is only returned after the owning deletion operation completes.
+
 ```bash
 npm run backend:test
 ```

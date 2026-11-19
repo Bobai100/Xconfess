@@ -23,6 +23,11 @@ import { UserAnonymousUser } from "../../user/entities/user-anonymous-link.entit
 import { ConfigService } from "@nestjs/config";
 import { Tip } from "../../tipping/entities/tip.entity";
 import { AuditLogService } from "../../audit-log/audit-log.service";
+import {
+  SupportAccessPurpose,
+  SupportAccessReviewDto,
+  SupportAccessScope,
+} from "../dto/support-access-review.dto";
 import { JobManagementService } from "../../notifications/services/job-management.service";
 import { LockoutService } from "../../auth/lockout.service";
 import { SessionService } from "../../auth/session.service";
@@ -103,6 +108,101 @@ export class AdminService {
     work: (manager: EntityManager) => Promise<T>,
   ): Promise<T> {
     return this.reportRepository.manager.transaction(work);
+  }
+
+  async reviewSupportAccess(
+    userId: number,
+    dto: SupportAccessReviewDto,
+    adminId: number,
+    request?: Request,
+  ) {
+    if (!Number.isSafeInteger(userId) || userId < 1) {
+      throw new BadRequestException("A valid account ID is required.");
+    }
+
+    const validPurpose = Object.values(SupportAccessPurpose).includes(
+      dto.purpose,
+    );
+    const validScope = Object.values(SupportAccessScope).includes(dto.scope);
+    const requiredScope =
+      dto.purpose === SupportAccessPurpose.ACCOUNT_RECOVERY
+        ? SupportAccessScope.SECURITY_STATUS
+        : SupportAccessScope.ACCOUNT_STATUS;
+    const purposeMatchesScope =
+      validPurpose && validScope && dto.scope === requiredScope;
+    let user: User | null = null;
+    let lookupFailed = false;
+    let lookupError: unknown;
+    if (purposeMatchesScope) {
+      try {
+        user = await this.userRepository.findOne({
+          where: { id: userId },
+          select: {
+            id: true,
+            username: true,
+            role: true,
+            is_active: true,
+            totpEnabled: true,
+          },
+        });
+      } catch (error) {
+        lookupFailed = true;
+        lookupError = error;
+      }
+    }
+
+    const requestId = (request as (Request & { requestId?: string }) | undefined)
+      ?.requestId;
+    await this.auditLogService.logRequired({
+      actionType: AuditActionType.ADMIN_SUPPORT_ACCESS_REVIEWED,
+      metadata: {
+        entityType: "support_access",
+        entityId: String(userId),
+        decision: user && !lookupFailed ? "allowed" : "denied",
+        purpose: dto.purpose,
+        scope: dto.scope,
+        ...(lookupFailed ? { reason: "account_lookup_failed" } : {}),
+        ...(!user && !lookupFailed ? { reason: "account_not_found" } : {}),
+      },
+      context: {
+        userId: adminId,
+        requestId,
+        actor: { type: "admin", id: String(adminId), userId: String(adminId) },
+      },
+    });
+
+    if (lookupFailed) {
+      throw lookupError;
+    }
+    if (!purposeMatchesScope) {
+      throw new ForbiddenException(
+        "The requested support scope is not permitted for this purpose.",
+      );
+    }
+    if (!user) {
+      throw new NotFoundException("Account not found.");
+    }
+
+    const subject =
+      dto.scope === SupportAccessScope.ACCOUNT_STATUS
+        ? {
+            id: user.id,
+            username: user.username,
+            role: user.role,
+            isActive: user.is_active,
+          }
+        : {
+            id: user.id,
+            isActive: user.is_active,
+            twoFactorEnabled: user.totpEnabled,
+          };
+
+    return {
+      decision: "allowed" as const,
+      purpose: dto.purpose,
+      scope: dto.scope,
+      subject,
+    };
   }
 
   // Reports

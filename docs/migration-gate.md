@@ -9,6 +9,13 @@ The migration gate (`scripts/migration-gate.js`) runs in CI and before every
 deployment to catch unsafe or broken migrations before they reach a live
 database.
 
+The CI migration job also runs `data-classification:gate`. For changed TypeORM
+entities and migrations, it requires an owning module and classifies newly
+added columns against `docs/data-classification-registry.json`. A migration
+with no column data changes still needs an owner and an operational/data
+classification. The job compares against the pull request's base branch and
+blocks when the registry is missing or incomplete.
+
 ## Checks performed
 
 ### 1. Duplicate timestamp detection

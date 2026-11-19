@@ -635,3 +635,55 @@ export function submitConfessionCorrection(
     },
   };
 }
+
+/**
+ * Set or clear the retention deadline on a user-owned draft.
+ *
+ * Authorization: only the draft owner may set the deadline. Published content
+ * is never eligible for expiry. Deadlines must be valid ISO-8601 timestamps in
+ * the future; malformed or past values are rejected with a typed error so the
+ * API layer can map them to 4xx responses. The input draft is not mutated; a
+ * new record is returned so callers can persist it idempotently.
+ */
+export function setDraftExpiry(input: SetDraftExpiryInput): DraftExpiryResult {
+  const { draft, requesterId, expiresAt } = input;
+  const now = input.now ?? new Date();
+
+  if (!draft) {
+    throw new DraftExpiryError("Draft not found", "not_found");
+  }
+
+  if (draft.ownerId !== requesterId) {
+    throw new DraftExpiryError(
+      "Only the draft owner may set an expiry deadline",
+      "forbidden",
+    );
+  }
+
+  if (draft.status !== "draft") {
+    throw new DraftExpiryError(
+      "Published content cannot be scheduled for expiry",
+      "not_a_draft",
+    );
+  }
+
+  if (expiresAt === null) {
+    return { draft: { ...draft, expiresAt: null }, expiresAt: null };
+  }
+
+  if (typeof expiresAt !== "string" || expiresAt.trim() === "") {
+    throw new DraftExpiryError("Deadline must be an ISO-8601 timestamp", "invalid_deadline");
+  }
+
+  const parsed = new Date(expiresAt);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new DraftExpiryError("Deadline must be an ISO-8601 timestamp", "invalid_deadline");
+  }
+
+  if (parsed.getTime() <= now.getTime()) {
+    throw new DraftExpiryError("Deadline must be in the future", "invalid_deadline");
+  }
+
+  const normalized = parsed.toISOString();
+  return { draft: { ...draft, expiresAt: normalized }, expiresAt: normalized };
+}
