@@ -114,6 +114,195 @@ export class PollError extends Error {
   }
 }
 
+export type TopicStatus = "pending" | "approved" | "rejected" | "archived";
+
+export interface Topic {
+  id: string;
+  slug: string;
+  label: string;
+  aliases: string[];
+  status: TopicStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TopicDirectoryEntry {
+  id: string;
+  slug: string;
+  label: string;
+  aliases: string[];
+}
+
+export interface CreateTopicInput {
+  slug: string;
+  label: string;
+  aliases?: string[];
+  now?: Date;
+}
+
+export interface TransitionTopicInput {
+  topic: Topic;
+  to: TopicStatus;
+  authorize: (action: "moderate") => boolean;
+  now?: Date;
+}
+
+export type TopicErrorCode =
+  | "invalid_slug"
+  | "invalid_label"
+  | "invalid_alias"
+  | "duplicate_topic"
+  | "unknown_topic"
+  | "unauthorized"
+  | "invalid_transition";
+
+export class TopicError extends Error {
+  readonly code: TopicErrorCode;
+
+  constructor(code: TopicErrorCode, message: string) {
+    super(message);
+    this.name = "TopicError";
+    this.code = code;
+  }
+}
+
+const TOPIC_SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const TOPIC_MAX_SLUG_LENGTH = 64;
+const TOPIC_MAX_LABEL_LENGTH = 80;
+const TOPIC_MAX_ALIASES = 10;
+
+const TOPIC_TRANSITIONS: Record<TopicStatus, TopicStatus[]> = {
+  pending: ["approved", "rejected"],
+  approved: ["archived"],
+  rejected: ["pending"],
+  archived: ["pending"],
+};
+
+function normalizeTopicSlug(slug: string): string {
+  if (typeof slug !== "string") {
+    throw new TopicError("invalid_slug", "Topic slug must be a string");
+  }
+  const normalized = slug.trim().toLowerCase();
+  if (!normalized || normalized.length > TOPIC_MAX_SLUG_LENGTH) {
+    throw new TopicError("invalid_slug", "Topic slug is empty or too long");
+  }
+  if (!TOPIC_SLUG_PATTERN.test(normalized)) {
+    throw new TopicError("invalid_slug", "Topic slug must be lowercase kebab-case");
+  }
+  return normalized;
+}
+
+function normalizeTopicAliases(aliases: string[] | undefined): string[] {
+  if (aliases === undefined) return [];
+  if (!Array.isArray(aliases)) {
+    throw new TopicError("invalid_alias", "Topic aliases must be an array");
+  }
+  if (aliases.length > TOPIC_MAX_ALIASES) {
+    throw new TopicError("invalid_alias", `Topic allows at most ${TOPIC_MAX_ALIASES} aliases`);
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const alias of aliases) {
+    const normalized = typeof alias === "string" ? alias.trim().toLowerCase() : "";
+    if (!normalized) {
+      throw new TopicError("invalid_alias", "Topic aliases must not be empty");
+    }
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+/**
+ * Create a topic in the pending moderation state with a stable slug identifier
+ * and normalized aliases. Rejects duplicate slugs/aliases against existing
+ * topics so identifiers stay stable and unambiguous.
+ */
+export function createTopic(input: CreateTopicInput, existing: Topic[] = []): Topic {
+  const now = input.now ?? new Date();
+  const slug = normalizeTopicSlug(input.slug);
+  const label = typeof input.label === "string" ? input.label.trim() : "";
+  if (!label || label.length > TOPIC_MAX_LABEL_LENGTH) {
+    throw new TopicError("invalid_label", "Topic label is empty or too long");
+  }
+  const aliases = normalizeTopicAliases(input.aliases);
+
+  const taken = new Set<string>();
+  for (const topic of existing) {
+    taken.add(topic.slug);
+    for (const alias of topic.aliases) taken.add(alias);
+  }
+  if (taken.has(slug) || aliases.some((alias) => taken.has(alias))) {
+    throw new TopicError("duplicate_topic", "Topic slug or alias is already in use");
+  }
+
+  return {
+    id: `topic_${slug}`,
+    slug,
+    label,
+    aliases,
+    status: "pending",
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+  };
+}
+
+/**
+ * Apply a moderation lifecycle transition. Requires explicit authorization and
+ * only permits transitions defined by the lifecycle graph.
+ */
+export function transitionTopic(input: TransitionTopicInput): Topic {
+  const { topic, to, authorize } = input;
+  const now = input.now ?? new Date();
+
+  if (!authorize("moderate")) {
+    throw new TopicError("unauthorized", "Unauthorized: topic moderation requires authorization");
+  }
+  if (!topic || !TOPIC_TRANSITIONS[topic.status]) {
+    throw new TopicError("unknown_topic", "Topic does not exist");
+  }
+  if (!TOPIC_TRANSITIONS[topic.status].includes(to)) {
+    throw new TopicError(
+      "invalid_transition",
+      `Cannot transition topic from ${topic.status} to ${to}`,
+    );
+  }
+
+  return { ...topic, status: to, updatedAt: now.toISOString() };
+}
+
+/**
+ * Build the public topic directory. Only approved topics are exposed; pending,
+ * rejected, and archived topics are never surfaced to public browse clients.
+ */
+export function listPublicTopics(topics: Topic[]): TopicDirectoryEntry[] {
+  return topics
+    .filter((topic) => topic.status === "approved")
+    .map((topic) => ({
+      id: topic.id,
+      slug: topic.slug,
+      label: topic.label,
+      aliases: [...topic.aliases],
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+/**
+ * Resolve a topic by its stable slug or any alias, restricted to public
+ * (approved) topics so private or deleted content is never reachable.
+ */
+export function resolvePublicTopic(topics: Topic[], identifier: string): TopicDirectoryEntry | null {
+  const key = typeof identifier === "string" ? identifier.trim().toLowerCase() : "";
+  if (!key) return null;
+  const match = topics.find(
+    (topic) =>
+      topic.status === "approved" && (topic.slug === key || topic.aliases.includes(key)),
+  );
+  if (!match) return null;
+  return { id: match.id, slug: match.slug, label: match.label, aliases: [...match.aliases] };
+}
+
 const REDACTED = "[redacted]";
 
 function redactId(value: string): string {
@@ -295,17 +484,19 @@ export function aggregatePollResults(
   }
 
   const totalVotes = pollVotes.length;
+  const closed = now.getTime() >= new Date(poll.closesAt).getTime();
+
   return {
     pollId: poll.id,
     totalVotes,
-    closed: now.getTime() >= new Date(poll.closesAt).getTime(),
+    closed,
     options: poll.options.map((option) => {
-      const optionVotes = counts.get(option.id) ?? 0;
+      const votes = counts.get(option.id) ?? 0;
       return {
         optionId: option.id,
         label: option.label,
-        votes: optionVotes,
-        percentage: totalVotes === 0 ? 0 : Math.round((optionVotes / totalVotes) * 100),
+        votes,
+        percentage: totalVotes === 0 ? 0 : Math.round((votes / totalVotes) * 100),
       };
     }),
   };
