@@ -1,0 +1,16 @@
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "lint": "eslint . --ext .ts,.tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "tokens:check": "node scripts/check-token-drift.mjs"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}
