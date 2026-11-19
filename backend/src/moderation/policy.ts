@@ -43,10 +43,44 @@ export interface ReplayOptions {
   authorize: (action: "replay") => boolean;
 }
 
-export const POLL_MIN_OPTIONS = 2;
-export const POLL_MAX_OPTIONS = 6;
-export const POLL_MAX_OPTION_LENGTH = 120;
-export const POLL_MAX_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
+export interface ConfessionCorrectionInput {
+  confessionId: string;
+  authorId: string;
+  originalText: string;
+  correctedText: string;
+  reason?: string;
+}
+
+export interface ConfessionCorrectionRecord {
+  confessionId: string;
+  authorId: string;
+  originalText: string;
+  correctedText: string;
+  reason: string | null;
+  correctedAt: string;
+}
+
+export interface ConfessionCorrectionAudit {
+  confessionId: string;
+  authorId: string;
+  originalTextHash: string;
+  correctedTextHash: string;
+  reason: string | null;
+  correctedAt: string;
+}
+
+export interface ConfessionCorrectionResult {
+  record: ConfessionCorrectionRecord;
+  audit: ConfessionCorrectionAudit;
+}
+
+export interface ConfessionCorrectionOptions {
+  input: ConfessionCorrectionInput;
+  authorize: (action: "correct", confessionId: string, authorId: string) => boolean;
+  now?: () => Date;
+}
+
+const REDACTED = "[redacted]";
 
 export interface PollOption {
   id: string;
@@ -531,60 +565,73 @@ export function createAnnotation(input: CreateAnnotationInput): ReaderAnnotation
 }
 
 /**
- * Update an existing annotation's note. Only the owning account may update it;
- * the new note is re-encrypted before persistence.
+ * Deterministic, non-reversible hash of correction text for the audit trail.
+ * The audit record stores only hashes so it never duplicates confession
+ * content beyond the correction record itself.
  */
-export function updateAnnotation(input: UpdateAnnotationInput): ReaderAnnotation {
-  const { annotation, ownerId, cipher } = input;
-  const now = input.now ?? new Date();
-  assertAnnotationOwner(annotation, ownerId);
-  const note = normalizeAnnotationNote(input.note);
-
-  let ciphertext: string;
-  try {
-    ciphertext = cipher.encrypt(note);
-  } catch {
-    throw new AnnotationError("encryption_failed", "Failed to encrypt annotation note");
+function hashText(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
   }
-  if (typeof ciphertext !== "string" || !ciphertext) {
-    throw new AnnotationError("encryption_failed", "Failed to encrypt annotation note");
-  }
-
-  return { ...annotation, ciphertext, updatedAt: now.toISOString() };
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 /**
- * Decrypt an annotation for the owning account only. Any other caller is
- * rejected before decryption is attempted.
+ * Submit an explicit correction to a published confession.
+ *
+ * The corrected text is kept distinct from the original publication: the
+ * returned record carries both `originalText` and `correctedText`, and the
+ * audit entry stores only hashes plus the author id already associated with
+ * the confession. Callers must be explicitly authorized for the confession.
+ *
+ * Throws on unauthorized access or invalid input so callers can surface an
+ * explicit failure and retry with a corrected payload.
  */
-export function readAnnotation(input: ReadAnnotationInput): string {
-  const { annotation, ownerId, cipher } = input;
-  assertAnnotationOwner(annotation, ownerId);
-  try {
-    return cipher.decrypt(annotation.ciphertext);
-  } catch {
-    throw new AnnotationError("decryption_failed", "Failed to decrypt annotation note");
+export function submitConfessionCorrection(
+  options: ConfessionCorrectionOptions,
+): ConfessionCorrectionResult {
+  const { input, authorize, now } = options;
+
+  if (!input || !input.confessionId || !input.authorId) {
+    throw new Error("Invalid correction: confessionId and authorId are required");
   }
-}
 
-/**
- * Delete an annotation. Only the owning account may delete it.
- */
-export function deleteAnnotation(input: DeleteAnnotationInput): void {
-  assertAnnotationOwner(input.annotation, input.ownerId);
-}
+  if (!authorize("correct", input.confessionId, input.authorId)) {
+    throw new Error("Unauthorized: correction requires explicit authorization");
+  }
 
-/**
- * Serialize annotations for export. Annotations are excluded by default and
- * only included when the caller explicitly opts in.
- */
-export function exportAnnotations(
-  annotations: ReaderAnnotation[],
-  ownerId: string,
-  options: AnnotationExportOptions = {},
-): ReaderAnnotation[] {
-  if (!options.includeAnnotations) return [];
-  return annotations
-    .filter((annotation) => annotation.ownerId === ownerId)
-    .map((annotation) => ({ ...annotation }));
+  const originalText = typeof input.originalText === "string" ? input.originalText : "";
+  const correctedText = typeof input.correctedText === "string" ? input.correctedText.trim() : "";
+
+  if (!correctedText) {
+    throw new Error("Invalid correction: correctedText must not be empty");
+  }
+
+  if (correctedText === originalText.trim()) {
+    throw new Error("Invalid correction: correctedText must differ from the original");
+  }
+
+  const correctedAt = (now ? now() : new Date()).toISOString();
+  const reason = input.reason && input.reason.trim() ? input.reason.trim() : null;
+
+  return {
+    record: {
+      confessionId: input.confessionId,
+      authorId: input.authorId,
+      originalText,
+      correctedText,
+      reason,
+      correctedAt,
+    },
+    audit: {
+      confessionId: input.confessionId,
+      authorId: input.authorId,
+      originalTextHash: hashText(originalText),
+      correctedTextHash: hashText(correctedText),
+      reason,
+      correctedAt,
+    },
+  };
 }

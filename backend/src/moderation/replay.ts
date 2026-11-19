@@ -121,3 +121,166 @@ export function replayModerationDecisions(options: ReplayOptions): ReplayDiffRep
     cases: redactedCases,
   };
 }
+
+/**
+ * Confession correction workflow.
+ *
+ * Lets the author of a published confession submit a correction while:
+ * - keeping the corrected text clearly distinguished from the original
+ *   published text (the original is never overwritten),
+ * - recording a privacy-safe audit entry (only redacted identifiers and
+ *   content hashes/lengths, never raw author data or raw text),
+ * - defining explicit success, authorization/validation, and failure/retry
+ *   semantics for invalid or failed correction operations.
+ */
+export interface PublishedConfession {
+  confessionId: string;
+  authorId: string;
+  /** The original published text. Immutable once published. */
+  originalText: string;
+  /** The current corrected text, if a correction has been applied. */
+  correctedText?: string;
+  /** Monotonic revision counter; 0 means no correction applied yet. */
+  revision: number;
+}
+
+export interface CorrectionAuditEntry {
+  confessionId: string;
+  authorRef: string;
+  originalContentRef: string;
+  correctedContentRef: string;
+  originalLength: number;
+  correctedLength: number;
+  revision: number;
+  /** ISO timestamp of when the correction was recorded. */
+  recordedAt: string;
+}
+
+export interface CorrectionResult {
+  status: 'applied';
+  confession: PublishedConfession;
+  audit: CorrectionAuditEntry;
+}
+
+export class CorrectionAuthorizationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CorrectionAuthorizationError';
+  }
+}
+
+export class CorrectionValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CorrectionValidationError';
+  }
+}
+
+export class CorrectionConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CorrectionConflictError';
+  }
+}
+
+export interface CorrectionStore {
+  /** Persists the corrected confession and its audit entry atomically. */
+  saveCorrection(
+    confession: PublishedConfession,
+    audit: CorrectionAuditEntry,
+  ): Promise<void>;
+}
+
+export interface SubmitCorrectionOptions {
+  /** Caller must be the author of the confession. */
+  requesterId: string;
+  /** The confession being corrected. Never mutated. */
+  confession: PublishedConfession;
+  /** The proposed corrected text. */
+  correctedText: string;
+  /** Revision the caller last observed; guards against lost updates. */
+  expectedRevision: number;
+  /** Persistence boundary for the correction + audit record. */
+  store: CorrectionStore;
+  /** Injectable clock for deterministic audit timestamps. */
+  now?: () => Date;
+}
+
+const MAX_CORRECTION_LENGTH = 10_000;
+
+/**
+ * Submits an author correction to a published confession.
+ *
+ * Success: returns the updated confession (with `correctedText` set and
+ * `revision` incremented) plus a privacy-safe audit entry.
+ *
+ * Authorization: only the confession author may submit a correction.
+ *
+ * Validation: the corrected text must be non-empty, within the length limit,
+ * and actually differ from the currently published text.
+ *
+ * Failure/retry: a stale `expectedRevision` raises a conflict so the caller
+ * can re-read and retry; a persistence failure propagates so the caller can
+ * retry the whole operation idempotently (the original text is untouched).
+ */
+export async function submitConfessionCorrection(
+  options: SubmitCorrectionOptions,
+): Promise<CorrectionResult> {
+  const { requesterId, confession, correctedText, expectedRevision, store, now } = options;
+
+  if (!requesterId || requesterId !== confession.authorId) {
+    throw new CorrectionAuthorizationError(
+      'Only the confession author may submit a correction',
+    );
+  }
+
+  if (!store || typeof store.saveCorrection !== 'function') {
+    throw new CorrectionValidationError('A correction store is required');
+  }
+
+  if (typeof correctedText !== 'string' || correctedText.trim().length === 0) {
+    throw new CorrectionValidationError('Corrected text must not be empty');
+  }
+
+  if (correctedText.length > MAX_CORRECTION_LENGTH) {
+    throw new CorrectionValidationError(
+      `Corrected text must be at most ${MAX_CORRECTION_LENGTH} characters`,
+    );
+  }
+
+  if (expectedRevision !== confession.revision) {
+    throw new CorrectionConflictError(
+      'Confession was modified since it was read; re-read and retry',
+    );
+  }
+
+  const currentText = confession.correctedText ?? confession.originalText;
+  if (correctedText === currentText) {
+    throw new CorrectionValidationError(
+      'Corrected text must differ from the currently published text',
+    );
+  }
+
+  const revision = confession.revision + 1;
+  const updatedConfession: PublishedConfession = {
+    ...confession,
+    correctedText,
+    revision,
+  };
+
+  const recordedAt = (now ? now() : new Date()).toISOString();
+  const audit: CorrectionAuditEntry = {
+    confessionId: redactIdentifier(confession.confessionId),
+    authorRef: redactIdentifier(confession.authorId),
+    originalContentRef: redactIdentifier(confession.originalText),
+    correctedContentRef: redactIdentifier(correctedText),
+    originalLength: confession.originalText.length,
+    correctedLength: correctedText.length,
+    revision,
+    recordedAt,
+  };
+
+  await store.saveCorrection(updatedConfession, audit);
+
+  return { status: 'applied', confession: updatedConfession, audit };
+}
