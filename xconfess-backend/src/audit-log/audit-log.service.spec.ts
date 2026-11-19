@@ -110,6 +110,22 @@ describe('AuditLogService', () => {
     expect(mockRepository.save).toHaveBeenCalled();
   });
 
+  it('surfaces failures when a required access-decision audit cannot be saved', async () => {
+    mockRepository.save.mockRejectedValueOnce(new Error('database unavailable'));
+
+    await expect(
+      service.logRequired({
+        actionType: AuditActionType.ADMIN_SUPPORT_ACCESS_REVIEWED,
+        metadata: {
+          entityType: 'support_access',
+          entityId: '17',
+          decision: 'allowed',
+        },
+        context: { userId: 4, actor: { type: 'admin', id: '4' } },
+      }),
+    ).rejects.toThrow('database unavailable');
+  });
+
   it('records rollout before/after diff snapshots', async () => {
     mockRepository.create.mockReturnValue({} as AuditLog);
     mockRepository.save.mockResolvedValue({} as AuditLog);

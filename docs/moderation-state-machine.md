@@ -41,6 +41,23 @@ Self-transitions (`X → X`) are always rejected.
 - **Notifications** — users are notified on `approved`, `rejected`, and `hidden` transitions
 - **Event emitter** — `moderation.status.changed` event fired on every valid transition
 
+## Moderator Calibration
+
+Admins with the moderation capability can create a calibration session through
+`POST /api/admin/moderation/calibration-sessions`, list its selected cases at
+`GET /api/admin/moderation/calibration-sessions/:sessionId/cases`, submit
+interpretations at `POST .../:sessionId/assessments`, and view aggregate
+agreement at `GET .../:sessionId/results`.
+
+Sessions accept only case IDs from the checked-in synthetic moderation corpus.
+The cases response omits reference labels, and result responses contain
+decision counts and agreement rates but no reviewer identities or reference
+categories. Sessions live in process memory for at most two hours; they are
+lost on restart and require requests to reach the same backend instance.
+Unknown sessions return `404`, expired sessions return `410`, and duplicate
+reviewer decisions return `409`. Do not submit live reporter content or
+identifiers to this workflow.
+
 ## Code References
 
 - State machine logic: `src/moderation/moderation-state-machine.ts`

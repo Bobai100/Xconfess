@@ -47,6 +47,7 @@ export enum AuditActionType {
   USER_UNBANNED = 'user_unbanned',
   USER_ADMIN_GRANTED = 'user_admin_granted',
   USER_ADMIN_REVOKED = 'user_admin_revoked',
+  ADMIN_SUPPORT_ACCESS_REVIEWED = 'admin_support_access_reviewed',
 
   // Email template rollout actions
   EMAIL_TEMPLATE_DELIVERED = 'email_template_delivered',

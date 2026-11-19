@@ -69,6 +69,7 @@ import {
   CancelActionApprovalDto,
   RequestActionApprovalDto,
 } from './dto/request-action-approval.dto';
+import { SupportAccessReviewDto } from './dto/support-access-review.dto';
 
 export class CreateTemplateDto {
   @IsNotEmpty({ message: 'Name is required' })
@@ -486,6 +487,31 @@ export class AdminController {
       query,
       parseInt(limit || '20', 10),
       cursor,
+    );
+  }
+
+  @Post('users/:id/support-review')
+  @RequireCapability(CAPABILITY_MANAGE_USERS)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Review a minimized account snapshot for a documented support purpose',
+  })
+  @ApiParam({ name: 'id', description: 'User numeric ID' })
+  @ApiResponse({
+    status: 200,
+    description: 'Minimized account snapshot after an audited access decision.',
+  })
+  async reviewSupportAccess(
+    @Param('id') id: string,
+    @Body() dto: SupportAccessReviewDto,
+    @GetUser('id') adminId: number,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.adminService.reviewSupportAccess(
+      Number(id),
+      dto,
+      adminId,
+      req,
     );
   }
 

@@ -114,6 +114,9 @@ export function getRankingVersionFeatureFlagKey(version: string): string {
  *                    null = governed by the global default.
  *   - consentRequired: Whether this event requires explicit user consent
  *                      before being recorded (for GDPR/CCPA purposes).
+ *   - allowedMetadataFields: The complete set of optional metadata fields
+ *                      accepted by the ingestion boundary.
+ *   - aggregationBehavior: The only supported aggregate for this event.
  *
  * Dashboard note: events with schemaVersion < ANALYTICS_SCHEMA_VERSION in
  * the entity indicate schema drift and should be flagged in quality reports.
@@ -124,6 +127,11 @@ export interface EventRegistryEntry {
   schemaVersion: number;
   retentionDays: number | null;
   consentRequired: boolean;
+  allowedMetadataFields: readonly string[];
+  aggregationBehavior:
+    | 'daily_count'
+    | 'daily_count_by_network'
+    | 'daily_count_by_state';
 }
 
 export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
@@ -133,6 +141,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 365,
     consentRequired: false,
+    allowedMetadataFields: ['source', 'requestId'],
+    aggregationBehavior: 'daily_count',
   },
   user_login: {
     owner: 'auth',
@@ -140,6 +150,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 90,
     consentRequired: false,
+    allowedMetadataFields: ['source'],
+    aggregationBehavior: 'daily_count',
   },
   confession_created: {
     owner: 'confessions',
@@ -147,6 +159,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 365,
     consentRequired: false,
+    allowedMetadataFields: ['source', 'confessionId'],
+    aggregationBehavior: 'daily_count',
   },
   confession_publish_failed: {
     owner: 'confessions',
@@ -154,6 +168,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 30,
     consentRequired: false,
+    allowedMetadataFields: ['source', 'reason'],
+    aggregationBehavior: 'daily_count',
   },
   comment_created: {
     owner: 'confessions',
@@ -161,6 +177,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 365,
     consentRequired: false,
+    allowedMetadataFields: ['source', 'commentId', 'confessionId'],
+    aggregationBehavior: 'daily_count',
   },
   reaction_created: {
     owner: 'confessions',
@@ -168,6 +186,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 365,
     consentRequired: false,
+    allowedMetadataFields: ['source', 'reactionId', 'confessionId'],
+    aggregationBehavior: 'daily_count',
   },
   message_sent: {
     owner: 'messages',
@@ -175,6 +195,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 90,
     consentRequired: false,
+    allowedMetadataFields: ['source', 'messageId', 'confessionId'],
+    aggregationBehavior: 'daily_count',
   },
   wallet_connected: {
     owner: 'stellar',
@@ -182,6 +204,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 365,
     consentRequired: false,
+    allowedMetadataFields: ['source'],
+    aggregationBehavior: 'daily_count',
   },
   stellar_tx_submitted: {
     owner: 'stellar',
@@ -189,6 +213,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 365,
     consentRequired: false,
+    allowedMetadataFields: ['source', 'state', 'requestId'],
+    aggregationBehavior: 'daily_count_by_network',
   },
   stellar_tx_confirmed: {
     owner: 'stellar',
@@ -196,6 +222,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 365,
     consentRequired: false,
+    allowedMetadataFields: ['source', 'requestId'],
+    aggregationBehavior: 'daily_count_by_network',
   },
   stellar_tx_failed: {
     owner: 'stellar',
@@ -203,6 +231,14 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 90,
     consentRequired: false,
+    allowedMetadataFields: [
+      'source',
+      'state',
+      'requestId',
+      'tipId',
+      'confessionId',
+    ],
+    aggregationBehavior: 'daily_count_by_state',
   },
   tip_completed: {
     owner: 'tipping',
@@ -210,6 +246,8 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 730,
     consentRequired: false,
+    allowedMetadataFields: ['source', 'tipId', 'confessionId', 'requestId'],
+    aggregationBehavior: 'daily_count_by_network',
   },
   soroban_event_indexed: {
     owner: 'stellar',
@@ -217,6 +255,23 @@ export const ANALYTICS_EVENT_REGISTRY: Record<string, EventRegistryEntry> = {
     schemaVersion: 1,
     retentionDays: 365,
     consentRequired: false,
+    allowedMetadataFields: ['source', 'state'],
+    aggregationBehavior: 'daily_count_by_network',
+  },
+  soroban_range_reprocessed: {
+    owner: 'stellar',
+    purpose: 'stellar_reliability',
+    schemaVersion: 1,
+    retentionDays: 30,
+    consentRequired: false,
+    allowedMetadataFields: [
+      'source',
+      'state',
+      'fromLedger',
+      'toLedger',
+      'reprocessedEvents',
+    ],
+    aggregationBehavior: 'daily_count_by_network',
   },
 } as const;
 

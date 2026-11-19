@@ -67,6 +67,7 @@
     "readiness": "npm run production:readiness",
     "migration:gate": "node scripts/migration-gate.js",
     "migration:gate:dry-run": "node scripts/migration-gate.js --dry-run",
+    "data-classification:gate": "node scripts/data-classification-gate.js",
     "migration:rehearsal": "node scripts/migration-rehearsal.js",
     "migration:rehearsal:dry-run": "node scripts/migration-rehearsal.js --dry-run",
     "readiness:test": "node --test scripts/__tests__/production-readiness.test.js",

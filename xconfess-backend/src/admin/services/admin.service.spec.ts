@@ -7,6 +7,10 @@ import { AuditActionType } from "../../audit-log/audit-log.entity";
 import { AnonymousConfession } from "../../confession/entities/confession.entity";
 import { User } from "../../user/entities/user.entity";
 import {
+  SupportAccessPurpose,
+  SupportAccessScope,
+} from "../dto/support-access-review.dto";
+import {
   AdminActionApproval,
   AdminActionApprovalStatus,
   AdminCriticalAction,
@@ -97,6 +101,7 @@ describe("AdminService", () => {
 
   const auditLogService: any = {
     getStatistics: jest.fn(),
+    logRequired: jest.fn(),
   };
 
   const jobManagementService: any = {
@@ -180,6 +185,112 @@ describe("AdminService", () => {
       lockoutService,
       sessionService,
       actionApprovalRepository,
+    );
+  });
+
+  it("returns only the account-status fields allowed by the support scope", async () => {
+    userRepository.findOne.mockResolvedValue({
+      id: 17,
+      username: "member",
+      role: "user",
+      is_active: true,
+      totpEnabled: true,
+      emailEncrypted: "must-not-return",
+    });
+
+    await expect(
+      service.reviewSupportAccess(
+        17,
+        {
+          purpose: SupportAccessPurpose.ACCOUNT_STATUS,
+          scope: SupportAccessScope.ACCOUNT_STATUS,
+        },
+        4,
+      ),
+    ).resolves.toEqual({
+      decision: "allowed",
+      purpose: SupportAccessPurpose.ACCOUNT_STATUS,
+      scope: SupportAccessScope.ACCOUNT_STATUS,
+      subject: { id: 17, username: "member", role: "user", isActive: true },
+    });
+    expect(auditLogService.logRequired).toHaveBeenCalledWith(
+      expect.objectContaining({
+        actionType: AuditActionType.ADMIN_SUPPORT_ACCESS_REVIEWED,
+        metadata: expect.objectContaining({ decision: "allowed", scope: "account_status" }),
+      }),
+    );
+    expect(userRepository.findOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.not.objectContaining({ emailEncrypted: true }),
+      }),
+    );
+  });
+
+  it("fails closed and records a denied decision for an unsupported scope", async () => {
+    await expect(
+      service.reviewSupportAccess(
+        17,
+        {
+          purpose: SupportAccessPurpose.ACCOUNT_STATUS,
+          scope: SupportAccessScope.SECURITY_STATUS,
+        },
+        4,
+      ),
+    ).rejects.toThrow("not permitted");
+    expect(userRepository.findOne).not.toHaveBeenCalled();
+    expect(auditLogService.logRequired).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({ decision: "denied" }),
+      }),
+    );
+  });
+
+  it("does not return account data when the required audit write fails", async () => {
+    userRepository.findOne.mockResolvedValue({
+      id: 17,
+      username: "member",
+      role: "user",
+      is_active: true,
+      totpEnabled: false,
+    });
+    auditLogService.logRequired.mockRejectedValueOnce(
+      new Error("audit storage unavailable"),
+    );
+
+    await expect(
+      service.reviewSupportAccess(
+        17,
+        {
+          purpose: SupportAccessPurpose.ACCOUNT_STATUS,
+          scope: SupportAccessScope.ACCOUNT_STATUS,
+        },
+        4,
+      ),
+    ).rejects.toThrow("audit storage unavailable");
+  });
+
+  it("records a denied decision when the account lookup fails", async () => {
+    userRepository.findOne.mockRejectedValueOnce(
+      new Error("account store unavailable"),
+    );
+
+    await expect(
+      service.reviewSupportAccess(
+        17,
+        {
+          purpose: SupportAccessPurpose.ACCOUNT_STATUS,
+          scope: SupportAccessScope.ACCOUNT_STATUS,
+        },
+        4,
+      ),
+    ).rejects.toThrow("account store unavailable");
+    expect(auditLogService.logRequired).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          decision: "denied",
+          reason: "account_lookup_failed",
+        }),
+      }),
     );
   });
 

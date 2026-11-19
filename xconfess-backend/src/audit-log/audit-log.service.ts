@@ -242,85 +242,7 @@ export class AuditLogService {
    */
   async log(dto: CreateAuditLogDto): Promise<void> {
     try {
-      const actor = this.resolveActor(dto);
-      const templateKey = this.extractMetadataString(
-        dto.metadata,
-        'templateKey',
-      );
-      const templateVersion = this.extractMetadataString(
-        dto.metadata,
-        'templateVersion',
-      );
-
-      const rawMetadata = {
-        ...(dto.metadata || {}),
-        ...(actor
-          ? {
-              actorType: actor.type,
-              actorId: actor.id,
-              actorUserId: actor.userId || null,
-              ...(actor.label ? { actorLabel: actor.label } : {}),
-              ...(actor.source ? { actorSource: actor.source } : {}),
-            }
-          : {}),
-        ...(dto.context?.requestId
-          ? { requestId: dto.context.requestId }
-          : {}),
-        ...(templateKey && templateVersion
-          ? {
-              templateKey,
-              templateVersion,
-            }
-          : {}),
-      };
-
-      let safeMetadata: Record<string, unknown> | null = rawMetadata;
-      try {
-        safeMetadata = this.redaction.redactMetadata(rawMetadata);
-      } catch (redactionError: unknown) {
-        this.logger.warn(
-          `Audit metadata redaction failed, falling back to raw metadata: ${redactionError instanceof Error ? redactionError.message : 'unknown error'}`,
-        );
-      }
-
-      const auditLog = this.auditLogRepository.create({
-        adminId: this.toNullableUserId(dto.context?.userId || null),
-        action: dto.actionType,
-        entityType:
-          typeof dto.metadata?.entityType === 'string'
-            ? dto.metadata.entityType
-            : null,
-        entityId: this.extractEntityId(dto.metadata),
-        metadata: safeMetadata,
-        notes: null,
-        ipAddress: dto.context?.ipAddress || null,
-        userAgent: dto.context?.userAgent || null,
-        requestId: dto.context?.requestId || null,
-        integrityHash: null,
-      });
-
-      // Persist first to obtain the generated id and database-assigned createdAt
-      const saved = await this.auditLogRepository.save(auditLog);
-
-      // Compute HMAC integrity tag using the persisted values
-      const integrityHash = this.integrity.computeIntegrityHash({
-        id: saved.id,
-        action: saved.action,
-        adminId: saved.adminId,
-        entityType: saved.entityType,
-        entityId: saved.entityId,
-        requestId: saved.requestId,
-        ipAddress: saved.ipAddress,
-        createdAt: saved.createdAt.toISOString(),
-      });
-
-      if (integrityHash) {
-        await this.auditLogRepository.update(saved.id, { integrityHash });
-      }
-
-      this.logger.log(
-        `Audit log created: ${dto.actionType} by ${actor?.type || 'anonymous'} ${this.redaction.maskIdentifier(actor?.id || dto.context?.userId || 'anonymous')}`,
-      );
+      await this.persistAuditLog(dto, false);
     } catch (error: unknown) {
       // Log the error but don't throw to prevent disrupting the main operation
       this.logger.error(
@@ -328,6 +250,95 @@ export class AuditLogService {
         error instanceof Error ? this.redaction.redactErrorMessage(error.stack || '') : undefined,
       );
     }
+  }
+
+  async logRequired(dto: CreateAuditLogDto): Promise<void> {
+    await this.persistAuditLog(dto, true);
+  }
+
+  private async persistAuditLog(
+    dto: CreateAuditLogDto,
+    failOnRedactionError: boolean,
+  ): Promise<void> {
+    const actor = this.resolveActor(dto);
+    const templateKey = this.extractMetadataString(
+      dto.metadata,
+      'templateKey',
+    );
+    const templateVersion = this.extractMetadataString(
+      dto.metadata,
+      'templateVersion',
+    );
+
+    const rawMetadata = {
+      ...(dto.metadata || {}),
+      ...(actor
+        ? {
+            actorType: actor.type,
+            actorId: actor.id,
+            actorUserId: actor.userId || null,
+            ...(actor.label ? { actorLabel: actor.label } : {}),
+            ...(actor.source ? { actorSource: actor.source } : {}),
+          }
+        : {}),
+      ...(dto.context?.requestId
+        ? { requestId: dto.context.requestId }
+        : {}),
+      ...(templateKey && templateVersion
+        ? {
+            templateKey,
+            templateVersion,
+          }
+        : {}),
+    };
+
+    let safeMetadata: Record<string, unknown> | null = rawMetadata;
+    try {
+      safeMetadata = this.redaction.redactMetadata(rawMetadata);
+    } catch (redactionError: unknown) {
+      if (failOnRedactionError) {
+        throw redactionError;
+      }
+      this.logger.warn(
+        `Audit metadata redaction failed, falling back to raw metadata: ${redactionError instanceof Error ? redactionError.message : 'unknown error'}`,
+      );
+    }
+
+    const auditLog = this.auditLogRepository.create({
+      adminId: this.toNullableUserId(dto.context?.userId || null),
+      action: dto.actionType,
+      entityType:
+        typeof dto.metadata?.entityType === 'string'
+          ? dto.metadata.entityType
+          : null,
+      entityId: this.extractEntityId(dto.metadata),
+      metadata: safeMetadata,
+      notes: null,
+      ipAddress: dto.context?.ipAddress || null,
+      userAgent: dto.context?.userAgent || null,
+      requestId: dto.context?.requestId || null,
+      integrityHash: null,
+    });
+
+    const saved = await this.auditLogRepository.save(auditLog);
+    const integrityHash = this.integrity.computeIntegrityHash({
+      id: saved.id,
+      action: saved.action,
+      adminId: saved.adminId,
+      entityType: saved.entityType,
+      entityId: saved.entityId,
+      requestId: saved.requestId,
+      ipAddress: saved.ipAddress,
+      createdAt: saved.createdAt.toISOString(),
+    });
+
+    if (integrityHash) {
+      await this.auditLogRepository.update(saved.id, { integrityHash });
+    }
+
+    this.logger.log(
+      `Audit log created: ${dto.actionType} by ${actor?.type || 'anonymous'} ${this.redaction.maskIdentifier(actor?.id || dto.context?.userId || 'anonymous')}`,
+    );
   }
 
   /**

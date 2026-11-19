@@ -38,6 +38,18 @@ describe('analytics.constants — schema registry (#86)', () => {
       ).toBe(true);
 
       expect(typeof entry.consentRequired).toBe('boolean');
+      expect(entry.allowedMetadataFields.length).toBeGreaterThan(0);
+      expect(
+        ['daily_count', 'daily_count_by_network', 'daily_count_by_state'],
+      ).toContain(entry.aggregationBehavior);
+    }
+  });
+
+  it('declares unique metadata fields for every event', () => {
+    for (const entry of Object.values(ANALYTICS_EVENT_REGISTRY)) {
+      expect(new Set(entry.allowedMetadataFields).size).toBe(
+        entry.allowedMetadataFields.length,
+      );
     }
   });
 
