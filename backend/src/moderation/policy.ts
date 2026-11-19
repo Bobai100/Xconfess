@@ -43,6 +43,77 @@ export interface ReplayOptions {
   authorize: (action: "replay") => boolean;
 }
 
+export const POLL_MIN_OPTIONS = 2;
+export const POLL_MAX_OPTIONS = 6;
+export const POLL_MAX_OPTION_LENGTH = 120;
+export const POLL_MAX_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface PollOption {
+  id: string;
+  label: string;
+}
+
+export interface Poll {
+  id: string;
+  threadId: string;
+  options: PollOption[];
+  closesAt: string;
+  createdAt: string;
+}
+
+export interface PollVote {
+  pollId: string;
+  userId: string;
+  optionId: string;
+  createdAt: string;
+}
+
+export interface PollResultOption {
+  optionId: string;
+  label: string;
+  votes: number;
+  percentage: number;
+}
+
+export interface PollResults {
+  pollId: string;
+  totalVotes: number;
+  closed: boolean;
+  options: PollResultOption[];
+}
+
+export interface CreatePollInput {
+  threadId: string;
+  options: string[];
+  closesAt: string;
+  now?: Date;
+}
+
+export interface CastVoteInput {
+  poll: Poll;
+  existingVotes: PollVote[];
+  userId: string;
+  optionId: string;
+  now?: Date;
+}
+
+export type PollErrorCode =
+  | "invalid_options"
+  | "invalid_close_time"
+  | "poll_closed"
+  | "unknown_option"
+  | "already_voted";
+
+export class PollError extends Error {
+  readonly code: PollErrorCode;
+
+  constructor(code: PollErrorCode, message: string) {
+    super(message);
+    this.name = "PollError";
+    this.code = code;
+  }
+}
+
 const REDACTED = "[redacted]";
 
 function redactId(value: string): string {
@@ -107,5 +178,135 @@ export function replayModerationDecisions(options: ReplayOptions): ReplayDiffRep
     changed,
     unchanged: cases.length - changed,
     deltas,
+  };
+}
+
+/**
+ * Validate and normalize poll options for a confession thread. Enforces a
+ * bounded option count, non-empty unique labels, and a bounded label length.
+ */
+export function normalizePollOptions(options: string[]): PollOption[] {
+  if (!Array.isArray(options)) {
+    throw new PollError("invalid_options", "Poll options must be an array");
+  }
+
+  const trimmed = options.map((option) => (typeof option === "string" ? option.trim() : ""));
+
+  if (trimmed.length < POLL_MIN_OPTIONS || trimmed.length > POLL_MAX_OPTIONS) {
+    throw new PollError(
+      "invalid_options",
+      `Poll requires between ${POLL_MIN_OPTIONS} and ${POLL_MAX_OPTIONS} options`,
+    );
+  }
+
+  const seen = new Set<string>();
+  return trimmed.map((label, index) => {
+    if (!label) {
+      throw new PollError("invalid_options", "Poll options must not be empty");
+    }
+    if (label.length > POLL_MAX_OPTION_LENGTH) {
+      throw new PollError(
+        "invalid_options",
+        `Poll options must be at most ${POLL_MAX_OPTION_LENGTH} characters`,
+      );
+    }
+    const key = label.toLowerCase();
+    if (seen.has(key)) {
+      throw new PollError("invalid_options", "Poll options must be unique");
+    }
+    seen.add(key);
+    return { id: `opt_${index + 1}`, label };
+  });
+}
+
+/**
+ * Create a poll for a confession thread with an explicit, bounded close time.
+ * The close time must be in the future and within the maximum poll duration.
+ */
+export function createPoll(input: CreatePollInput): Poll {
+  const now = input.now ?? new Date();
+  const options = normalizePollOptions(input.options);
+  const closesAt = new Date(input.closesAt);
+
+  if (Number.isNaN(closesAt.getTime())) {
+    throw new PollError("invalid_close_time", "Poll close time is invalid");
+  }
+  if (closesAt.getTime() <= now.getTime()) {
+    throw new PollError("invalid_close_time", "Poll close time must be in the future");
+  }
+  if (closesAt.getTime() - now.getTime() > POLL_MAX_DURATION_MS) {
+    throw new PollError("invalid_close_time", "Poll close time exceeds the maximum duration");
+  }
+
+  return {
+    id: `poll_${input.threadId}`,
+    threadId: input.threadId,
+    options,
+    closesAt: closesAt.toISOString(),
+    createdAt: now.toISOString(),
+  };
+}
+
+/**
+ * Cast a vote with one-vote-per-user semantics. Rejects votes after the close
+ * time, votes for unknown options, and repeat votes from the same user.
+ */
+export function castPollVote(input: CastVoteInput): PollVote {
+  const now = input.now ?? new Date();
+  const { poll, existingVotes, userId, optionId } = input;
+
+  if (!userId) {
+    throw new PollError("already_voted", "A user identity is required to vote");
+  }
+  if (now.getTime() >= new Date(poll.closesAt).getTime()) {
+    throw new PollError("poll_closed", "Poll is closed");
+  }
+  if (!poll.options.some((option) => option.id === optionId)) {
+    throw new PollError("unknown_option", "Selected poll option does not exist");
+  }
+  if (existingVotes.some((vote) => vote.pollId === poll.id && vote.userId === userId)) {
+    throw new PollError("already_voted", "User has already voted in this poll");
+  }
+
+  return {
+    pollId: poll.id,
+    userId,
+    optionId,
+    createdAt: now.toISOString(),
+  };
+}
+
+/**
+ * Aggregate poll results without exposing voter identity. Only counts are
+ * returned; individual votes are never surfaced.
+ */
+export function aggregatePollResults(
+  poll: Poll,
+  votes: PollVote[],
+  now: Date = new Date(),
+): PollResults {
+  const pollVotes = votes.filter((vote) => vote.pollId === poll.id);
+  const counts = new Map<string, number>();
+  for (const option of poll.options) counts.set(option.id, 0);
+  for (const vote of pollVotes) {
+    if (counts.has(vote.optionId)) {
+      counts.set(vote.optionId, (counts.get(vote.optionId) ?? 0) + 1);
+    }
+  }
+
+  const totalVotes = pollVotes.length;
+  return {
+    pollId: poll.id,
+    totalVotes,
+    closed: now.getTime() >= new Date(poll.closesAt).getTime(),
+    options: poll.options.map((option) => {
+      const optionVotes = counts.get(option.id) ?? 0;
+      return {
+        optionId: option.id,
+        label: option.label,
+        votes: optionVotes,
+        percentage: totalVotes === 0 ? 0 : Math.round((optionVotes / totalVotes) * 100),
+      };
+    }),
   };
 }
