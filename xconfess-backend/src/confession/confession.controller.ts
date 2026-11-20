@@ -38,6 +38,7 @@ import { GetConfessionsByTagDto } from './dto/get-confessions-by-tag.dto';
 import { GetConfessionsDto } from './dto/get-confessions.dto';
 import { SearchConfessionDto } from './dto/search-confession.dto';
 import { UpdateConfessionDto } from './dto/update-confession.dto';
+import { UpdateConfessionTopicsDto } from './dto/update-confession-topics.dto';
 import { OptionalJwtAuthGuard } from '../auth/optional-jwt-auth.guard';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AdminGuard } from '../auth/admin.guard';
@@ -282,6 +283,17 @@ export class ConfessionController {
   @UsePipes(new ValidationPipe({ whitelist: true }))
   update(@Param('id') id: string, @Body() dto: UpdateConfessionDto) {
     return this.service.update(id, dto);
+  }
+
+  @Put(':id/topics')
+  @ApiOperation({ summary: 'Transactionally update confession topics and sync search index' })
+  @ApiParam({ name: 'id', description: 'Confession UUID' })
+  @UsePipes(new ValidationPipe({ whitelist: true }))
+  updateTopics(
+    @Param('id') id: string,
+    @Body() dto: UpdateConfessionTopicsDto,
+  ) {
+    return this.service.updateConfessionTopics(id, dto.topics);
   }
 
   @Delete(':id')

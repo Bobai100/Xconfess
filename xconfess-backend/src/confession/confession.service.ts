@@ -56,6 +56,10 @@ import { mapToSlimConfession } from './utils/confession-mapper';
 import { AnomalyDetectionService } from '../anomaly/anomaly-detection.service';
 import { ConfessionIdempotencyService } from './confession-idempotency.service';
 import { AnalyticsEventService } from '../analytics/analytics-event.service';
+import { SearchIndexOutboxService } from '../search-discovery/search-index-outbox.service';
+import { SearchOutboxAction } from '../search-discovery/entities/search-index-outbox.entity';
+import { TopicService } from '../topic/topic.service';
+import { Tag } from './entities/tag.entity';
 import { randomBytes } from 'crypto';
 
 export interface ArchiveActor {
@@ -84,6 +88,10 @@ export class ConfessionService {
     private readonly idempotencyService: ConfessionIdempotencyService,
     @Optional()
     private readonly analyticsEventService?: AnalyticsEventService,
+    @Optional()
+    private readonly searchOutboxService?: SearchIndexOutboxService,
+    @Optional()
+    private readonly topicService?: TopicService,
   ) {}
 
   private get aesKey(): string {
@@ -630,12 +638,93 @@ export class ConfessionService {
       where: { id, isDeleted: false },
     });
     if (!existing) throw new NotFoundException(`Confession ${id} not found`);
-    await this.confessionRepo.update(id, {
-      isDeleted: true,
-      deletedAt: new Date(),
-      deletedBy: deletedBy || null,
+
+    await this.confessionRepo.manager.transaction(async (manager) => {
+      await manager.update(AnonymousConfession, id, {
+        isDeleted: true,
+        deletedAt: new Date(),
+        deletedBy: deletedBy || null,
+      });
+
+      if (this.searchOutboxService) {
+        await this.searchOutboxService.enqueueIndexChange(
+          manager,
+          'CONFESSION',
+          id,
+          SearchOutboxAction.INDEX_DELETE,
+          { confessionId: id, deletedAt: new Date() },
+        );
+      }
     });
+
     return { message: 'Confession soft-deleted', id };
+  }
+
+  /**
+   * Transactionally update confession topics and enqueue search index synchronization.
+   */
+  async updateConfessionTopics(id: string, topics: string[], userId?: number) {
+    const existing = await this.confessionRepo.findOne({
+      where: { id, isDeleted: false },
+      relations: ['confessionTags', 'confessionTags.tag'],
+    });
+    if (!existing) {
+      throw new NotFoundException(`Confession ${id} not found`);
+    }
+
+    const normalizedTopics: string[] = [];
+    for (const rawTopic of topics) {
+      if (this.topicService) {
+        const canonical = await this.topicService.resolveTopic(rawTopic);
+        this.topicService.assertTopicAssignable(canonical);
+        normalizedTopics.push(canonical.slug);
+      } else {
+        const norm = rawTopic.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-');
+        if (norm) normalizedTopics.push(norm);
+      }
+    }
+
+    // Run atomically inside transaction
+    await this.confessionRepo.manager.transaction(async (manager) => {
+      // Clear existing tags
+      await manager.delete(ConfessionTag, { confession: { id } });
+
+      // Create or associate tags/topics
+      for (const tName of normalizedTopics) {
+        let tag = await manager.findOne(Tag, { where: { name: tName } });
+        if (!tag) {
+          tag = await manager.save(Tag, manager.create(Tag, { name: tName }));
+        }
+        await manager.save(
+          ConfessionTag,
+          manager.create(ConfessionTag, {
+            confession: existing,
+            tag,
+          }),
+        );
+      }
+
+      // Enqueue search outbox entry in the same transaction
+      if (this.searchOutboxService) {
+        await this.searchOutboxService.enqueueIndexChange(
+          manager,
+          'CONFESSION',
+          id,
+          SearchOutboxAction.TOPIC_SYNC,
+          {
+            confessionId: id,
+            topics: normalizedTopics,
+            updatedAt: new Date(),
+          },
+        );
+      }
+    });
+
+    return {
+      message: 'Confession topics updated and search sync enqueued',
+      confessionId: id,
+      topics: normalizedTopics,
+    };
   }
 
   /**

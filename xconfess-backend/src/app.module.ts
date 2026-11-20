@@ -16,6 +16,9 @@ import { CapabilitiesModule } from './auth/capabilities/capabilities.module';
 import { ConfessionModule } from './confession/confession.module';
 import { ConfessionDraftModule } from './confession-draft/confession-draft.module';
 import { SearchDiscoveryModule } from './search-discovery/search-discovery.module';
+import { WebhookModule } from './webhooks/webhook.module';
+import { ApiDeprecationModule } from './deprecation/api-deprecation.module';
+import { TopicModule } from './topic/topic.module';
 import { CommentModule } from './comment/comment.module';
 import { ReactionModule } from './reaction/reaction.module';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
@@ -155,6 +158,9 @@ import { RateLimitGuard } from './rate-limit/rate-limit.guard';
     ConfessionModule,
     ConfessionDraftModule,
     SearchDiscoveryModule,
+    WebhookModule,
+    ApiDeprecationModule,
+    TopicModule,
     ReactionModule,
     CommentModule,
     MessagesModule,
